@@ -212,8 +212,8 @@ that feature.
 - **[VR-Stereo-Hub/bioshock-trilogy-vr](https://github.com/VR-Stereo-Hub/bioshock-trilogy-vr)**,
   the mod this is built on. All the hard parts (stereo, head tracking, the bone drive, the aim
   hooks) are theirs.
-- **BioVRDev's BioVR**, whose design the always-visible off hand and two-handed grip are
-  modelled on: the grab and release distances, the grab-zone buzz, and aiming along both hands.
+- **[BioVRDev's Bioshock-Remastered-VR](https://github.com/BioVRDev/Bioshock-Remastered-VR)**, whose design the always-visible off hand and two-handed grip are
+  modeled on: the grab and release distances, the grab-zone buzz, and aiming along both hands.
 - Built with help by Claude (Anthropic).
 
 ---
