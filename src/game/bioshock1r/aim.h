@@ -81,6 +81,12 @@ void* learned_weapon_object();
 bool weapon_key_is(const char* name);
 // The ACTIVE per-weapon profile key (weapon class name), "" if none. Game thread.
 const char* active_weapon_key();
+// Player weapon shots so far (the fire seam, 40 ms debounce - one per shotgun
+// blast, one per Tommy gun round). Monotonic; hands.cpp diffs it for recoil.
+uint32_t player_shot_count();
+// Player ability fires (plasmid casts AND wrench swings - both use the
+// ability fire seam), same debounce. For haptics.
+uint32_t player_ability_count();
 
 // The live aim trim (degrees), PER HAND (0 = left/plasmid, 1 = right/weapon)
 // since session 16 part 3 - shared so the laser, the fire ray and the M7

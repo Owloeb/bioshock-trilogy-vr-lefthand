@@ -53,4 +53,21 @@ void input_set_sim_hand(int hand, bool aimPose, bool valid, const float pos3[3],
                         const float quat4[4]);
 void input_clear_sim_hands();
 
+// Two-handed grip, pose half (role space: 0 plasmid, 1 weapon). While on,
+// input_get_hand_pose serves the WEAPON role rotated about its grip so the
+// grab point (grabLocal, metres, in the weapon GRIP pose's local frame) lies
+// on the line to the plasmid hand, and the PLASMID role pinned to that grab
+// point with orientation offRelQuat (in the same frame). Refresh every frame;
+// it self-expires after 250 ms. The raw getter bypasses it (for recording and
+// for the grab-distance test).
+void input_set_two_hand_grip(bool on, const float grabLocal[3], const float offRelQuat[4]);
+bool input_get_raw_hand_pose(int hand, bool aimPose, float* pos3, float* quat4);
+// Raw squeeze 0..1 by role, and per-role bumper reservation (refresh each
+// frame; expires after 200 ms): a reserved role's squeeze never composes to
+// its bumper.
+float input_hand_squeeze(int role);
+void input_reserve_grip_bumper(int role, bool on);
+// Queue one haptic pulse on the controller holding `role`.
+void input_haptic_pulse(int role, float amplitude, int durationMs);
+
 } // namespace bvr::vr

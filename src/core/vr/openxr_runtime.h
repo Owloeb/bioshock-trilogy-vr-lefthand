@@ -65,6 +65,15 @@ bool peek_head_pose(HeadPose& out);
 // (hand/weapon placement).
 bool get_hand_pose(int hand, bool aimPose, HeadPose& out);
 
+// Two-handed grip (role space: 0 plasmid, 1 weapon) - see openxr_input.h for
+// the full contract. get_hand_pose serves the two-handed poses while it is
+// on; get_raw_hand_pose never does.
+bool get_raw_hand_pose(int hand, bool aimPose, HeadPose& out);
+void set_two_hand_grip(bool on, const float grabLocal[3], const float offRelQuat[4]);
+float hand_squeeze(int role);
+void reserve_grip_bumper(int role, bool on);
+void haptic_pulse(int role, float amplitude, int durationMs);
+
 // --- Session 20: vrrec record+replay support ---------------------------------
 // Sim overlay on the hand-pose funnel: while armed, every consumer of
 // get_hand_pose/input_get_hand_pose (fire ray, viewmodel, laser) reads the

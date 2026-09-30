@@ -4,6 +4,8 @@
 
 #include <d3dcompiler.h>
 
+#include <atomic>
+
 namespace bvr::blit {
 namespace {
 
@@ -42,6 +44,16 @@ float4 ps_process(VSOut i) : SV_Target {
     c.a = max(c.a, saturate(lum * 0.35));
     return c;
 }
+// Premultiplied-consistent repair: a premultiplied colour can never exceed
+// its alpha, so coverage is at least the brightest channel. The luminance
+// floor above lets a saturated red health fill keep ~10% alpha - composited
+// ONE/INV_SRC_ALPHA that fill barely occludes the world and reads as a
+// see-through, glowing bar.
+float4 ps_process_premul(VSOut i) : SV_Target {
+    float4 c = tex0.Sample(samp0, i.uv);
+    c.a = max(c.a, saturate(max(c.r, max(c.g, c.b))));
+    return c;
+}
 )";
 
 ID3D11VertexShader* g_vs = nullptr;
@@ -49,6 +61,8 @@ ID3D11VertexShader* g_vsStretch = nullptr;
 ID3D11Buffer* g_stretchCb = nullptr;
 ID3D11PixelShader* g_ps = nullptr;
 ID3D11PixelShader* g_psProcess = nullptr;
+ID3D11PixelShader* g_psProcessPremul = nullptr;
+std::atomic<bool> g_premulRepair{true};
 ID3D11BlendState* g_blend = nullptr;
 ID3D11SamplerState* g_sampler = nullptr;
 ID3D11RasterizerState* g_raster = nullptr;
@@ -75,6 +89,16 @@ bool ensure_pipeline(ID3D11DeviceContext* ctx) {
                                    "ps_main", "ps_4_0", 0, 0, &psb, &err)) &&
               SUCCEEDED(D3DCompile(kShader, strlen(kShader), nullptr, nullptr, nullptr,
                                    "ps_process", "ps_4_0", 0, 0, &ppb, &err));
+    // Optional: a failure here only drops back to the luminance repair.
+    ID3DBlob* pmb = nullptr;
+    ID3DBlob* pmErr = nullptr;
+    if (ok && (FAILED(D3DCompile(kShader, strlen(kShader), nullptr, nullptr, nullptr,
+                                 "ps_process_premul", "ps_4_0", 0, 0, &pmb, &pmErr)) ||
+               FAILED(dev->CreatePixelShader(pmb->GetBufferPointer(), pmb->GetBufferSize(),
+                                             nullptr, &g_psProcessPremul))))
+        g_psProcessPremul = nullptr;
+    if (pmb) pmb->Release();
+    if (pmErr) pmErr->Release();
     if (ok)
         ok = SUCCEEDED(dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(),
                                                nullptr, &g_vs)) &&
@@ -234,7 +258,10 @@ bool alpha_premul(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* dst,
 bool process(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* dst,
              ID3D11ShaderResourceView* src, UINT dstW, UINT dstH) {
     // Blend OFF (null state = replace): rgb passes through, alpha repaired.
-    return draw_internal(ctx, dst, src, dstW, dstH, g_psProcess, nullptr);
+    ID3D11PixelShader* ps = g_premulRepair.load(std::memory_order_relaxed) && g_psProcessPremul
+                                ? g_psProcessPremul
+                                : g_psProcess;
+    return draw_internal(ctx, dst, src, dstW, dstH, ps, nullptr);
 }
 
 bool stretch_band(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* dst,
@@ -259,10 +286,14 @@ void release() {
     if (g_stretchCb) { g_stretchCb->Release(); g_stretchCb = nullptr; }
     if (g_ps) { g_ps->Release(); g_ps = nullptr; }
     if (g_psProcess) { g_psProcess->Release(); g_psProcess = nullptr; }
+    if (g_psProcessPremul) { g_psProcessPremul->Release(); g_psProcessPremul = nullptr; }
     if (g_blend) { g_blend->Release(); g_blend = nullptr; }
     if (g_sampler) { g_sampler->Release(); g_sampler = nullptr; }
     if (g_raster) { g_raster->Release(); g_raster = nullptr; }
     if (g_depth) { g_depth->Release(); g_depth = nullptr; }
 }
+
+void set_premul_repair(bool on) { g_premulRepair.store(on, std::memory_order_relaxed); }
+bool premul_repair() { return g_premulRepair.load(std::memory_order_relaxed); }
 
 } // namespace bvr::blit

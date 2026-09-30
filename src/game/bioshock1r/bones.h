@@ -44,6 +44,20 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
 // written this frame.
 void reapply();
 
+// Always-visible off hand (BioVR port): where the cluster drive() does NOT own
+// goes on the next drive() - and on every Route B re-drive until changed.
+// track=false (or gp null) restores the old behaviour: the off cluster is
+// collapsed by hide-inactive. Tracking needs hide-inactive on (it replaces the
+// collapse). Game thread, before drive().
+void set_off_target(bool track, const GamePose* gp);
+// While the off hand holds the gun (two-handed grip), also carry the engine's
+// own off-hand motion relative to the gun (shotgun pump, chemical thrower
+// crank) onto it. Game thread, before drive().
+void set_off_follow(bool on);
+// Draw the off hand in its grip shape without following (grab-point recording,
+// grab-zone preview). Game thread, before drive().
+void set_off_preview(bool on);
+
 // The old actors died with the old world; drop every cached pointer.
 void on_world_change();
 
