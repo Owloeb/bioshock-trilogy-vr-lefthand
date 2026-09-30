@@ -225,9 +225,6 @@ constexpr uint64_t kThStaleMs = 250;
 // plasmid hand cannot switch to plasmids.
 std::atomic<float> g_squeeze[2];
 std::atomic<uint64_t> g_reserveMs[2];
-// Same idea for the triggers (hand calibration's 'set' press must not fire).
-std::atomic<float> g_trigger[2];
-std::atomic<uint64_t> g_reserveTrigMs[2];
 
 // Haptics (first use in this mod): one VIBRATION_OUTPUT action per physical
 // hand. Game thread queues by ROLE; the render thread applies in input_sync.
@@ -774,13 +771,6 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
     // WEAPON trigger is whichever controller holds the weapon role.
     float rt = read_float(session, lh ? g_plasmid : g_fire);
     float lt = read_float(session, lh ? g_fire : g_plasmid);
-    g_trigger[1].store(rt, std::memory_order_relaxed);
-    g_trigger[0].store(lt, std::memory_order_relaxed);
-    {
-        const uint64_t nowT = GetTickCount64();
-        if (nowT - g_reserveTrigMs[1].load(std::memory_order_relaxed) < 200) rt = 0.0f;
-        if (nowT - g_reserveTrigMs[0].load(std::memory_order_relaxed) < 200) lt = 0.0f;
-    }
     pad.rt = static_cast<uint8_t>(rt * 255.0f + 0.5f);
     pad.lt = static_cast<uint8_t>(lt * 255.0f + 0.5f);
 
@@ -1043,15 +1033,6 @@ float input_hand_squeeze(int role) {
 void input_reserve_grip_bumper(int role, bool on) {
     if (role != 0 && role != 1) return;
     g_reserveMs[role].store(on ? GetTickCount64() : 0, std::memory_order_relaxed);
-}
-
-float input_hand_trigger(int role) {
-    return role == 0 || role == 1 ? g_trigger[role].load(std::memory_order_relaxed) : 0.0f;
-}
-
-void input_reserve_trigger(int role, bool on) {
-    if (role != 0 && role != 1) return;
-    g_reserveTrigMs[role].store(on ? GetTickCount64() : 0, std::memory_order_relaxed);
 }
 
 void input_haptic_pulse(int role, float amplitude, int durationMs) {

@@ -72,8 +72,6 @@ bool get_raw_hand_pose(int hand, bool aimPose, HeadPose& out);
 void set_two_hand_grip(bool on, const float grabLocal[3], const float offRelQuat[4]);
 float hand_squeeze(int role);
 void reserve_grip_bumper(int role, bool on);
-float hand_trigger(int role);             // raw 0..1 by role
-void reserve_trigger(int role, bool on);  // refresh each frame; composes as released
 void haptic_pulse(int role, float amplitude, int durationMs);
 
 // --- Session 20: vrrec record+replay support ---------------------------------
@@ -487,12 +485,6 @@ struct AimDotConfig {
 };
 
 void set_aim_dot(const AimDotConfig& cfg);
-
-// Hand calibration: up to 4 marker dots fixed in `role`'s RAW grip frame
-// (local offsets in metres, OpenXR grip axes), drawn on the physical
-// controller at submit time. Refresh every frame (expires after 250 ms);
-// on=false hides them. They share the laser's dot budget.
-void set_ctrl_markers(int role, bool on, const float local[][3], const float sizeDeg[], int n);
 
 // --- Session 40: a SECOND laser + dot slot (additive) -----------------------
 // For games whose hands are both active at once - BS2 is natively dual-wield,

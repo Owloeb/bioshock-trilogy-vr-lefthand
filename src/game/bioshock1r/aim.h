@@ -84,10 +84,6 @@ const char* active_weapon_key();
 // Player weapon shots so far (the fire seam, 40 ms debounce - one per shotgun
 // blast, one per Tommy gun round). Monotonic; hands.cpp diffs it for recoil.
 uint32_t player_shot_count();
-// Hand calibration: the weapon model turned by dq (weapon-controller frame, XR
-// axes; in the mirrored rig when `mirrored`). Turns every weapon's aim
-// correction the same way so the ray stays on the rendered barrel. Game thread.
-void rotate_weapon_aim(const float dq[4], bool mirrored);
 // Player ability fires (plasmid casts AND wrench swings - both use the
 // ability fire seam), same debounce. For haptics.
 uint32_t player_ability_count();
