@@ -1,4 +1,4 @@
-# bioshock-vr, left-handed edition
+# bioshock-vr, for southpaws
 
 A fork of [VR-Stereo-Hub/bioshock-trilogy-vr](https://github.com/VR-Stereo-Hub/bioshock-trilogy-vr)
 that makes BioShock Remastered play properly left-handed in VR, and adds the two-handed,
@@ -7,8 +7,7 @@ physical feel that VR shooters need.
 - **Weapon in your left hand, plasmids in your right**, with a mirrored viewmodel so you see a
   real left hand holding the gun.
 - **Both hands always visible.** Your off hand follows its controller instead of vanishing.
-- **Two-handed grips** on any weapon. Hold the shotgun's pump or the Tommy gun's foregrip with
-  your real hand, and the gun aims along both hands.
+- **Two-handed grips** on any weapon. All weapons should have supporting grips now.
 - **Recoil and haptics** on every weapon, wrench hits and plasmid casts.
 - **Plasmid aim calibration** for your hand, plus an aim dot for plasmids.
 - **Solid HUD bars.** The health and EVE fills no longer show the world through them.
@@ -195,7 +194,7 @@ that feature.
 - **The pump and lever follow copies the game's own hand animation.** Where the game moves a
   part of the gun without moving its hand, the held hand won't follow that part.
 - **Mirror mode can need a per-gun muzzle trim** where a gun's flash isn't attached to the
-  barrel.
+  barrel. In my testing only the Tommy Gun needed an offset of -5.00
 - **Tested by one player on one setup.** Controller profiles other than Quest Touch get the
   same bindings (haptics included), but haven't been tried on hardware.
 
@@ -215,7 +214,7 @@ that feature.
   hooks) are theirs.
 - **BioVRDev's BioVR**, whose design the always-visible off hand and two-handed grip are
   modelled on: the grab and release distances, the grab-zone buzz, and aiming along both hands.
-- Built by Owen with Claude (Anthropic).
+- Built with help by Claude (Anthropic).
 
 ---
 ---
