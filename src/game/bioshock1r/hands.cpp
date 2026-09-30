@@ -984,6 +984,133 @@ bool recoil_kick(const FrameContext& ctx, const GamePose& gp, bool held, Kick& k
     return true;
 }
 
+// ---- Arms: shoulder anchors (experimental, arms.ini) -------------------------
+// Each visible hand's arm hangs from a shoulder below and beside the head. The
+// shoulders follow a TORSO yaw that lags the head (a 25 deg deadzone plus a
+// slow drift), so looking around does not swing both arms. Computed in the
+// rig's own space - the virtual, head-mirrored one when mirroring - then put
+// through the same reflections as the hands, so the render mirror shows each
+// arm on the side of the hand it holds.
+std::atomic<bool> g_armsOn{true};
+std::atomic<float> g_shDownCm{20.0f}, g_shSideCm{18.0f}, g_shBackCm{6.0f};
+std::atomic<float> g_elbowOut{0.6f};
+std::atomic<bool> g_armsSave{false};
+bool g_armsLoaded = false;
+float g_torsoYaw = 0.0f;
+bool g_torsoValid = false;
+uint64_t g_torsoMs = 0;
+
+void arms_ini_path(wchar_t* out, size_t n) {
+    swprintf_s(out, n, L"%s\\arms.ini", bvr::log::data_dir());
+}
+void arms_save() {
+    wchar_t path[MAX_PATH];
+    arms_ini_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "# BioShock VR - arms (experimental)\n");
+    fprintf(f, "armsOn=%d\nshoulderDownCm=%.1f\nshoulderSideCm=%.1f\nshoulderBackCm=%.1f\n"
+               "elbowOut=%.2f\narmLength=%.2f\nscaleSkin=%d\n",
+            g_armsOn.load() ? 1 : 0, g_shDownCm.load(), g_shSideCm.load(), g_shBackCm.load(),
+            g_elbowOut.load(), bones::arm_length(), bones::arm_scale_skin() ? 1 : 0);
+    fclose(f);
+}
+void arms_load() {
+    g_armsLoaded = true;
+    wchar_t path[MAX_PATH];
+    arms_ini_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") == 0 && f) {
+        char line[128];
+        while (fgets(line, sizeof line, f)) {
+            char key[48] = {};
+            float v = 0.0f;
+            if (sscanf_s(line, "%47[^=]=%f", key, static_cast<unsigned>(sizeof key), &v) != 2)
+                continue;
+            if (strcmp(key, "armsOn") == 0) g_armsOn.store(v != 0.0f);
+            else if (strcmp(key, "shoulderDownCm") == 0) g_shDownCm.store(v);
+            else if (strcmp(key, "shoulderSideCm") == 0) g_shSideCm.store(v);
+            else if (strcmp(key, "shoulderBackCm") == 0) g_shBackCm.store(v);
+            else if (strcmp(key, "elbowOut") == 0) g_elbowOut.store(v);
+            else if (strcmp(key, "armLength") == 0 && v > 0.3f) bones::set_arm_length(v);
+            else if (strcmp(key, "scaleSkin") == 0) bones::set_arm_scale_skin(v != 0.0f);
+        }
+        fclose(f);
+    }
+    bones::set_arms(g_armsOn.load());
+}
+
+void reflect_point(float p[3], const float P[3], const float n[3]) {
+    const float k = 2.0f * ((p[0] - P[0]) * n[0] + (p[1] - P[1]) * n[1] + (p[2] - P[2]) * n[2]);
+    for (int i = 0; i < 3; ++i) p[i] -= k * n[i];
+}
+
+// Publish both clusters' shoulder + elbow-pole targets for this frame.
+void publish_arm_targets(const FrameContext& ctx, bool mirrorPose, bool gunPlane) {
+    if (!g_armsLoaded) arms_load();
+    if (g_armsSave.exchange(false)) arms_save();
+    bones::set_arms(g_armsOn.load(std::memory_order_relaxed));
+    if (!g_armsOn.load(std::memory_order_relaxed)) {
+        bones::set_arm_target(0, false, nullptr, nullptr);
+        bones::set_arm_target(1, false, nullptr, nullptr);
+        return;
+    }
+    bvr::vr::HeadPose head{};
+    if (!ctx.vrDriving || !bvr::vr::peek_head_pose(head)) {
+        bones::set_arm_target(0, false, nullptr, nullptr);
+        bones::set_arm_target(1, false, nullptr, nullptr);
+        return;
+    }
+    const float hp[3] = {head.px, head.py, head.pz};
+    const float hq[4] = {head.qx, head.qy, head.qz, head.qw};
+    const GamePose hw = xr_pose_to_game(ctx, hp, hq);
+
+    // Torso yaw: chase the head only past a deadzone, plus a slow drift.
+    const float headYaw = static_cast<float>(hw.rot.yaw) / kRotUnitsPerRadian;
+    const uint64_t now = GetTickCount64();
+    float dt = g_torsoMs ? (now - g_torsoMs) / 1000.0f : 0.0f;
+    g_torsoMs = now;
+    if (dt > 0.1f) dt = 0.1f;
+    if (!g_torsoValid) {
+        g_torsoYaw = headYaw;
+        g_torsoValid = true;
+    }
+    float diff = headYaw - g_torsoYaw;
+    while (diff > kPi) diff -= 2.0f * kPi;
+    while (diff < -kPi) diff += 2.0f * kPi;
+    const float dz = 25.0f / kRadToDeg;
+    if (diff > dz) g_torsoYaw += diff - dz;
+    else if (diff < -dz) g_torsoYaw += diff + dz;
+    g_torsoYaw += diff * (1.0f - expf(-dt / 1.5f)) * 0.5f;
+
+    FRotator tr{0, static_cast<int32_t>(g_torsoYaw * kRotUnitsPerRadian), 0};
+    float f[3], r[3], u[3];
+    ue_rot_basis(tr, f, r, u);
+    const float uu = ctx.worldScale / 100.0f;
+    const float down = g_shDownCm.load() * uu, side = g_shSideCm.load() * uu,
+                back = g_shBackCm.load() * uu, out = g_elbowOut.load();
+    const bool lh = bvr::input::left_handed();
+    for (int c = 0; c < 2; ++c) {
+        // Which side this cluster's arm hangs from: in the mirrored rig each
+        // cluster keeps its own side; unmirrored, it follows its controller.
+        float sgn = c == 1 ? 1.0f : -1.0f;
+        if (!mirrorPose && lh) sgn = -sgn;
+        float S[3], P[3];
+        for (int i = 0; i < 3; ++i) {
+            S[i] = (&hw.loc.x)[i] - u[i] * down + r[i] * side * sgn - f[i] * back;
+            P[i] = -u[i] + r[i] * out * sgn - f[i] * 0.3f;
+        }
+        if (gunPlane) {
+            reflect_point(S, g_hdH, g_hdN);
+            reflect_point(S, g_eyePlaneQ, g_eyePlaneN);
+            float t[3];
+            reflect_vec(P, g_hdN, t);
+            reflect_vec(t, g_eyePlaneN, P);
+        }
+        bones::set_arm_target(c, true, S, P);
+    }
+}
+
 // Always-visible off hand: the OTHER role's controller through the same chain
 // as the driven hand - XR pose (two-handed pose when gripped), the head-mirror
 // when mirroring, that hand's model trims and offsets, and in gun-plane mode
@@ -1782,6 +1909,7 @@ void on_calcview(const FrameContext& ctx) {
         // The weapon-scale lane rides the same per-frame slot (session 61);
         // it no-ops at wscale 1.0 and drops itself on weapon switches.
         bones::wskel_drive();
+        publish_arm_targets(ctx, mirrorPose, gunPlaneLive);
         // The other hand: tracked at its own controller (or collapsed as before).
         {
             GamePose offGp{};
@@ -2141,6 +2269,62 @@ void draw_debug_ui() {
                 g_lastPitch.load(std::memory_order_relaxed),
                 g_lastYaw.load(std::memory_order_relaxed),
                 g_lastRoll.load(std::memory_order_relaxed));
+}
+
+void draw_arms_ui() {
+    if (!ImGui::CollapsingHeader("Arms (experimental)")) return;
+    bool on = g_armsOn.load();
+    if (ImGui::Checkbox("Full arms (IK from the shoulders)", &on)) {
+        g_armsOn.store(on);
+        g_armsSave.store(true);
+    }
+    ImGui::TextDisabled("Shoulder position, from the centre of your head:");
+    float v = g_shDownCm.load();
+    if (ImGui::SliderFloat("shoulders down (cm)", &v, 5.0f, 40.0f)) {
+        g_shDownCm.store(v);
+        g_armsSave.store(true);
+    }
+    v = g_shSideCm.load();
+    if (ImGui::SliderFloat("shoulders apart, each side (cm)", &v, 8.0f, 30.0f)) {
+        g_shSideCm.store(v);
+        g_armsSave.store(true);
+    }
+    v = g_shBackCm.load();
+    if (ImGui::SliderFloat("shoulders back (cm)", &v, -10.0f, 25.0f)) {
+        g_shBackCm.store(v);
+        g_armsSave.store(true);
+    }
+    v = g_elbowOut.load();
+    if (ImGui::SliderFloat("elbows out", &v, 0.0f, 1.5f)) {
+        g_elbowOut.store(v);
+        g_armsSave.store(true);
+    }
+    v = bones::arm_length();
+    if (ImGui::SliderFloat("arm length (x Jack's)", &v, 0.6f, 1.8f)) {
+        bones::set_arm_length(v);
+        g_armsSave.store(true);
+    }
+    unsigned solves = 0, stretched = 0;
+    bones::arm_stats(&solves, &stretched);
+    static unsigned s_ls = 0, s_lt = 0, s_rs = 0, s_rt = 0;
+    static uint64_t s_ms = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - s_ms >= 1000) {
+        s_rs = solves - s_ls;
+        s_rt = stretched - s_lt;
+        s_ls = solves;
+        s_lt = stretched;
+        s_ms = now;
+    }
+    ImGui::Text("arms posed/s %u | at full reach/s %u", s_rs, s_rt);
+    ImGui::TextDisabled("Lots of 'full reach'? Raise the arm length or lower the shoulders.");
+    if (bvr::overlay::dev_tools()) {
+        bool sk = bones::arm_scale_skin();
+        if (ImGui::Checkbox("Scale the arm skin like the hands", &sk)) {
+            bones::set_arm_scale_skin(sk);
+            g_armsSave.store(true);
+        }
+    }
 }
 
 void on_eye_camera(int eye, const float loc[3], int32_t pitch, int32_t yaw, int32_t roll) {

@@ -54,6 +54,20 @@ void set_off_target(bool track, const GamePose* gp);
 // own off-hand motion relative to the gun (shotgun pump, chemical thrower
 // crank) onto it. Game thread, before drive().
 void set_off_follow(bool on);
+
+// Arms (two-bone IK, experimental): instead of collapsing a visible hand's
+// sleeve, pose clavicle / upper arm / elbow / twist helpers from a shoulder
+// point to the written wrist. Targets are in ENGINE world space (already
+// mirrored when the viewmodel mirror is on) and persist until changed; pole =
+// the direction the elbow bends toward. Game thread, before drive().
+void set_arm_target(int hand, bool valid, const float shoulderW[3], const float poleW[3]);
+void set_arms(bool on);
+void set_arm_length(float mult); // 1.0 = Jack's own arm (reference pose)
+float arm_length();
+bool arms();
+void set_arm_scale_skin(bool on); // scale the arm skin like the hands (default on)
+bool arm_scale_skin();
+void arm_stats(unsigned* solves, unsigned* stretched);
 // Draw the off hand in its grip shape without following (grab-point recording,
 // grab-zone preview). Game thread, before drive().
 void set_off_preview(bool on);

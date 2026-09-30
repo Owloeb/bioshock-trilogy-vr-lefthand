@@ -76,6 +76,8 @@ struct CachedSleeve {
     int idx;
     float p[3];
     float s[3];
+    float q[4];     // arms: the IK rotation
+    bool writeQ;    // false for the collapse (position + zero scale only)
 };
 CachedSleeve g_cacheSleeve[16]; // both hands' sleeves (off-hand tracking)
 int g_cacheSleeveCount = 0;
@@ -1127,6 +1129,286 @@ bool barrel_ref_axis(float d0[3]) {
     return true;
 }
 
+// ---- Arms (two-bone IK) -------------------------------------------------------
+// The AHands mesh carries BOTH complete arms: per side a clavicle, upper arm,
+// elbow and two forearm-twist helpers (patterns kBone*Sleeve, in that order).
+// The drive used to collapse them because they moved rigidly with the gun.
+// With arms on, each visible hand's sleeve is posed instead: the shoulder at a
+// point the game side derives from the head and a lagging torso yaw (already
+// mirrored into engine space when the viewmodel mirror is on), the wrist where
+// the hand cluster was just written, the elbow from the fixed bone lengths of
+// the engine's own reference pose, bent toward a pole (down and out). Bone
+// orientations are the reference orientations carried by the rotation that
+// maps each segment's reference frame (direction + bend-plane normal) onto the
+// solved one - so no bone-axis convention has to be known.
+std::atomic<bool> g_armsOn{false};
+std::atomic<bool> g_armScaleS{true}; // scale the arm skin like the hands (.s)
+std::atomic<float> g_armLength{1.0f}; // bone-length multiplier (reach vs Jack's arm)
+bool g_armTargetValid[2] = {false, false};
+float g_armShoulderW[2][3] = {};
+float g_armPoleW[2][3] = {};
+std::atomic<uint32_t> g_armSolves{0}, g_armStretched{0};
+
+void v_sub(const float a[3], const float b[3], float o[3]) {
+    for (int i = 0; i < 3; ++i) o[i] = a[i] - b[i];
+}
+float v_len(const float a[3]) { return sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]); }
+void v_cross(const float a[3], const float b[3], float o[3]) {
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+float v_dot(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+bool v_norm(float a[3]) {
+    const float l = v_len(a);
+    if (l < 1e-5f) return false;
+    for (int i = 0; i < 3; ++i) a[i] /= l;
+    return true;
+}
+
+// Rotation (quaternion, xyzw) from a 3x3 whose COLUMNS are the target axes
+// expressed in the source axes' coordinates.
+void mat_to_quat(const float m[3][3], float q[4]) {
+    const float tr = m[0][0] + m[1][1] + m[2][2];
+    if (tr > 0.0f) {
+        const float s = sqrtf(tr + 1.0f) * 2.0f;
+        q[3] = 0.25f * s;
+        q[0] = (m[2][1] - m[1][2]) / s;
+        q[1] = (m[0][2] - m[2][0]) / s;
+        q[2] = (m[1][0] - m[0][1]) / s;
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        const float s = sqrtf(1.0f + m[0][0] - m[1][1] - m[2][2]) * 2.0f;
+        q[3] = (m[2][1] - m[1][2]) / s;
+        q[0] = 0.25f * s;
+        q[1] = (m[0][1] + m[1][0]) / s;
+        q[2] = (m[0][2] + m[2][0]) / s;
+    } else if (m[1][1] > m[2][2]) {
+        const float s = sqrtf(1.0f + m[1][1] - m[0][0] - m[2][2]) * 2.0f;
+        q[3] = (m[0][2] - m[2][0]) / s;
+        q[0] = (m[0][1] + m[1][0]) / s;
+        q[1] = 0.25f * s;
+        q[2] = (m[1][2] + m[2][1]) / s;
+    } else {
+        const float s = sqrtf(1.0f + m[2][2] - m[0][0] - m[1][1]) * 2.0f;
+        q[3] = (m[1][0] - m[0][1]) / s;
+        q[0] = (m[0][2] + m[2][0]) / s;
+        q[1] = (m[1][2] + m[2][1]) / s;
+        q[2] = 0.25f * s;
+    }
+    const float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    for (int i = 0; i < 4; ++i) q[i] /= n;
+}
+
+// The rotation that takes frame (x0, n0) onto frame (x1, n1): x = segment
+// direction, n = bend-plane normal (both unit, orthogonalised here).
+bool frame_rotation(const float x0in[3], const float n0in[3], const float x1in[3],
+                    const float n1in[3], float q[4]) {
+    float x0[3] = {x0in[0], x0in[1], x0in[2]}, x1[3] = {x1in[0], x1in[1], x1in[2]};
+    if (!v_norm(x0) || !v_norm(x1)) return false;
+    float n0[3], n1[3], t[3];
+    const float d0 = v_dot(n0in, x0), d1 = v_dot(n1in, x1);
+    for (int i = 0; i < 3; ++i) {
+        n0[i] = n0in[i] - d0 * x0[i];
+        n1[i] = n1in[i] - d1 * x1[i];
+    }
+    if (!v_norm(n0) || !v_norm(n1)) return false;
+    float y0[3], y1[3];
+    v_cross(n0, x0, y0);
+    v_cross(n1, x1, y1);
+    // R = B1 * B0^T, B = [x y n] as columns.
+    const float* a0[3] = {x0, y0, n0};
+    const float* a1[3] = {x1, y1, n1};
+    float m[3][3];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            float sum = 0.0f;
+            for (int k = 0; k < 3; ++k) sum += a1[k][r] * a0[k][c];
+            m[r][c] = sum;
+        }
+    (void)t;
+    mat_to_quat(m, q);
+    return true;
+}
+
+// Swing-twist: the part of q that turns about unit axis `ax`.
+void twist_about(const float q[4], const float ax[3], float out[4]) {
+    const float d = q[0] * ax[0] + q[1] * ax[1] + q[2] * ax[2];
+    float t[4] = {ax[0] * d, ax[1] * d, ax[2] * d, q[3]};
+    const float n = sqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2] + t[3] * t[3]);
+    if (n < 1e-6f) {
+        out[0] = out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        return;
+    }
+    for (int i = 0; i < 4; ++i) out[i] = t[i] / n;
+}
+void quat_scale_angle(const float q[4], float f, float out[4]) {
+    float w = q[3] < -1.0f ? -1.0f : q[3] > 1.0f ? 1.0f : q[3];
+    const float ang = 2.0f * acosf(w);
+    const float sn = sqrtf(1.0f - w * w);
+    if (sn < 1e-5f) {
+        out[0] = out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        return;
+    }
+    const float h = 0.5f * ang * f;
+    for (int i = 0; i < 3; ++i) out[i] = q[i] / sn * sinf(h);
+    out[3] = cosf(h);
+}
+
+void write_arm_bone(int idx, const float p[3], const float q[4], float sScale) {
+    if (idx < 0 || idx >= g_boneCount) return;
+    write_n(g_bones[idx].p, p, 12);
+    write_n(g_bones[idx].q, q, 16);
+    float sv[3] = {g_ref[idx].s[0] * sScale, g_ref[idx].s[1] * sScale, g_ref[idx].s[2] * sScale};
+    write_n(g_bones[idx].s, sv, 12);
+    if (g_cacheSleeveCount < static_cast<int>(_countof(g_cacheSleeve))) {
+        CachedSleeve& cs = g_cacheSleeve[g_cacheSleeveCount++];
+        cs.idx = idx;
+        memcpy(cs.p, p, 12);
+        memcpy(cs.s, sv, 12);
+        memcpy(cs.q, q, 16);
+        cs.writeQ = true;
+    }
+}
+
+// Pose `hand`'s sleeve so it runs from its shoulder to the wrist just written
+// at Wt. False = no target / degenerate (caller collapses the sleeve instead).
+bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actorLoc[3]) {
+    if (!g_armsOn.load(std::memory_order_relaxed) || !g_armTargetValid[hand] || !g_refValid)
+        return false;
+    const int* sl = hand == 1 ? patterns::kBoneRSleeve : patterns::kBoneLSleeve;
+    const int cla = sl[0], upa = sl[1], elb = sl[2], tw1 = sl[3], tw2 = sl[4];
+    const int wri = hand == 1 ? patterns::kBoneRClusterFirst : patterns::kBoneLWrist;
+    for (int b : {cla, upa, elb, tw1, tw2, wri})
+        if (b < 0 || b >= g_boneCount) return false;
+
+    // Targets into component space.
+    float S[3], P[3];
+    {
+        const float dW[3] = {g_armShoulderW[hand][0] - actorLoc[0],
+                             g_armShoulderW[hand][1] - actorLoc[1],
+                             g_armShoulderW[hand][2] - actorLoc[2]};
+        qts_rotate(qaInv, dW, S);
+        qts_rotate(qaInv, g_armPoleW[hand], P);
+    }
+    const float sc = g_scale[hand].load(std::memory_order_relaxed);
+    const float* U0 = g_ref[upa].p;
+    const float* E0 = g_ref[elb].p;
+    const float* W0 = g_ref[wri].p;
+    float ue0[3], ew0[3], uw0[3];
+    v_sub(E0, U0, ue0);
+    v_sub(W0, E0, ew0);
+    v_sub(W0, U0, uw0);
+    const float len = g_armLength.load(std::memory_order_relaxed);
+    const float a = v_len(ue0) * sc * len, b = v_len(ew0) * sc * len;
+    if (a < 1.0f || b < 1.0f) return false;
+
+    // Reach: out of range, the SHOULDER gives (slides toward / away from the
+    // hand) rather than the hand leaving the controller.
+    float sw[3];
+    v_sub(Wt, S, sw);
+    float d = v_len(sw);
+    if (d < 1e-3f) return false;
+    float n[3] = {sw[0] / d, sw[1] / d, sw[2] / d};
+    const float maxR = (a + b) * 0.995f, minR = fabsf(a - b) * 1.05f + 0.5f;
+    if (d > maxR || d < minR) {
+        const float dd = d > maxR ? maxR : minR;
+        for (int i = 0; i < 3; ++i) S[i] = Wt[i] - n[i] * dd;
+        d = dd;
+        g_armStretched.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Elbow: law of cosines, bent toward the pole.
+    const float cosA = (a * a + d * d - b * b) / (2.0f * a * d);
+    const float sinA = sqrtf(fmaxf(0.0f, 1.0f - cosA * cosA));
+    float pp[3];
+    const float pd = v_dot(P, n);
+    for (int i = 0; i < 3; ++i) pp[i] = P[i] - pd * n[i];
+    if (!v_norm(pp)) return false;
+    float E[3];
+    for (int i = 0; i < 3; ++i) E[i] = S[i] + n[i] * a * cosA + pp[i] * a * sinA;
+
+    // Segment frames: reference vs solved.
+    float nRef[3], nNew[3], se[3], ew[3];
+    v_cross(ue0, ew0, nRef);
+    v_sub(E, S, se);
+    v_sub(Wt, E, ew);
+    v_cross(se, ew, nNew);
+    if (v_len(nRef) < 1e-4f) {
+        // The reference arm is straight: take its bend plane from the pole.
+        float ref_dir[3] = {uw0[0], uw0[1], uw0[2]};
+        v_norm(ref_dir);
+        float down[3] = {0.0f, 0.0f, -1.0f};
+        v_cross(ref_dir, down, nRef);
+    }
+    float qUp[4], qFore[4];
+    if (!frame_rotation(ue0, nRef, se, nNew, qUp)) return false;
+    if (!frame_rotation(ew0, nRef, ew, nNew, qFore)) return false;
+
+    const float sS = g_armScaleS.load(std::memory_order_relaxed) ? sc : 1.0f;
+    float q[4], p[3], rel[3], relR[3];
+
+    // Upper arm at the shoulder, elbow at the elbow.
+    quat_mul(qUp, g_ref[upa].q, q);
+    write_arm_bone(upa, S, q, sS);
+    quat_mul(qFore, g_ref[elb].q, q);
+    write_arm_bone(elb, E, q, sS);
+
+    // Clavicle rides the upper arm's swing only loosely: its reference offset
+    // from the shoulder, turned by half of the upper-arm rotation.
+    {
+        float half[4];
+        quat_scale_angle(qUp, 0.35f, half);
+        v_sub(g_ref[cla].p, U0, rel);
+        for (float& c : rel) c *= sc;
+        qts_rotate(half, rel, relR);
+        for (int i = 0; i < 3; ++i) p[i] = S[i] + relR[i];
+        quat_mul(half, g_ref[cla].q, q);
+        write_arm_bone(cla, p, q, sS);
+    }
+
+    // Twist helpers: along the forearm (reference offset from the elbow, forearm
+    // rotation), sharing out the wrist's twist about the forearm axis.
+    {
+        float implied[4], wq[4], wqInv[4], delta[4], tw[4], ax[3] = {ew[0], ew[1], ew[2]};
+        v_norm(ax);
+        quat_mul(qFore, g_ref[wri].q, implied);
+        if (!read_n(g_bones[wri].q, wq, 16)) return false; // the wrist as the drive wrote it
+        quat_conj(implied, wqInv);
+        quat_mul(wq, wqInv, delta);
+        twist_about(delta, ax, tw);
+        const int helpers[2] = {tw1, tw2};
+        const float frac[2] = {0.33f, 0.66f};
+        for (int k = 0; k < 2; ++k) {
+            const int h = helpers[k];
+            float part[4], qh[4];
+            quat_scale_angle(tw, frac[k], part);
+            v_sub(g_ref[h].p, E0, rel);
+            for (float& c : rel) c *= sc;
+            qts_rotate(qFore, rel, relR);
+            for (int i = 0; i < 3; ++i) p[i] = E[i] + relR[i];
+            quat_mul(qFore, g_ref[h].q, qh);
+            quat_mul(part, qh, q);
+            write_arm_bone(h, p, q, sS);
+        }
+    }
+    g_armSolves.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// Where the wrist of `hand` sits after rigid_cluster wrote it with (ptc, qtc)
+// from reference `src` about `anchor`.
+void written_wrist(int hand, int anchor, const float ptc[3], const float qtc[4], const Qts* src,
+                   float Wt[3]) {
+    const int wri = hand == 1 ? patterns::kBoneRClusterFirst : patterns::kBoneLWrist;
+    const float sc = g_scale[hand].load(std::memory_order_relaxed);
+    float rel[3] = {(src[wri].p[0] - src[anchor].p[0]) * sc, (src[wri].p[1] - src[anchor].p[1]) * sc,
+                    (src[wri].p[2] - src[anchor].p[2]) * sc};
+    float r[3];
+    qts_rotate(qtc, rel, r);
+    for (int i = 0; i < 3; ++i) Wt[i] = ptc[i] + r[i];
+}
+
 // One cluster, moved rigidly: rotate its reference pose by qtc about its
 // reference anchor point, then put the anchor point at ptc. Appends every write
 // to the reapply cache (the caller resets it once per drive).
@@ -1289,7 +1571,14 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
                        relaxed ? g_neutral : gripShape ? g_gripShape : g_ref))
         return false;
     static const float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (collapse) {
+    bool armed = false;
+    if (g_armsOn.load(std::memory_order_relaxed)) {
+        const Qts* srcUsed = relaxed ? g_neutral : gripShape ? g_gripShape : g_ref;
+        float Wt[3];
+        written_wrist(ih, anchor, ptc, qtc, srcUsed, Wt);
+        armed = arm_ik(ih, Wt, qaInv, actorLoc);
+    }
+    if (collapse && !armed) {
         const int* sleeve = ih == 1 ? patterns::kBoneRSleeve : patterns::kBoneLSleeve;
         const size_t n = ih == 1 ? _countof(patterns::kBoneRSleeve) : _countof(patterns::kBoneLSleeve);
         for (size_t k = 0; k < n; ++k) {
@@ -1302,6 +1591,7 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
                 cs.idx = idx;
                 memcpy(cs.p, ptc, 12);
                 memcpy(cs.s, kZero, 12);
+                cs.writeQ = false;
             }
         }
     }
@@ -1609,10 +1899,17 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     // written back explicitly - the engine cannot be relied on to re-evaluate
     // while the drive keeps clearing the dirty flag.
     bool collapse = g_collapse.load(std::memory_order_relaxed);
+    bool armed = false;
+    if (g_armsOn.load(std::memory_order_relaxed)) {
+        float Wt[3];
+        written_wrist(hand, anchor, ptc, qtc, g_ref, Wt);
+        armed = arm_ik(hand, Wt, qaInv, actorLoc);
+    }
+    const bool collapseThis = collapse && !armed;
     const int* sleeve = hand == 1 ? patterns::kBoneRSleeve : patterns::kBoneLSleeve;
     const size_t sleeveCount = hand == 1 ? _countof(patterns::kBoneRSleeve)
                                          : _countof(patterns::kBoneLSleeve);
-    if (collapse) {
+    if (collapseThis) {
         static const float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (size_t k = 0; k < sleeveCount; ++k) {
             int idx = sleeve[k];
@@ -1624,9 +1921,10 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
                 cs.idx = idx;
                 memcpy(cs.p, ptc, 12);
                 memcpy(cs.s, kZero, 12);
+                cs.writeQ = false;
             }
         }
-    } else if (g_wasCollapsed) {
+    } else if (g_wasCollapsed && !armed) {
         for (size_t k = 0; k < sleeveCount; ++k) {
             int idx = sleeve[k];
             if (idx >= g_boneCount) continue;
@@ -1634,8 +1932,8 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             write_n(g_bones[idx].s, g_ref[idx].s, 12);
         }
     }
-    g_wasCollapsed = collapse;
-    g_collapsedHand = collapse ? hand : -1;
+    g_wasCollapsed = collapseThis;
+    g_collapsedHand = collapseThis ? hand : -1;
 
     // Collapse the whole INACTIVE hand: cluster + its sleeve (session 19).
     // Zero scale hides the skin exactly like the sleeve collapse; positions
@@ -1687,6 +1985,24 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     return true;
 }
 
+void set_arm_target(int hand, bool valid, const float shoulderW[3], const float poleW[3]) {
+    if (hand != 0 && hand != 1) return;
+    g_armTargetValid[hand] = valid && shoulderW && poleW;
+    if (!g_armTargetValid[hand]) return;
+    memcpy(g_armShoulderW[hand], shoulderW, 12);
+    memcpy(g_armPoleW[hand], poleW, 12);
+}
+void set_arms(bool on) { g_armsOn.store(on, std::memory_order_relaxed); }
+void set_arm_length(float m) { g_armLength.store(m, std::memory_order_relaxed); }
+float arm_length() { return g_armLength.load(std::memory_order_relaxed); }
+bool arms() { return g_armsOn.load(std::memory_order_relaxed); }
+void set_arm_scale_skin(bool on) { g_armScaleS.store(on, std::memory_order_relaxed); }
+bool arm_scale_skin() { return g_armScaleS.load(std::memory_order_relaxed); }
+void arm_stats(unsigned* solves, unsigned* stretched) {
+    *solves = g_armSolves.load(std::memory_order_relaxed);
+    *stretched = g_armStretched.load(std::memory_order_relaxed);
+}
+
 void set_off_follow(bool on) { g_offFollow = on; }
 void set_off_preview(bool on) { g_offPreview = on; }
 
@@ -1715,6 +2031,7 @@ void reapply() {
         if (cs.idx >= g_boneCount) continue;
         write_n(g_bones[cs.idx].p, cs.p, 12);
         write_n(g_bones[cs.idx].s, cs.s, 12);
+        if (cs.writeQ) write_n(g_bones[cs.idx].q, cs.q, 16);
     }
     for (int k = 0; k < g_cacheHiddenCount; ++k) {
         const CachedHidden& ch = g_cacheHidden[k];
