@@ -113,6 +113,9 @@ constexpr int16_t kPitchServoMax = 8000; // ~24% deflection
 std::atomic<float> g_turnScale{1.0f};
 std::atomic<bool> g_snapTurn{false};
 std::atomic<int> g_ammoMod{1}; // AmmoMod::Thumbrest (user's call, session 23)
+// Left-handed mode + stick swap (see xinput_bridge.h). Default off.
+std::atomic<bool> g_leftHanded{false};
+std::atomic<bool> g_swapSticks{false};
 // Session 44: which per-game map the XR composer builds. 0 == PadProfile::
 // Bioshock1, the historical hardcoded semantics, so BS1 and BS2 (which never
 // call the setter) compose exactly what they composed before.
@@ -651,7 +654,10 @@ void log_status() {
 
 } // namespace
 
+void load_handedness();
+
 void init() {
+    load_handedness();
     // Two modules named xinput1_3.dll are in-process: our proxy (game folder,
     // loaded via the game's static import) and the real one (SysWOW64, loaded
     // by the proxy). Resolve the proxy deterministically by exe-dir full path;
@@ -794,6 +800,70 @@ AmmoMod ammo_mod() {
 }
 void set_ammo_mod(AmmoMod m) {
     g_ammoMod.store(static_cast<int>(m), std::memory_order_relaxed);
+}
+
+// Hand-setup persistence (handedness.ini, shared by every game). Saved the
+// moment a setting changes and loaded at init, independent of any per-game
+// preset - a preset is only written by an explicit Save, so a checkbox change
+// kept there would be lost at the next launch.
+bool g_handLoading = false;
+bool g_handLoaded = false;
+
+void handedness_path(wchar_t* out, size_t count) {
+    swprintf_s(out, count, L"%s\\handedness.ini", bvr::log::data_dir());
+}
+
+void save_handedness() {
+    if (g_handLoading || !g_handLoaded) return;
+    wchar_t path[MAX_PATH];
+    handedness_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "# BioShock VR - hand setup (saved automatically)\n");
+    fprintf(f, "leftHanded=%d\nswapSticks=%d\n", g_leftHanded.load() ? 1 : 0,
+            g_swapSticks.load() ? 1 : 0);
+    fclose(f);
+}
+
+void load_handedness() {
+    g_handLoaded = true;
+    wchar_t path[MAX_PATH];
+    handedness_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    g_handLoading = true;
+    char line[96];
+    while (fgets(line, sizeof line, f)) {
+        char key[48] = {};
+        int v = 0;
+        if (sscanf_s(line, "%47[^=]=%d", key, static_cast<unsigned>(sizeof key), &v) != 2) continue;
+        if (strcmp(key, "leftHanded") == 0) set_left_handed(v != 0);
+        else if (strcmp(key, "swapSticks") == 0) set_swap_sticks(v != 0);
+    }
+    g_handLoading = false;
+    fclose(f);
+    BVR_LOG("input: hand setup loaded (%s-handed%s)", g_leftHanded.load() ? "left" : "right",
+            g_swapSticks.load() ? ", sticks swapped" : "");
+}
+
+bool left_handed() { return g_leftHanded.load(std::memory_order_relaxed); }
+void set_left_handed(bool on) {
+    const bool was = g_leftHanded.exchange(on, std::memory_order_relaxed);
+    if (was != on) save_handedness();
+    if (was != on)
+        BVR_LOG("input: handedness %s - weapon (aim, laser, viewmodel, fire trigger, "
+                "weapon grip, swing) on the %s controller, plasmid on the %s",
+                on ? "LEFT" : "right", on ? "LEFT" : "right", on ? "right" : "left");
+}
+bool swap_sticks() { return g_swapSticks.load(std::memory_order_relaxed); }
+void set_swap_sticks(bool on) {
+    const bool was = g_swapSticks.exchange(on, std::memory_order_relaxed);
+    if (was != on) save_handedness();
+    if (was != on)
+        BVR_LOG("input: sticks %s - move on the %s stick, turn on the %s; the ammo "
+                "thumbrest modifier is the %s one",
+                on ? "SWAPPED" : "normal", on ? "right" : "left", on ? "left" : "right",
+                on ? "RIGHT" : "left");
 }
 
 PadProfile pad_profile() {
@@ -948,6 +1018,16 @@ void handle_command(const char* args) {
                 m == AmmoMod::Click       ? "CLICK (hold right stick click)"
                 : m == AmmoMod::Thumbrest ? "THUMBREST (rest left thumb)"
                                           : "BOTH (either)");
+    } else if (strcmp(verb, "hand") == 0) {
+        if (strncmp(rest, "left", 4) == 0) set_left_handed(true);
+        else if (strncmp(rest, "right", 5) == 0) set_left_handed(false);
+        BVR_LOG("input: weapon hand = %s (vrinput hand left|right)",
+                left_handed() ? "LEFT" : "right");
+    } else if (strcmp(verb, "sticks") == 0) {
+        if (strncmp(rest, "swap", 4) == 0) set_swap_sticks(true);
+        else if (strncmp(rest, "normal", 6) == 0) set_swap_sticks(false);
+        BVR_LOG("input: sticks %s (vrinput sticks swap|normal)",
+                swap_sticks() ? "SWAPPED (move right, turn left)" : "normal (move left, turn right)");
     } else if (strcmp(verb, "swing") == 0) {
         bvr::input::swing::handle_command(rest); // logs its own echoes
     } else if (strcmp(verb, "sticklog") == 0) {
@@ -1068,15 +1148,27 @@ void draw_debug_ui() {
     // Session 23: how you hold the ammo-select modifier. Thumbrest is the
     // default; "Both" exists for controllers whose runtime reports no
     // thumbrest at all (Pico, some SteamVR setups) - see xinput_bridge.h.
+    // Left-handed mode (roles swap; see xinput_bridge.h).
+    bool lh = g_leftHanded.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Left-handed (weapon in left hand, plasmid in right)", &lh))
+        set_left_handed(lh);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Weapon aim, laser, viewmodel, fire trigger, weapon grip and\n"
+                          "swing-to-attack move to the LEFT controller; plasmids to the right.\n"
+                          "Buttons (A/B/X/Y/menu) stay where they are. Per-hand tuning follows\n"
+                          "the role, so re-check the weapon offsets once after switching.");
+    bool ss = g_swapSticks.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Swap sticks (move right, turn left)", &ss)) set_swap_sticks(ss);
+
     int am = g_ammoMod.load(std::memory_order_relaxed);
-    const char* amNames[] = {"Right-stick click", "Left thumbrest", "Either"};
+    const char* amNames[] = {"Turn-stick click", "Thumbrest (move-stick hand)", "Either"};
     if (ImGui::Combo("Ammo-select modifier", &am, amNames, 3))
         set_ammo_mod(static_cast<AmmoMod>(am));
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Hold this, then push the RIGHT stick up/down/left to pick an "
-                          "ammo slot.\nThe thumbrest is the pad above the buttons - it is "
-                          "the LEFT one,\nbecause your right thumb cannot rest and push the "
-                          "right stick at once.");
+        ImGui::SetTooltip("Hold this, then push the TURN stick up/down/left to pick an "
+                          "ammo slot.\nThe thumbrest is the pad above the buttons, on the "
+                          "MOVE-stick hand,\nbecause one thumb cannot rest and push a stick "
+                          "at once.");
 
     // Session 31 swing-to-attack (its own module; see core/input/swing.h).
     ImGui::Separator();

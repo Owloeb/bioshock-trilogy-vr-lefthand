@@ -141,6 +141,22 @@ void set_snap_angle_deg(float d);
 enum class AmmoMod { Click = 0, Thumbrest = 1, Both = 2 };
 AmmoMod ammo_mod();
 void set_ammo_mod(AmmoMod m);
+
+// Left-handed mode. Swaps ROLES, not bindings: the XR bindings stay physical
+// (so A/B, X/Y and menu keep working on every profile), and the XR composer
+// routes the LEFT controller's grip/aim pose, trigger and grip into the WEAPON
+// role (hand slot 1) and the right controller into the PLASMID role (slot 0).
+// Every consumer (aim ray, laser, viewmodel, swing-to-attack, per-hand trims
+// and offsets) is keyed by role, so they all follow automatically. The visible
+// weapon is still the right-hand mesh - mirroring it is not possible here.
+// Default off: right-handed users see no change.
+bool left_handed();
+void set_left_handed(bool on);
+// Independent companion toggle: MOVE on the right stick, TURN on the left.
+// The stick clicks and the thumbrest ammo modifier follow the sticks, so the
+// modifier is always on the hand opposite the turn stick.
+bool swap_sticks();
+void set_swap_sticks(bool on);
 int take_snap_steps(); // +right/-left steps queued since the last drain
 
 // Feedback session 2 (2026-08-13): BOTH-STICKS-CLICK = recenter chord. The XR

@@ -593,10 +593,19 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
 
     // M6: hand grip poses for the aim ray (never fatal - a hand that fails to
     // locate just leaves its slot invalid and the aim falls back to the view).
-    locate_hand(session, g_poseL, g_gripSpaceL, predictedDisplayTime, g_hands[0]);
-    locate_hand(session, g_poseR, g_gripSpaceR, predictedDisplayTime, g_hands[1]);
-    locate_hand(session, g_aimL, g_aimSpaceL, predictedDisplayTime, g_aims[0]);
-    locate_hand(session, g_aimR, g_aimSpaceR, predictedDisplayTime, g_aims[1]);
+    //
+    // Left-handed mode: the slots are ROLES (0 = plasmid, 1 = weapon), and every
+    // consumer (aim ray, laser, viewmodel, swing, per-hand tuning) reads them by
+    // role. So swapping which PHYSICAL controller fills which slot is the whole
+    // pose half of handedness - the bindings themselves stay physical.
+    const bool lh = bvr::input::left_handed();
+    const bool sw = bvr::input::swap_sticks();
+    const int slotL = lh ? 1 : 0; // role slot the physical LEFT controller fills
+    const int slotR = lh ? 0 : 1;
+    locate_hand(session, g_poseL, g_gripSpaceL, predictedDisplayTime, g_hands[slotL]);
+    locate_hand(session, g_poseR, g_gripSpaceR, predictedDisplayTime, g_hands[slotR]);
+    locate_hand(session, g_aimL, g_aimSpaceL, predictedDisplayTime, g_aims[slotL]);
+    locate_hand(session, g_aimR, g_aimSpaceR, predictedDisplayTime, g_aims[slotR]);
 
     // Session 31 swing-to-attack: feed the right hand's motion to the detector.
     // Read through input_get_hand_pose rather than off g_hands[1] directly, so
@@ -617,8 +626,12 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
     bvr::input::Gamepad pad{};
 
     float mx = 0.0f, my = 0.0f, lx = 0.0f, ly = 0.0f;
-    read_vec2(session, g_move, &mx, &my);
-    read_vec2(session, g_look, &lx, &ly);
+    // Physical sticks -> roles. g_move/g_look are bound to the physical left/
+    // right sticks; with the stick swap the right stick moves and the left turns.
+    const XrAction moveStick = sw ? g_look : g_move;
+    const XrAction lookStick = sw ? g_move : g_look;
+    read_vec2(session, moveStick, &mx, &my);
+    read_vec2(session, lookStick, &lx, &ly);
     apply_deadzone(mx, my);
     apply_deadzone(lx, ly);
     pad.lx = axis_to_thumb(mx);
@@ -626,13 +639,17 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
     pad.rx = axis_to_thumb(lx);
     pad.ry = axis_to_thumb(ly);
 
-    float rt = read_float(session, g_fire);
-    float lt = read_float(session, g_plasmid);
+    // g_fire / g_plasmid are bound to the physical right / left triggers; the
+    // WEAPON trigger is whichever controller holds the weapon role.
+    float rt = read_float(session, lh ? g_plasmid : g_fire);
+    float lt = read_float(session, lh ? g_fire : g_plasmid);
     pad.rt = static_cast<uint8_t>(rt * 255.0f + 0.5f);
     pad.lt = static_cast<uint8_t>(lt * 255.0f + 0.5f);
 
-    float gl = read_float(session, g_gripL);
-    float gr = read_float(session, g_gripR);
+    // gl/gr are ROLE grips (plasmid / weapon), read from the physical side
+    // that holds each role.
+    float gl = read_float(session, lh ? g_gripR : g_gripL);
+    float gr = read_float(session, lh ? g_gripL : g_gripR);
     g_gripLatchedL = g_gripLatchedL ? (gl >= kGripRelease) : (gl >= kGripPress);
     g_gripLatchedR = g_gripLatchedR ? (gr >= kGripRelease) : (gr >= kGripPress);
 
@@ -688,8 +705,10 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
     // cannot also sprint/zoom/select ammo. The single-frame leak of the
     // first-pressed click before the second joins is accepted - same class
     // as the documented radial-grip leak.
-    const bool clickL = read_bool(session, g_stickClickL);
-    const bool clickRraw = read_bool(session, g_stickClickR);
+    // ROLE clicks: clickL = the MOVE stick's click, clickRraw = the TURN
+    // stick's. With the stick swap those are the physical right / left.
+    const bool clickL = read_bool(session, sw ? g_stickClickR : g_stickClickL);
+    const bool clickRraw = read_bool(session, sw ? g_stickClickL : g_stickClickR);
     const bool chordHeld = clickL && clickRraw;
     static bool s_chordArmed = true;
     if (chordHeld && s_chordArmed) {
@@ -719,7 +738,7 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
     // radials read the stick).
     if (map.flick) {
         float rawX = 0.0f, rawY = 0.0f;
-        read_vec2(session, g_look, &rawX, &rawY);
+        read_vec2(session, lookStick, &rawX, &rawY);
         bool gripHeld = g_gripLatchedL || g_gripLatchedR;
 
         // Session 23: the modifier can also be the LEFT thumbrest. It has to be
@@ -728,8 +747,12 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
         // necessarily cross-hand. Slot directions stay on the right stick, so
         // nobody's muscle memory changes.
         const bool rsClick = clickRraw && !chordHeld;
+        // Physical thumbrests. The MODIFIER is the one on the move-stick hand
+        // (opposite the turn stick) - the physical right one under the swap.
         const bool restL = read_bool(session, g_thumbrestL);
         const bool restR = read_bool(session, g_thumbrestR);
+        const bool restMove = sw ? restR : restL;
+        const int restMoveIdx = sw ? 1 : 0;
         for (int i = 0; i < 2; ++i) {
             if ((i == 0 ? restL : restR) && !g_thumbrestSeen[i]) {
                 g_thumbrestSeen[i] = true;
@@ -745,7 +768,7 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
         // modifier, and the ammo-modifier preference (a BioShock 1 comfort
         // setting) does not apply. Thumbrest-only, unconditionally.
         bool clickMod = false;
-        bool restMod = restL;
+        bool restMod = restMove;
         if (map.flickAmmoModPref) {
             const bvr::input::AmmoMod mode = bvr::input::ammo_mod();
             // Thumbrest is the default, but not every controller has one (Pico
@@ -754,9 +777,9 @@ void input_sync(XrSession session, XrTime predictedDisplayTime) {
             // Thumbrest mode the stick click keeps working UNTIL a real
             // thumbrest touch is observed - after that the mapping is exactly
             // what was chosen.
-            const bool noThumbrestYet = !g_thumbrestSeen[0];
+            const bool noThumbrestYet = !g_thumbrestSeen[restMoveIdx];
             clickMod = (mode != bvr::input::AmmoMod::Thumbrest || noThumbrestYet) && rsClick;
-            restMod = mode != bvr::input::AmmoMod::Click && restL;
+            restMod = mode != bvr::input::AmmoMod::Click && restMove;
         }
         const bool modHeld = clickMod || restMod;
 

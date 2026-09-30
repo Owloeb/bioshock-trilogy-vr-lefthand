@@ -16,6 +16,8 @@
 #include <imgui_impl_win32.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cwchar>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -31,6 +33,93 @@ ID3D11RenderTargetView* g_rtv = nullptr;
 ID3D11Texture2D* g_rtvBackbuffer = nullptr; // identity only, never deref'd
 HWND g_window = nullptr;
 WNDPROC g_originalWndProc = nullptr;
+
+// ---------------------------------------------------------------------------
+// Readable overlay at any backbuffer size.
+//
+// ImGui's Win32 backend lays out in WINDOW CLIENT pixels (io.DisplaySize from
+// GetClientRect, and the mouse arrives in the same units), but the overlay is
+// drawn into the game's BACKBUFFER. The README tells users to run a near-square
+// backbuffer (e.g. 2750x2850); on a normal monitor Windows shrinks that window,
+// so the backbuffer and the client area differ - by a DIFFERENT factor on each
+// axis. Drawn 1:1 into the backbuffer, the menu then landed in a corner and was
+// scaled down non-uniformly on its way to the window: squashed, unreadable, and
+// the mouse no longer lined up with it.
+//
+// io.DisplayFramebufferScale is ImGui's own lever for exactly this split
+// (logical vs framebuffer pixels; the DX11 backend honours it for the viewport
+// and scissor): layout and mouse stay in client pixels, the render stretches to
+// the full backbuffer, and the window's own downscale undoes the stretch. At
+// backbuffer == client size the scale is (1,1) and nothing changes.
+//
+// On top of that, a user text-size factor (style.FontScaleMain + spacing),
+// persisted in overlay.ini beside the log.
+// ---------------------------------------------------------------------------
+constexpr float kUiScaleMin = 0.75f;
+constexpr float kUiScaleMax = 3.0f;
+float g_uiScale = 1.25f;     // user factor; 1.25 reads comfortably on a desktop mirror
+float g_appliedScale = 0.0f; // what the style currently carries (0 = base style)
+ImGuiStyle g_baseStyle;      // unscaled style, so re-scaling never compounds
+
+void ui_scale_path(wchar_t* out, size_t cap) {
+    const wchar_t* dir = bvr::log::data_dir();
+    swprintf(out, cap, L"%s\\overlay.ini", dir ? dir : L".");
+}
+
+void load_ui_scale() {
+    wchar_t path[MAX_PATH];
+    ui_scale_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        float v = 0.0f;
+        if (sscanf_s(line, "uiScale=%f", &v) == 1 && v >= kUiScaleMin && v <= kUiScaleMax)
+            g_uiScale = v;
+    }
+    fclose(f);
+}
+
+void save_ui_scale() {
+    wchar_t path[MAX_PATH];
+    ui_scale_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "uiScale=%.2f\n", g_uiScale);
+    fclose(f);
+    BVR_LOG("overlay: text size %.2f saved", g_uiScale);
+}
+
+void apply_ui_scale() {
+    if (g_appliedScale == g_uiScale) return;
+    ImGuiStyle& st = ImGui::GetStyle();
+    st = g_baseStyle;
+    st.ScaleAllSizes(g_uiScale);
+    st.FontScaleMain = g_uiScale;
+    g_appliedScale = g_uiScale;
+}
+
+// Called between the Win32 NewFrame (which sets DisplaySize = client size) and
+// ImGui::NewFrame.
+void apply_framebuffer_scale(IDXGISwapChain* swapchain) {
+    ImGuiIO& io = ImGui::GetIO();
+    DXGI_SWAP_CHAIN_DESC d{};
+    float sx = 1.0f, sy = 1.0f;
+    if (SUCCEEDED(swapchain->GetDesc(&d)) && io.DisplaySize.x > 0.0f &&
+        io.DisplaySize.y > 0.0f && d.BufferDesc.Width && d.BufferDesc.Height) {
+        sx = static_cast<float>(d.BufferDesc.Width) / io.DisplaySize.x;
+        sy = static_cast<float>(d.BufferDesc.Height) / io.DisplaySize.y;
+    }
+    static float s_loggedX = 0.0f, s_loggedY = 0.0f;
+    if (sx != s_loggedX || sy != s_loggedY) {
+        s_loggedX = sx;
+        s_loggedY = sy;
+        BVR_LOG("overlay: window %.0fx%.0f, backbuffer %ux%u -> framebuffer scale %.3f x %.3f",
+                io.DisplaySize.x, io.DisplaySize.y, d.BufferDesc.Width, d.BufferDesc.Height,
+                sx, sy);
+    }
+    io.DisplayFramebufferScale = ImVec2(sx, sy);
+}
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     // Session 38: the subclass is on the GAME's main window, so it is the
@@ -83,6 +172,9 @@ bool Init(IDXGISwapChain* swapchain) {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; // don't scatter imgui.ini into the game folder
     ImGui::StyleColorsDark();
+    g_baseStyle = ImGui::GetStyle();
+    load_ui_scale();
+    apply_ui_scale();
     ImGui_ImplWin32_Init(g_window);
     ImGui_ImplDX11_Init(g_device, g_context);
 
@@ -94,11 +186,15 @@ bool Init(IDXGISwapChain* swapchain) {
 }
 
 void DrawUi() {
-    ImGui::SetNextWindowSize(ImVec2(420, 420), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(420 * g_uiScale, 420 * g_uiScale), ImGuiCond_FirstUseEver);
     // Build id in the title so an in-headset screenshot identifies the build.
     ImGui::Begin("BioShock VR " BVR_VERSION " [" BVR_BUILD_ID "]");
     ImGui::Text("%.1f fps (%.2f ms)", ImGui::GetIO().Framerate,
                 1000.0f / ImGui::GetIO().Framerate);
+    // Readability first, so it is reachable however unreadable the rest is.
+    ImGui::SetNextItemWidth(160.0f * g_uiScale);
+    ImGui::SliderFloat("Menu text size", &g_uiScale, kUiScaleMin, kUiScaleMax, "%.2f");
+    if (ImGui::IsItemDeactivatedAfterEdit()) save_ui_scale();
     ImGui::Separator();
     vr::draw_debug_ui();
     ImGui::Separator();
@@ -157,6 +253,8 @@ void on_present(IDXGISwapChain* swapchain) {
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    apply_framebuffer_scale(swapchain);
+    apply_ui_scale();
     ImGui::NewFrame();
     DrawUi();
     ImGui::Render();
