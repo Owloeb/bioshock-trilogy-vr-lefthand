@@ -42,6 +42,7 @@ void Bioshock1RAdapter::drawDebugUi() {
     aim::draw_debug_ui();
     hands::draw_debug_ui();
     twohand::draw_debug_ui();
+    hands::draw_calibration_ui();
     hands::draw_arms_ui();
     body::draw_debug_ui();
     input_drive::draw_debug_ui();

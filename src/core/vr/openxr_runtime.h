@@ -486,6 +486,12 @@ struct AimDotConfig {
 
 void set_aim_dot(const AimDotConfig& cfg);
 
+// Hand calibration: up to 4 marker dots fixed in `role`'s RAW grip frame
+// (local offsets in metres, OpenXR grip axes), drawn on the physical
+// controller at submit time. Refresh every frame (expires after 250 ms);
+// on=false hides them. They share the laser's dot budget.
+void set_ctrl_markers(int role, bool on, const float local[][3], const float sizeDeg[], int n);
+
 // --- Session 40: a SECOND laser + dot slot (additive) -----------------------
 // For games whose hands are both active at once - BS2 is natively dual-wield,
 // so the weapon hand and the plasmid hand each need their own beam and dot,

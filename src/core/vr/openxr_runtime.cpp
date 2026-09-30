@@ -3338,6 +3338,61 @@ uint32_t build_aim_dot_slot(XrCompositionLayerQuad* quad, int slot) {
     return 1;
 }
 
+// Controller markers (hand calibration): up to kMaxMarkers dots fixed in a
+// role's RAW grip frame, placed at submit time from the freshest pose so they
+// sit exactly on the physical controller. Share the laser's dot budget.
+constexpr int kMaxMarkers = 4;
+std::atomic<bool> g_markOn{false};
+std::atomic<int> g_markRole{1};
+std::atomic<int> g_markCount{0};
+std::atomic<float> g_markLocal[kMaxMarkers][3];
+std::atomic<float> g_markSizeDeg[kMaxMarkers];
+std::atomic<uint64_t> g_markStampMs{0};
+
+uint32_t build_markers(XrCompositionLayerQuad* quads, int budget) {
+    if (!g_markOn.load(std::memory_order_relaxed) || budget < 1) return 0;
+    if (GetTickCount64() - g_markStampMs.load(std::memory_order_relaxed) > 250) return 0;
+    if (g_laserSwapchain == XR_NULL_HANDLE || !g_laserDot || !g_viewsValid) return 0;
+    float gp[3], gq[4];
+    if (!input_get_raw_hand_pose(g_markRole.load(std::memory_order_relaxed), false, gp, gq))
+        return 0;
+    const float head[3] = {(g_views[0].pose.position.x + g_views[1].pose.position.x) * 0.5f,
+                           (g_views[0].pose.position.y + g_views[1].pose.position.y) * 0.5f,
+                           (g_views[0].pose.position.z + g_views[1].pose.position.z) * 0.5f};
+    int n = g_markCount.load(std::memory_order_relaxed);
+    if (n > kMaxMarkers) n = kMaxMarkers;
+    if (n > budget) n = budget;
+    constexpr float kDegToRad = 3.14159265f / 180.0f;
+    uint32_t built = 0;
+    for (int i = 0; i < n; ++i) {
+        const float l[3] = {g_markLocal[i][0].load(std::memory_order_relaxed),
+                            g_markLocal[i][1].load(std::memory_order_relaxed),
+                            g_markLocal[i][2].load(std::memory_order_relaxed)};
+        float w[3];
+        bvr::xrmath::quat_rotate(gq[0], gq[1], gq[2], gq[3], l, w);
+        const float p[3] = {gp[0] + w[0], gp[1] + w[1], gp[2] + w[2]};
+        float toHead[3] = {head[0] - p[0], head[1] - p[1], head[2] - p[2]};
+        const float len = sqrtf(toHead[0] * toHead[0] + toHead[1] * toHead[1] + toHead[2] * toHead[2]);
+        if (len < 0.02f) continue;
+        for (float& c : toHead) c /= len;
+        XrCompositionLayerQuad& q = quads[built];
+        q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+        q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        q.space = g_space;
+        q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        q.subImage.swapchain = g_laserSwapchain;
+        q.subImage.imageRect = {
+            {0, 0}, {static_cast<int32_t>(kLaserTexSize), static_cast<int32_t>(kLaserTexSize)}};
+        q.pose.position = {p[0], p[1], p[2]};
+        q.pose.orientation = quat_facing(toHead);
+        const float side =
+            2.0f * len * tanf(g_markSizeDeg[i].load(std::memory_order_relaxed) * kDegToRad * 0.5f);
+        q.size = {side, side};
+        ++built;
+    }
+    return built;
+}
+
 uint32_t build_aim_dot_layer(XrCompositionLayerQuad* quad) {
     return build_aim_dot_slot(quad, 0);
 }
@@ -3935,6 +3990,9 @@ void on_present_end(IDXGISwapChain* swapchain) {
         uint32_t dots = build_laser_from(snapshot_laser_slot(0), laserQuads, kMaxLaserDots);
         uint32_t dots2 = build_laser_from(snapshot_laser_slot(1), laserQuads + dots,
                                           kMaxLaserDots - static_cast<int>(dots));
+        uint32_t marks = build_markers(laserQuads + dots + dots2,
+                                       kMaxLaserDots - static_cast<int>(dots + dots2));
+        dots2 += marks; // same swapchain, same layer array: count them with the beam
         uint32_t aimDot = build_aim_dot_slot(&dotQuad, 0);
         uint32_t aimDot2 = build_aim_dot_slot(&dot2Quad, 1);
         uint32_t handRef = build_hand_ref_quad(&handQuad);
@@ -5043,6 +5101,22 @@ void set_laser(const LaserConfig& cfg) {
     g_laserModelRollTrim.store(cfg.modelRollTrimDeg, std::memory_order_relaxed);
 }
 
+void set_ctrl_markers(int role, bool on, const float local[][3], const float sizeDeg[], int n) {
+    if (!on || !local || !sizeDeg || n <= 0) {
+        g_markOn.store(false, std::memory_order_relaxed);
+        return;
+    }
+    if (n > kMaxMarkers) n = kMaxMarkers;
+    for (int i = 0; i < n; ++i) {
+        for (int k = 0; k < 3; ++k) g_markLocal[i][k].store(local[i][k], std::memory_order_relaxed);
+        g_markSizeDeg[i].store(sizeDeg[i], std::memory_order_relaxed);
+    }
+    g_markRole.store(role ? 1 : 0, std::memory_order_relaxed);
+    g_markCount.store(n, std::memory_order_relaxed);
+    g_markStampMs.store(GetTickCount64(), std::memory_order_relaxed);
+    g_markOn.store(true, std::memory_order_relaxed);
+}
+
 void set_aim_dot(const AimDotConfig& cfg) {
     g_dotOn.store(cfg.enabled, std::memory_order_relaxed);
     g_dotSizeDeg.store(cfg.sizeDeg, std::memory_order_relaxed);
@@ -5237,6 +5311,7 @@ int sr_peek_eye() { return 0; }
 void sr_push_eye(int) {}
 void set_laser(const LaserConfig&) {}
 void set_aim_dot(const AimDotConfig&) {}
+void set_ctrl_markers(int, bool, const float[][3], const float[], int) {}
 void set_hud_quad(float, float, float) {}
 void get_hud_quad(float* d, float* w, float* u) {
     if (d) *d = 0;

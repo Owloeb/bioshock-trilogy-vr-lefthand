@@ -984,6 +984,224 @@ bool recoil_kick(const FrameContext& ctx, const GamePose& gp, bool held, Kick& k
     return true;
 }
 
+bool mirror_wanted();
+
+// ---- Hand calibration (FEAR VR style) ------------------------------------------
+// Press "Calibrate" in F10 and that hand's model FREEZES where it is. Three dots
+// appear on your physical controller (palm, forward, thumb side); move the
+// controller into the frozen hand as if you were holding it, and hold still.
+// After 1.5 s still, the offsets that make that controller pose produce that
+// hand pose are solved exactly and saved - all six hand sliders in one go.
+// Everything is solved in the rig's own space (the head-mirrored one when
+// mirroring): the frozen hand you SEE is the mirror of the frozen rig pose
+// under the current head, and your controller is mirrored by the same head, so
+// head movement cannot skew the result.
+enum { kCalIdle = 0, kCalArmed = 1, kCalFrozen = 2 };
+std::atomic<int> g_calReqHand{-1}; // UI: 0/1 start that hand, 2 cancel, 3 undo
+int g_calHand = -1;
+int g_calPhase = kCalIdle;
+GamePose g_calFrozen{};
+float g_calQFreeze[4] = {0, 0, 0, 1}; // rig-space controller orientation at freeze
+float g_calTrimOld[3] = {};            // pitch / yaw / roll at freeze
+float g_calUndo[2][6] = {};            // per hand: the six values before the last calibration
+bool g_calUndoValid[2] = {false, false};
+std::atomic<bool> g_calCanUndo{false};
+uint64_t g_calStartMs = 0, g_calStillMs = 0;
+float g_calStillP[3] = {}, g_calStillQ[4] = {0, 0, 0, 1};
+bool g_calReadyBuzzed = false;
+char g_calStatus[128] = "";
+std::atomic<int> g_calDisplayHand{-1};
+
+// The controller as the rig sees it: the model's pose source, mirrored about
+// the head when the viewmodel mirror is on.
+bool rig_controller(int h, bool mirrorPose, float pos[3], float quat[4]) {
+    bvr::vr::HeadPose hp{};
+    if (!bvr::vr::get_hand_pose(h, g_useAimPose.load(std::memory_order_relaxed), hp)) return false;
+    pos[0] = hp.px; pos[1] = hp.py; pos[2] = hp.pz;
+    quat[0] = hp.qx; quat[1] = hp.qy; quat[2] = hp.qz; quat[3] = hp.qw;
+    if (mirrorPose) {
+        bvr::vr::HeadPose head{};
+        if (!bvr::vr::peek_head_pose(head)) return false;
+        mirror_pose_about_head(head, pos, quat);
+    }
+    return true;
+}
+
+void cal_finish(const char* why) {
+    g_calPhase = kCalIdle;
+    g_calHand = -1;
+    g_calDisplayHand.store(-1);
+    bvr::vr::set_ctrl_markers(0, false, nullptr, nullptr, 0);
+    strncpy_s(g_calStatus, why, _TRUNCATE);
+}
+
+void cal_store(int h, const float v[6]) {
+    g_rotPitchDeg[h].store(v[0]);
+    g_rotYawDeg[h].store(v[1]);
+    g_rotRollDeg[h].store(v[2]);
+    g_posFwdCm[h].store(v[3]);
+    g_posRightCm[h].store(v[4]);
+    g_posUpCm[h].store(v[5]);
+}
+
+// Solve and store the offsets. The model orientation is pose (x) trim, so the
+// trim that keeps the frozen orientation is conj(q_now) (x) q_freeze (x) trim_old;
+// with it, the model frame IS the frozen frame and the position offset is the
+// frozen location seen from the controller, in that frame.
+void cal_solve(const FrameContext& ctx, int h, const float posNow[3], const float qNow[4]) {
+    float tOld[4], qF[4], qNowInv[4], t[4];
+    xr_local_trim_quat(g_calTrimOld[0] / kRadToDeg, g_calTrimOld[1] / kRadToDeg,
+                       g_calTrimOld[2] / kRadToDeg, tOld);
+    quat_mul(g_calQFreeze, tOld, qF);
+    quat_conj(qNow, qNowInv);
+    quat_mul(qNowInv, qF, t);
+    // Decompose t = Ry(-yaw) Rx(pitch) Rz(-roll) (xr_local_trim_quat's order).
+    const float x = t[0], y = t[1], z = t[2], w = t[3];
+    const float m02 = 2 * (x * z + y * w), m22 = 1 - 2 * (x * x + y * y);
+    float m12 = 2 * (y * z - x * w);
+    const float m10 = 2 * (x * y + z * w), m11 = 1 - 2 * (x * x + z * z);
+    if (m12 > 1.0f) m12 = 1.0f;
+    if (m12 < -1.0f) m12 = -1.0f;
+    const float pitch = asinf(-m12) * kRadToDeg;
+    const float yaw = -atan2f(m02, m22) * kRadToDeg;
+    const float roll = -atan2f(m10, m11) * kRadToDeg;
+
+    const GamePose at = xr_pose_to_game(ctx, posNow, qNow);
+    float f[3], r[3], u[3];
+    ue_rot_basis(g_calFrozen.rot, f, r, u);
+    const float d[3] = {g_calFrozen.loc.x - at.loc.x, g_calFrozen.loc.y - at.loc.y,
+                        g_calFrozen.loc.z - at.loc.z};
+    const float uuPerCm = ctx.worldScale / 100.0f;
+    const float fwd = (d[0] * f[0] + d[1] * f[1] + d[2] * f[2]) / uuPerCm;
+    const float rgt = (d[0] * r[0] + d[1] * r[1] + d[2] * r[2]) / uuPerCm;
+    const float up = (d[0] * u[0] + d[1] * u[1] + d[2] * u[2]) / uuPerCm;
+    if (fabsf(fwd) > 60.0f || fabsf(rgt) > 60.0f || fabsf(up) > 60.0f) {
+        cal_finish("Calibration rejected: the controller was over 60 cm from the hand.");
+        return;
+    }
+    g_calUndo[h][0] = g_rotPitchDeg[h].load();
+    g_calUndo[h][1] = g_rotYawDeg[h].load();
+    g_calUndo[h][2] = g_rotRollDeg[h].load();
+    g_calUndo[h][3] = g_posFwdCm[h].load();
+    g_calUndo[h][4] = g_posRightCm[h].load();
+    g_calUndo[h][5] = g_posUpCm[h].load();
+    g_calUndoValid[h] = true;
+    g_calCanUndo.store(true);
+    const float v[6] = {pitch, yaw, roll, fwd, rgt, up};
+    cal_store(h, v);
+    save_config();
+    if (h == 1) {
+        // The gun turned with the hand: keep the bullets on its barrel.
+        float tOldInv[4], dq[4];
+        quat_conj(tOld, tOldInv);
+        quat_mul(t, tOldInv, dq);
+        aim::rotate_weapon_aim(dq, mirror_wanted());
+    }
+    BVR_LOG("[hands] calibrated %s hand: trim %.1f/%.1f/%.1f deg, offset %.1f/%.1f/%.1f cm",
+            h == 1 ? "weapon" : "plasmid", pitch, yaw, roll, fwd, rgt, up);
+    bvr::vr::haptic_pulse(h, 0.9f, 90);
+    bvr::vr::haptic_pulse(1 - h, 0.9f, 90);
+    char msg[128];
+    _snprintf_s(msg, sizeof msg, _TRUNCATE, "%s hand calibrated and saved.",
+                h == 1 ? "Weapon" : "Plasmid");
+    cal_finish(msg);
+}
+
+// Called with each hand's rig-space pose (after trims and offsets, before the
+// recoil kick and the mirror's gun-plane step). Freezes and solves.
+void cal_filter(const FrameContext& ctx, int h, bool mirrorPose, GamePose& gp) {
+    if (g_calHand != h || g_calPhase == kCalIdle) return;
+    float pos[3], quat[4];
+    const bool have = rig_controller(h, mirrorPose, pos, quat);
+    const uint64_t now = GetTickCount64();
+    if (g_calPhase == kCalArmed) {
+        if (!have) return;
+        g_calFrozen = gp;
+        memcpy(g_calQFreeze, quat, sizeof quat);
+        g_calTrimOld[0] = g_rotPitchDeg[h].load();
+        g_calTrimOld[1] = g_rotYawDeg[h].load();
+        g_calTrimOld[2] = g_rotRollDeg[h].load();
+        g_calPhase = kCalFrozen;
+        g_calStartMs = now;
+        g_calStillMs = 0;
+        g_calReadyBuzzed = false;
+        bvr::vr::haptic_pulse(h, 0.6f, 60);
+        strncpy_s(g_calStatus, "Frozen. Move the controller into the hand and hold still.",
+                  _TRUNCATE);
+    }
+    gp = g_calFrozen; // the model stays put while you line up
+    // Palm, forward (through the curled fingers, grip -Z) and thumb side (+Y).
+    static const float kMarks[3][3] = {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -0.09f}, {0.0f, 0.05f, 0.0f}};
+    static const float kSizes[3] = {1.3f, 0.9f, 0.7f};
+    bvr::vr::set_ctrl_markers(h, true, kMarks, kSizes, 3);
+    if (now - g_calStartMs > 60000) {
+        cal_finish("Calibration timed out - nothing changed.");
+        return;
+    }
+    // Stillness on the RAW controller: within 4 mm and 1 deg for 1.5 s.
+    bvr::vr::HeadPose raw{};
+    if (!have || !bvr::vr::get_raw_hand_pose(h, false, raw)) {
+        g_calStillMs = 0;
+        return;
+    }
+    const float rp[3] = {raw.px, raw.py, raw.pz};
+    const float rq[4] = {raw.qx, raw.qy, raw.qz, raw.qw};
+    const float dp = sqrtf((rp[0] - g_calStillP[0]) * (rp[0] - g_calStillP[0]) +
+                           (rp[1] - g_calStillP[1]) * (rp[1] - g_calStillP[1]) +
+                           (rp[2] - g_calStillP[2]) * (rp[2] - g_calStillP[2]));
+    float dot = fabsf(rq[0] * g_calStillQ[0] + rq[1] * g_calStillQ[1] + rq[2] * g_calStillQ[2] +
+                      rq[3] * g_calStillQ[3]);
+    if (dot > 1.0f) dot = 1.0f;
+    const float dang = 2.0f * acosf(dot) * kRadToDeg;
+    if (!g_calStillMs || dp > 0.004f || dang > 1.0f) {
+        memcpy(g_calStillP, rp, sizeof rp);
+        memcpy(g_calStillQ, rq, sizeof rq);
+        g_calStillMs = now;
+        g_calReadyBuzzed = false;
+        return;
+    }
+    // Not in the first 2 s: you have to get there first.
+    if (now - g_calStartMs < 2000) return;
+    if (!g_calReadyBuzzed && now - g_calStillMs > 700) {
+        g_calReadyBuzzed = true;
+        bvr::vr::haptic_pulse(h, 0.25f, 40); // "holding still - keep it there"
+    }
+    if (now - g_calStillMs >= 1500) cal_solve(ctx, h, pos, quat);
+}
+
+// Start / cancel / undo requests from the UI, applied on the game thread.
+void cal_tick() {
+    const int req = g_calReqHand.exchange(-1);
+    if (req == 2) {
+        if (g_calPhase != kCalIdle) cal_finish("Calibration cancelled - nothing changed.");
+        return;
+    }
+    if (req == 3) {
+        for (int h = 0; h < 2; ++h)
+            if (g_calUndoValid[h]) {
+                cal_store(h, g_calUndo[h]);
+                g_calUndoValid[h] = false;
+            }
+        g_calCanUndo.store(false);
+        save_config();
+        strncpy_s(g_calStatus, "Restored the hand offsets from before calibrating.", _TRUNCATE);
+        return;
+    }
+    if (g_calPhase == kCalArmed && GetTickCount64() - g_calStartMs > 3000) {
+        cal_finish(g_calHand == 0 ? "That hand isn't visible: raise a plasmid, or turn on "
+                                    "'Show the off hand', and try again."
+                                  : "That hand isn't visible: raise a weapon and try again.");
+        return;
+    }
+    if ((req == 0 || req == 1) && g_calPhase == kCalIdle) {
+        g_calHand = req;
+        g_calPhase = kCalArmed;
+        g_calStartMs = GetTickCount64();
+        g_calDisplayHand.store(req);
+        strncpy_s(g_calStatus, "Freezing the hand...", _TRUNCATE);
+    }
+}
+
 // ---- Arms: shoulder anchors (experimental, arms.ini) -------------------------
 // Each visible hand's arm hangs from a shoulder below and beside the head. The
 // shoulders follow a TORSO yaw that lags the head (a 25 deg deadzone plus a
@@ -1142,6 +1360,7 @@ bool off_hand_pose(const FrameContext& ctx, int offHand, bool mirrorPose, bool g
     gp.loc = {gp.loc.x + fwd[0] * of + right[0] * orr + up[0] * ou,
               gp.loc.y + fwd[1] * of + right[1] * orr + up[1] * ou,
               gp.loc.z + fwd[2] * of + right[2] * orr + up[2] * ou};
+    cal_filter(ctx, offHand, mirrorPose, gp);
     if (kick) apply_kick(*kick, gp); // held on the gun: ride its recoil
     if (gunPlane) {
         reflect_pose(gp, g_hdH, g_hdN);
@@ -1866,9 +2085,13 @@ void on_calcview(const FrameContext& ctx) {
         // culling, correct engine-side FX anchoring) and the hand CLUSTER
         // moves to the controller instead.
         gp.loc = {loc[0], loc[1], loc[2]};
+        cal_tick();
+        cal_filter(ctx, hand, mirrorPose, gp);
+        const bool calibrating = g_calPhase != kCalIdle;
         ability_haptics(hand);
         Kick kick{};
-        const bool kicked = hand == 1 && recoil_kick(ctx, gp, twohand::gripped(), kick);
+        const bool kicked =
+            hand == 1 && !calibrating && recoil_kick(ctx, gp, twohand::gripped(), kick);
         if (kicked) apply_kick(kick, gp);
         if (mirrorPose) {
             const float trim = sync_weapon_trim(hand);
@@ -2269,6 +2492,28 @@ void draw_debug_ui() {
                 g_lastPitch.load(std::memory_order_relaxed),
                 g_lastYaw.load(std::memory_order_relaxed),
                 g_lastRoll.load(std::memory_order_relaxed));
+}
+
+void draw_calibration_ui() {
+    if (!ImGui::CollapsingHeader("Hand calibration")) return;
+    ImGui::TextWrapped("Press a button: that hand freezes and three dots appear on your controller "
+                       "(palm, forward, thumb side). Put the controller into the frozen hand the "
+                       "way you'd hold it, then hold still - it saves after 1.5 s.");
+    const int cur = g_calDisplayHand.load();
+    if (cur < 0) {
+        if (ImGui::Button("Calibrate weapon hand")) g_calReqHand.store(1);
+        ImGui::SameLine();
+        if (ImGui::Button("Calibrate plasmid hand")) g_calReqHand.store(0);
+        ImGui::TextDisabled("The plasmid hand needs 'Show the off hand' on, or a plasmid raised.");
+        if (g_calCanUndo.load()) {
+            if (ImGui::Button("Undo last calibration")) g_calReqHand.store(3);
+        }
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "Calibrating the %s hand...",
+                           cur == 1 ? "weapon" : "plasmid");
+        if (ImGui::Button("Cancel##handcal")) g_calReqHand.store(2);
+    }
+    if (g_calStatus[0]) ImGui::TextWrapped("%s", g_calStatus);
 }
 
 void draw_arms_ui() {

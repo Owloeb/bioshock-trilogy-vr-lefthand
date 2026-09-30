@@ -1947,6 +1947,41 @@ void* learned_weapon_object() {
 }
 
 const char* active_weapon_key() { return g_weaponKey.c_str(); }
+// Hand calibration moved the weapon model by dq (a rotation in the weapon
+// controller's own frame, XR axes). Every weapon's aim correction was tuned so
+// the ray runs along the RENDERED barrel, so turn each one by the same amount:
+// ray direction d = trim * fwd  ->  dq * d, then back to pitch/yaw. Yaw values
+// are stored in right-handed terms and flipped at use when mirrored; so is dq
+// (the model lives in the head-mirrored rig), hence the conjugation.
+void rotate_weapon_aim(const float dqIn[4], bool mirrored) {
+    float dq[4] = {dqIn[0], dqIn[1], dqIn[2], dqIn[3]};
+    if (mirrored) {
+        dq[1] = -dq[1];
+        dq[2] = -dq[2];
+    }
+    const float side = mirror_side();
+    auto turn = [&](float& pitchDeg, float& yawStoredDeg) {
+        float t[4], d[3], d2[3];
+        const float fwd[3] = {0.0f, 0.0f, -1.0f};
+        xr_local_trim_quat(pitchDeg / kRadToDeg, yawStoredDeg * side / kRadToDeg, 0.0f, t);
+        quat_rotate(t[0], t[1], t[2], t[3], fwd, d);
+        quat_rotate(dq[0], dq[1], dq[2], dq[3], d, d2);
+        const float y = d2[1] < -1.0f ? -1.0f : d2[1] > 1.0f ? 1.0f : d2[1];
+        pitchDeg = asinf(y) * kRadToDeg;
+        yawStoredDeg = atan2f(d2[0], -d2[2]) * kRadToDeg * side;
+    };
+    stash_active_profile();
+    for (auto& [k, p] : g_weaponProfiles) turn(p.trimPitch, p.trimYaw);
+    turn(g_presetBaseline.trimPitch, g_presetBaseline.trimYaw);
+    float lp = g_pitchOffsetDeg[1].load(), ly = g_yawOffsetDeg[1].load();
+    turn(lp, ly);
+    g_pitchOffsetDeg[1].store(lp);
+    g_yawOffsetDeg[1].store(ly);
+    save_weapon_profiles();
+    BVR_LOG("[aim] weapon aim corrections turned with the calibrated weapon hand (%u profiles)",
+            static_cast<unsigned>(g_weaponProfiles.size()));
+}
+
 uint32_t player_shot_count() { return g_playerShots.load(std::memory_order_relaxed); }
 uint32_t player_ability_count() { return g_playerAbilities.load(std::memory_order_relaxed); }
 
