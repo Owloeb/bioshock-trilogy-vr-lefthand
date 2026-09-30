@@ -1792,6 +1792,7 @@ void on_calcview(const FrameContext& ctx) {
                               held && kicked ? &kick : nullptr, offGp);
             bones::set_off_target(track, track ? &offGp : nullptr);
             bones::set_off_follow(held);
+            bones::set_off_preview(hand == 1 && twohand::preview_grip());
         }
         bonewatch::mark_drive_begin();
         const bool drove = bones::drive(ctx, target, gp, hand);

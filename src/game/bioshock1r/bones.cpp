@@ -132,6 +132,8 @@ GamePose g_offGp{};
 // ENGINE's own off hand is doing relative to the gun - pumping the shotgun,
 // cranking the chemical thrower - as a delta from that hand's settled pose.
 bool g_offFollow = false;
+bool g_offPreview = false; // grip shape without the follow (recording, grab zone)
+Qts g_followBaseRef43; // the DRAWN gun's attach pose (reference) at rest
 // v2 (the first cut followed the sway-killed REFERENCE, which only tracks an
 // animation in bursts and freezes it mid-stroke): follow the engine's LIVE
 // pose, read every time the engine re-evaluates, against a REST pose that is
@@ -1206,23 +1208,46 @@ bool target_to_component(const GamePose& gp, const float qaInv[4], const float a
 // hide block in drive()) and 44 collapses, then the cluster counts as hidden
 // so the normal restore runs when that hand becomes the driven one again.
 bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool collapse,
-                    const float qtcMain[4]) {
+                    const float qtcMain[4], const float ptcMain[3]) {
     int first = 0, last = 0, anchor = 0;
     cluster_of(ih, &first, &last, &anchor);
     if (first < 0 || last >= g_boneCount || anchor < first || anchor > last) return false;
     float ptc[3], qtc[4];
     if (!target_to_component(g_offGp, qaInv, actorLoc, ptc, qtc)) return false;
     if (g_offFollow && ih == 0 && g_followBaseValid && g_liveValid) {
-        // v3: the engine hand's motion measured in the GUN's frame (bone 43,
-        // which the engine animates too - the gun tilts through a pump), then
-        // re-applied in the frame the gun is actually DRAWN in
-        // (G = qtcMain * ref43.q). The first cut measured in raw component
-        // space and applied the drawn frame on top, so any gun rotation in the
-        // animation was counted twice or not at all.
+        // v4. Two motions, applied in the order they happen:
+        //  1. TILT - the drawn gun turns about its attach bone (a pump rocks
+        //     the whole shotgun back). The pinned hand was placed for the gun
+        //     at rest, so it must turn about the attach point with it:
+        //     T = qtcMain (ref43_now ref43_rest^-1) qtcMain^-1. v3 dropped this
+        //     term and the hand slid off the rocking shotgun.
+        //  2. STROKE - the engine hand's motion RELATIVE to the gun (the slide
+        //     itself, the lever), measured in the gun's live frame and applied
+        //     in the drawn frame G = qtcMain ref43_now.
         const Qts& w = g_live[0];
         const Qts& a = g_live[1];
         const Qts& w0 = g_followBase[0];
         const Qts& a0 = g_followBase[1];
+        const Qts& r43 = g_ref[patterns::kBoneWeaponAttach];
+        float mInv[4], G[4], Gi[4];
+        quat_conj(qtcMain, mInv);
+        quat_mul(qtcMain, r43.q, G);
+        quat_conj(G, Gi);
+
+        // 1. tilt
+        float r0i[4], tl[4], t1[4], T[4];
+        quat_conj(g_followBaseRef43.q, r0i);
+        quat_mul(r43.q, r0i, tl);
+        quat_mul(qtcMain, tl, t1);
+        quat_mul(t1, mInv, T);
+        {
+            const float off[3] = {ptc[0] - ptcMain[0], ptc[1] - ptcMain[1], ptc[2] - ptcMain[2]};
+            float offT[3];
+            qts_rotate(T, off, offT);
+            for (int k = 0; k < 3; ++k) ptc[k] = ptcMain[k] + offT[k];
+        }
+
+        // 2. stroke
         float ai[4], a0i[4];
         quat_conj(a.q, ai);
         quat_conj(a0.q, a0i);
@@ -1236,32 +1261,30 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
         constexpr float kMaxFollowUu = 40.0f; // a pump stroke, never an equip swing
         if (len > kMaxFollowUu)
             for (float& c : d) c *= kMaxFollowUu / len;
-        // The gun mesh is drawn at the weapon-scale lane's size, so its moving
-        // parts travel that much less than the authored hand does.
-        const float ws = g_wScale.load(std::memory_order_relaxed);
+        const float ws = g_wScale.load(std::memory_order_relaxed); // the gun's drawn size
         for (float& c : d) c *= ws;
-        float G[4];
-        quat_mul(qtcMain, g_ref[patterns::kBoneWeaponAttach].q, G);
         float dc[3];
         qts_rotate(G, d, dc);
-        ptc[0] += dc[0];
-        ptc[1] += dc[1];
-        ptc[2] += dc[2];
-        // Orientation: the wrist's rotation relative to the gun, now vs rest,
-        // carried into the drawn gun frame: D = G (r r0^-1) G^-1, r = a^-1 w.
-        float r[4], r0[4], r0i[4], dr[4], t1[4], Gi[4], D[4], q2[4];
+        for (int k = 0; k < 3; ++k) ptc[k] += dc[k];
+
+        // Orientation: ride the tilt, then the wrist's own turn relative to
+        // the gun (D = G (r r0^-1) G^-1, r = a^-1 w).
+        float r[4], rr0[4], rr0i[4], dr[4], u1[4], D[4], q2[4], q3[4];
         quat_mul(ai, w.q, r);
-        quat_mul(a0i, w0.q, r0);
-        quat_conj(r0, r0i);
-        quat_mul(r, r0i, dr);
-        quat_mul(G, dr, t1);
-        quat_conj(G, Gi);
-        quat_mul(t1, Gi, D);
-        quat_mul(D, qtc, q2);
-        memcpy(qtc, q2, sizeof q2);
+        quat_mul(a0i, w0.q, rr0);
+        quat_conj(rr0, rr0i);
+        quat_mul(r, rr0i, dr);
+        quat_mul(G, dr, u1);
+        quat_mul(u1, Gi, D);
+        quat_mul(T, qtc, q2);
+        quat_mul(D, q2, q3);
+        memcpy(qtc, q3, sizeof q3);
     }
-    const bool relaxed = ih == 0 && !g_offFollow && g_neutralValid;
-    const bool gripShape = ih == 0 && g_offFollow && g_gripShapeValid;
+    // Shape: the rest grip while held, recording or in the grab zone (so you
+    // see how the hand will sit); the relaxed pose otherwise.
+    const bool wantGrip = g_offFollow || g_offPreview;
+    const bool relaxed = ih == 0 && !wantGrip && g_neutralValid;
+    const bool gripShape = ih == 0 && wantGrip && g_gripShapeValid;
     if (!rigid_cluster(ih, first, last, anchor, ptc, qtc,
                        relaxed ? g_neutral : gripShape ? g_gripShape : g_ref))
         return false;
@@ -1448,6 +1471,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             g_followBase[0] = g_live[0];
             g_followBase[1] = g_live[1];
             g_followBaseValid = true;
+            g_followBaseRef43 = g_ref[patterns::kBoneWeaponAttach];
             // The grip shape is taken only while the weapon hand is raised:
             // that is when the engine's left hand is the one on the gun.
             if (hand == 1) {
@@ -1623,7 +1647,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     // below the actor in component space and frustum-culled instead.
     g_cacheHiddenCount = 0;
     bool offDone = false;
-    if (offTrack) offDone = drive_off_hand(1 - hand, qaInv, actorLoc, collapse, qtc);
+    if (offTrack) offDone = drive_off_hand(1 - hand, qaInv, actorLoc, collapse, qtc, ptc);
     if (hideInactive && !offDone) {
         const int ih = 1 - hand;
         int hFirst = 0, hLast = 0, hAnchor = 0;
@@ -1664,6 +1688,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
 }
 
 void set_off_follow(bool on) { g_offFollow = on; }
+void set_off_preview(bool on) { g_offPreview = on; }
 
 void set_off_target(bool track, const GamePose* gp) {
     g_offTrack = track && gp;

@@ -147,6 +147,10 @@ void conj_rotate(const float q[4], const float v[3], float out[3]) {
 
 bool off_hand_enabled() { return g_offHand.load(std::memory_order_relaxed); }
 bool gripped() { return g_gripped.load(std::memory_order_relaxed); }
+bool preview_grip() {
+    return g_captureArmed.load(std::memory_order_relaxed) ||
+           g_eligible.load(std::memory_order_relaxed);
+}
 
 void tick(bool weaponRaised, bool gameplay) {
     if (!g_loaded) load();

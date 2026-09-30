@@ -33,6 +33,10 @@ void tick(bool weaponRaised, bool gameplay);
 
 bool off_hand_enabled(); // F10 setting: draw the off hand at its controller
 bool gripped();          // two-handing right now
+// Show the off hand in its GRIP shape rather than the relaxed one: while a
+// grab point is being recorded (so you can see how the hand will sit) and
+// while the hand is inside the grab zone (a preview of the hold).
+bool preview_grip();
 
 // F10 section (render thread).
 void draw_debug_ui();

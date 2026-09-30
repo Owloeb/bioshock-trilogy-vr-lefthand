@@ -54,6 +54,9 @@ void set_off_target(bool track, const GamePose* gp);
 // own off-hand motion relative to the gun (shotgun pump, chemical thrower
 // crank) onto it. Game thread, before drive().
 void set_off_follow(bool on);
+// Draw the off hand in its grip shape without following (grab-point recording,
+// grab-zone preview). Game thread, before drive().
+void set_off_preview(bool on);
 
 // The old actors died with the old world; drop every cached pointer.
 void on_world_change();
