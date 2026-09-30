@@ -128,6 +128,14 @@ float lock_delta_mag();
 // world barrel dir = target rotation (x) d0 (see the impl derivation). False
 // until a reference pose exists. Game thread.
 bool barrel_ref_axis(float d0[3]);
+// Mirror probe v6: bone 44 (the per-weapon muzzle-ish tip) relative to the
+// weapon-attach anchor, in the drive target's local frame (UE fwd/right/up),
+// scaled like the drive scales cluster translations. Game thread.
+bool muzzle_ref_offset(float out[3]);
+// Route B probe: the live hands bone array (hkQsTransform[count]) or null.
+void* bone_array(int* count);
+// The hands SkeletonInstance the drive is bound to (identity for Route B).
+void* skeleton_instance();
 
 // Overlay section (render thread only).
 void draw_debug_ui();

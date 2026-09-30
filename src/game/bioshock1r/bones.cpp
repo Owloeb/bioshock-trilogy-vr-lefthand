@@ -999,6 +999,26 @@ float lock_delta_mag() {
     return g_lockDeltaMag.load(std::memory_order_relaxed);
 }
 
+void* skeleton_instance() { return g_skelInst; }
+
+void* bone_array(int* count) {
+    if (count) *count = g_bones ? g_boneCount : 0;
+    return g_bones;
+}
+
+bool muzzle_ref_offset(float out[3]) {
+    // Same derivation as barrel_ref_axis below: drive() places the cluster as
+    // a rigid rotation of the reference about the anchor, so the rendered
+    // world offset of bone 44 is q_target (x) ((p44 - p43) * scale) and the
+    // bracket IS the offset in the target's local frame.
+    if (!g_refValid || g_boneCount <= patterns::kBoneRClusterLast) return false;
+    const float* pa = g_ref[patterns::kBoneWeaponAttach].p;
+    const float* pm = g_ref[patterns::kBoneRClusterLast].p;
+    const float s = g_scale[1].load(std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i) out[i] = (pm[i] - pa[i]) * s;
+    return true;
+}
+
 bool barrel_ref_axis(float d0[3]) {
     // The rendered barrel axis in the DRIVE TARGET's local frame (UE
     // fwd/right/up). Derivation: drive() writes every cluster quat as

@@ -57,6 +57,7 @@ WNDPROC g_originalWndProc = nullptr;
 // ---------------------------------------------------------------------------
 constexpr float kUiScaleMin = 0.75f;
 constexpr float kUiScaleMax = 3.0f;
+std::atomic<bool> g_devTools{false};
 float g_uiScale = 1.25f;     // user factor; 1.25 reads comfortably on a desktop mirror
 float g_appliedScale = 0.0f; // what the style currently carries (0 = base style)
 ImGuiStyle g_baseStyle;      // unscaled style, so re-scaling never compounds
@@ -76,6 +77,8 @@ void load_ui_scale() {
         float v = 0.0f;
         if (sscanf_s(line, "uiScale=%f", &v) == 1 && v >= kUiScaleMin && v <= kUiScaleMax)
             g_uiScale = v;
+        int dt = 0;
+        if (sscanf_s(line, "devTools=%d", &dt) == 1) g_devTools.store(dt != 0);
     }
     fclose(f);
 }
@@ -86,6 +89,7 @@ void save_ui_scale() {
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "uiScale=%.2f\n", g_uiScale);
+    fprintf(f, "devTools=%d\n", g_devTools.load() ? 1 : 0);
     fclose(f);
     BVR_LOG("overlay: text size %.2f saved", g_uiScale);
 }
@@ -195,6 +199,11 @@ void DrawUi() {
     ImGui::SetNextItemWidth(160.0f * g_uiScale);
     ImGui::SliderFloat("Menu text size", &g_uiScale, kUiScaleMin, kUiScaleMax, "%.2f");
     if (ImGui::IsItemDeactivatedAfterEdit()) save_ui_scale();
+    bool dt = g_devTools.load();
+    if (ImGui::Checkbox("Developer tools (probes and diagnostics)", &dt)) {
+        g_devTools.store(dt);
+        save_ui_scale();
+    }
     ImGui::Separator();
     vr::draw_debug_ui();
     ImGui::Separator();
@@ -273,5 +282,7 @@ void on_resize() {
 void set_visible(bool on) {
     g_visibleRequest.store(on ? 1 : 0, std::memory_order_relaxed);
 }
+
+bool dev_tools() { return g_devTools.load(std::memory_order_relaxed); }
 
 } // namespace bvr::overlay

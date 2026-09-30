@@ -157,6 +157,10 @@ void set_left_handed(bool on);
 // modifier is always on the hand opposite the turn stick.
 bool swap_sticks();
 void set_swap_sticks(bool on);
+// Viewmodel mirror probe (only with left_handed(); games that support it -
+// BioShock 1 so far - read this). See core/gfx/vm_mirror.h.
+bool mirror_viewmodel();
+void set_mirror_viewmodel(bool on);
 int take_snap_steps(); // +right/-left steps queued since the last drain
 
 // Feedback session 2 (2026-08-13): BOTH-STICKS-CLICK = recenter chord. The XR

@@ -15,4 +15,9 @@ void on_resize(); // drop backbuffer references before ResizeBuffers
 // F10, and it doubles as the user's recovery if a keyboard state wedges.
 void set_visible(bool on);
 
+// "Developer tools" checkbox at the top of F10 (persisted in overlay.ini,
+// default off): shows the probes, counters and tuning internals that the
+// feature sections keep hidden from players. Any thread.
+bool dev_tools();
+
 } // namespace bvr::overlay

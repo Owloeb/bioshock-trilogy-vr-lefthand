@@ -907,6 +907,14 @@ int sr_pop_eye() {
     return sign;
 }
 
+// Peek without consuming: the tag of the frame currently being drawn.
+int sr_peek_eye_impl() {
+    uint32_t tail = g_srTail.load(std::memory_order_relaxed);
+    uint32_t head = g_srHead.load(std::memory_order_acquire);
+    if (tail == head || head - tail > 2) return 0;
+    return g_srRing[tail & (kSrRingSize - 1)].load(std::memory_order_relaxed);
+}
+
 const char* res_str(XrResult r) {
     static char buf[XR_MAX_RESULT_STRING_SIZE];
     if (g_instance != XR_NULL_HANDLE && xrResultToString(g_instance, r, buf) == XR_SUCCESS)
@@ -4994,6 +5002,8 @@ int current_eye_sign() {
     return g_aerEyeSign.load(std::memory_order_relaxed);
 }
 
+int sr_peek_eye() { return sr_peek_eye_impl(); }
+
 void set_laser(const LaserConfig& cfg) {
     g_laserOn.store(cfg.enabled, std::memory_order_relaxed);
     g_laserHand.store(cfg.hand ? 1 : 0, std::memory_order_relaxed);
@@ -5199,6 +5209,7 @@ void set_cine_drive(CineDrive) {}
 const char* cine_drive_name(CineDrive) { return "authored"; }
 float rendered_hfov_deg() { return 0.0f; }
 int current_eye_sign() { return 0; }
+int sr_peek_eye() { return 0; }
 void sr_push_eye(int) {}
 void set_laser(const LaserConfig&) {}
 void set_aim_dot(const AimDotConfig&) {}

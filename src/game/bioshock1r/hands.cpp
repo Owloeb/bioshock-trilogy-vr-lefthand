@@ -24,20 +24,30 @@
 #include "game/bioshock1r/hands.h"
 
 #include "core/gfx/hud_capture.h"
+#include "core/gfx/vm_mirror.h"
 #include "core/input/xinput_bridge.h"
+#include "core/ui/overlay.h"
 #include "core/util/log.h"
 #include "core/vr/openxr_runtime.h"
 #include "game/bioshock1r/aim.h"
 #include "game/bioshock1r/bones.h"
+#include "game/bioshock1r/bonewatch.h"
+#include "game/bioshock1r/camera.h"
 #include "game/bioshock1r/patterns.h"
 
 #include <windows.h>
+#include <MinHook.h>
 
 #include <imgui.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <cwctype>
+#include <map>
+#include <string>
 
 namespace bvr::b1r::hands {
 namespace {
@@ -567,7 +577,767 @@ void init(const bvr::pattern_scan::ProcessImage& image) {
             patterns::kPlayerWeaponVtableRva);
 }
 
+// ---- Viewmodel mirror probe (see core/gfx/vm_mirror.h) ----------------------
+// The render side reflects every foreground draw about the head's mid-plane;
+// this side hands the rig the controller poses reflected about the SAME plane,
+// so the reflected render lands on the real hands. Both reflections are the
+// same plane: through the HMD, normal = the HMD's right axis (the axis the
+// stereo eye offsets are applied along).
+//
+// Reflecting a controller is P' = M(P - H) + H with M = I - 2nn^T, and for the
+// orientation R' = M R D, where D flips the controller's LOCAL x. D is what
+// turns a left controller into a right one: both hands' grip and aim frames
+// have +x pointing to the user's right, so a reflected left frame has +x
+// pointing left until D restores the convention. det(M R D) = +1, a proper
+// rotation. The result is a virtual RIGHT controller for the gun hand (so the
+// right-hand calibration applies unchanged) and a virtual LEFT one for the
+// plasmid hand.
+namespace {
+
+// Effects-flip state (used by apply_gun_plane and the attach hook below).
+bool g_attachHookTried = false, g_attachHookLive = false;
+std::atomic<bool> g_effectsFlip{true};
+std::atomic<uint32_t> g_flips{0};
+void* g_flipWeapon = nullptr;
+float g_pgQ[3] = {}, g_pgN[3] = {};
+uint64_t g_pgStampMs = 0;
+
+void quat_to_mat(const float q[4], float m[9]) { // columns = local axes
+    const float x = q[0], y = q[1], z = q[2], w = q[3];
+    m[0] = 1 - 2 * (y * y + z * z); m[3] = 2 * (x * y - z * w);     m[6] = 2 * (x * z + y * w);
+    m[1] = 2 * (x * y + z * w);     m[4] = 1 - 2 * (x * x + z * z); m[7] = 2 * (y * z - x * w);
+    m[2] = 2 * (x * z - y * w);     m[5] = 2 * (y * z + x * w);     m[8] = 1 - 2 * (x * x + y * y);
+}
+
+void mat_to_quat(const float m[9], float q[4]) {
+    const float tr = m[0] + m[4] + m[8];
+    if (tr > 0.0f) {
+        const float s = sqrtf(tr + 1.0f) * 2.0f;
+        q[3] = 0.25f * s;
+        q[0] = (m[5] - m[7]) / s;
+        q[1] = (m[6] - m[2]) / s;
+        q[2] = (m[1] - m[3]) / s;
+    } else if (m[0] > m[4] && m[0] > m[8]) {
+        const float s = sqrtf(1.0f + m[0] - m[4] - m[8]) * 2.0f;
+        q[3] = (m[5] - m[7]) / s;
+        q[0] = 0.25f * s;
+        q[1] = (m[3] + m[1]) / s;
+        q[2] = (m[6] + m[2]) / s;
+    } else if (m[4] > m[8]) {
+        const float s = sqrtf(1.0f + m[4] - m[0] - m[8]) * 2.0f;
+        q[3] = (m[6] - m[2]) / s;
+        q[0] = (m[3] + m[1]) / s;
+        q[1] = 0.25f * s;
+        q[2] = (m[7] + m[5]) / s;
+    } else {
+        const float s = sqrtf(1.0f + m[8] - m[0] - m[4]) * 2.0f;
+        q[3] = (m[1] - m[3]) / s;
+        q[0] = (m[6] + m[2]) / s;
+        q[1] = (m[7] + m[5]) / s;
+        q[2] = 0.25f * s;
+    }
+}
+
+// Reflect an XR-space controller pose about the head mid-plane (in place).
+void mirror_pose_about_head(const bvr::vr::HeadPose& head, float pos[3], float quat[4]) {
+    static const float kRight[3] = {1.0f, 0.0f, 0.0f};
+    float n[3];
+    quat_rotate(head.qx, head.qy, head.qz, head.qw, kRight, n);
+    const float d = (pos[0] - head.px) * n[0] + (pos[1] - head.py) * n[1] +
+                    (pos[2] - head.pz) * n[2];
+    for (int i = 0; i < 3; ++i) pos[i] -= 2.0f * d * n[i];
+
+    float r[9];
+    quat_to_mat(quat, r);
+    for (int c = 0; c < 3; ++c) {
+        float* col = &r[c * 3];
+        if (c == 0) { col[0] = -col[0]; col[1] = -col[1]; col[2] = -col[2]; } // D
+        const float k = col[0] * n[0] + col[1] * n[1] + col[2] * n[2];       // M
+        for (int i = 0; i < 3; ++i) col[i] -= 2.0f * k * n[i];
+    }
+    mat_to_quat(r, quat);
+}
+
+void configure_mirror_once() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    // THE fg marker, measured by the probe's own labelled stack samples (run
+    // v3, 2026-09-29): fg and world skinned draws share every frame from the
+    // D3D call up to the scene iterator 0x5CF9xx, and differ at the call site
+    // inside it - fg draws return to 0x5CFECF, world draws to 0x5CFF36. That
+    // is the "recorded scene command that iterates the mesh" ENGINE_NOTES
+    // session 21 names. The session-21 bake RVAs (0x3DBF7C / 0x3EDCBF) are
+    // skinning strategies shared with the world - measured ~5,000 world
+    // draws/s carrying them - so they are no longer used.
+    // cb tiers: 576 carries the clip rows at float 40 (after the 36..39
+    // viewport block, patterns.h kFgCbTransformFirst); 832 and 1088 measured
+    // at the same offset live.
+    static const uint32_t kFgRet[] = {0x5CFECF};
+    static const bvr::vm_mirror::TierSpec kTiers[] = {
+        {576, static_cast<int>(patterns::kFgCbTransformFirst) + 4},
+        {832, static_cast<int>(patterns::kFgCbTransformFirst) + 4}, // discovered live, run 1
+        {1088, static_cast<int>(patterns::kFgCbTransformFirst) + 4}}; // measured, run 2
+    bvr::vm_mirror::configure(kFgRet, 1, kTiers, 3);
+}
+
+// Arms the render-side reflection exactly once per call, on every exit path,
+// so a gated frame (cinematic, cutscene view, no rig) is never reflected.
+struct MirrorArm {
+    bool arm = false;
+    ~MirrorArm() { bvr::vm_mirror::set_armed(arm); }
+};
+
+// FRotator from a UE basis (forward + up), the exact inverse of ue_rot_basis
+// (same zero-roll reference frame ue_angles_from_xr_quat measures roll in).
+FRotator basis_to_rot(const float f[3], const float u[3]) {
+    FRotator r{};
+    const float len2d = sqrtf(f[0] * f[0] + f[1] * f[1]);
+    r.yaw = static_cast<int32_t>(atan2f(f[1], f[0]) * kRotUnitsPerRadian);
+    r.pitch = static_cast<int32_t>(atan2f(f[2], len2d) * kRotUnitsPerRadian);
+    if (len2d > 0.001f) {
+        const float rn[3] = {-f[1] / len2d, f[0] / len2d, 0.0f};
+        const float un[3] = {-f[2] * rn[1], f[2] * rn[0], f[0] * rn[1] - f[1] * rn[0]};
+        r.roll = static_cast<int32_t>(
+            atan2f(u[0] * rn[0] + u[1] * rn[1],
+                   u[0] * un[0] + u[1] * un[1] + u[2] * un[2]) *
+            kRotUnitsPerRadian);
+    }
+    return r;
+}
+
+void reflect_vec(const float v[3], const float n[3], float out[3]) {
+    const float k = 2.0f * (v[0] * n[0] + v[1] * n[1] + v[2] * n[2]);
+    for (int i = 0; i < 3; ++i) out[i] = v[i] - k * n[i];
+}
+
+// Head-plane mode (v4): per eye, the head centre sits at x = -eyeSign*IPD/2 in
+// that eye's view, so the plane is x = d with d = +IPD/2 (left), -IPD/2 (right).
+void publish_head_planes(const FrameContext& ctx) {
+    const float half = camera::ipd_mm() / 2000.0f * ctx.worldScale;
+    const float shift = bvr::vm_mirror::plane_shift_uu();
+    const float n[3] = {1.0f, 0.0f, 0.0f};
+    bvr::vm_mirror::set_plane(0, n, +half + shift, true);
+    bvr::vm_mirror::set_plane(1, n, -half + shift, true);
+}
+
+// GUN-PLANE mode (v5) - the effects fix. `gp` arrives as the rig pose for the
+// head-reflected (virtual) controller, which is what the render must SHOW
+// after one reflection. Showing it via the head plane leaves the ENGINE's rig -
+// and so its muzzle, and every flash, tracer and smoke puff the engine spawns
+// from it - on the wrong side of the head. Instead:
+//   F  = head-reflection of the virtual rig   (the gun as it must appear: at
+//        the real left hand, an improper frame - a left-handed gun)
+//   Pg = F's own vertical mid-plane (through F, normal = F's right axis)
+//   engine rig R' = Pg-reflection of F        (a proper right-handed rig with
+//        F's forward and up, at F's place)
+// and the render reflects about Pg, which turns R' back into F exactly. The
+// barrel lies in Pg, so the ENGINE muzzle is the VISIBLE muzzle: effects spawn
+// where the gun is seen. The overlay shift slider moves Pg sideways for a
+// weapon whose barrel sits off the attach bone's plane (R' then moves by 2x the
+// shift, keeping F where it was).
+// Returns false when the per-eye cameras are unavailable (caller falls back).
+// World-space render plane (gun-plane mode), re-expressed per eye.
+float g_eyePlaneQ[3] = {};
+float g_eyePlaneN[3] = {};
+bool g_eyePlaneLive = false;
+uint64_t g_eyePlaneStampMs = 0;
+
+// Pg in one eye's view space (x right, y up, z forward): n.X = d.
+void publish_eye_plane(int e, const float eyeLoc[3], const int32_t eyeRot[3]) {
+    FRotator er{eyeRot[0], eyeRot[1], eyeRot[2]};
+    float ef[3], erg[3], eu[3];
+    ue_rot_basis(er, ef, erg, eu);
+    const float* fr = g_eyePlaneN;
+    const float* Q = g_eyePlaneQ;
+    const float n[3] = {fr[0] * erg[0] + fr[1] * erg[1] + fr[2] * erg[2],
+                        fr[0] * eu[0] + fr[1] * eu[1] + fr[2] * eu[2],
+                        fr[0] * ef[0] + fr[1] * ef[1] + fr[2] * ef[2]};
+    const float d = fr[0] * (Q[0] - eyeLoc[0]) + fr[1] * (Q[1] - eyeLoc[1]) +
+                    fr[2] * (Q[2] - eyeLoc[2]);
+    bvr::vm_mirror::set_plane(e, n, d, true);
+}
+
+bool apply_gun_plane(const GamePose& headW, GamePose& gp, float shift) {
+    float eyeLoc[2][3];
+    int32_t eyeRot[2][3];
+    for (int e = 0; e < 2; ++e)
+        if (!camera::driven_eye_cam(e, eyeLoc[e], eyeRot[e])) return false;
+
+    float hf[3], hr[3], hu[3];
+    ue_rot_basis(headW.rot, hf, hr, hu); // head right = the head plane normal
+    const float H[3] = {headW.loc.x, headW.loc.y, headW.loc.z};
+
+    float vf[3], vr[3], vu[3];
+    ue_rot_basis(gp.rot, vf, vr, vu);
+    const float Tv[3] = {gp.loc.x, gp.loc.y, gp.loc.z};
+
+    // F: head-reflect the virtual rig.
+    const float rel[3] = {Tv[0] - H[0], Tv[1] - H[1], Tv[2] - H[2]};
+    float relF[3], ff[3], fr[3], fu[3];
+    reflect_vec(rel, hr, relF);
+    reflect_vec(vf, hr, ff);
+    reflect_vec(vr, hr, fr);
+    reflect_vec(vu, hr, fu);
+    const float Tf[3] = {H[0] + relF[0], H[1] + relF[1], H[2] + relF[2]};
+
+    // Pg through F (+ shift along F's right), normal = F's right. v6: the
+    // caller's shift puts Pg through the weapon's MUZZLE (auto, from bone 44)
+    // plus the per-weapon trim, so engine effects leave the visible barrel.
+    const float Q[3] = {Tf[0] + shift * fr[0], Tf[1] + shift * fr[1], Tf[2] + shift * fr[2]};
+
+    // Engine rig: Pg-reflection of F. Position Tf + 2*shift*fr; forward/up
+    // unchanged by Pg (they lie in it); right becomes -fr (proper frame).
+    gp.loc.x = Tf[0] + 2.0f * shift * fr[0];
+    gp.loc.y = Tf[1] + 2.0f * shift * fr[1];
+    gp.loc.z = Tf[2] + 2.0f * shift * fr[2];
+    gp.rot = basis_to_rot(ff, fu);
+
+    // Effects flip: the same plane in WORLD space.
+    for (int i = 0; i < 3; ++i) {
+        g_pgQ[i] = Q[i];
+        g_pgN[i] = fr[i];
+    }
+    g_pgStampMs = GetTickCount64();
+    // The render plane, in WORLD space, for on_eye_camera.
+    for (int i = 0; i < 3; ++i) {
+        g_eyePlaneQ[i] = Q[i];
+        g_eyePlaneN[i] = fr[i];
+    }
+    g_eyePlaneLive = true;
+    g_eyePlaneStampMs = GetTickCount64();
+    // Provisional per-eye publish from the stashed cameras. Those are the
+    // PREVIOUS frame's (the left eye is stashed after this runs), so while
+    // moving they lag by a frame and the two eyes disagree - the doubling.
+    // on_eye_camera overwrites each eye with its exact current camera right
+    // before that eye renders; this only covers a frame where it does not run.
+    for (int e = 0; e < 2; ++e) publish_eye_plane(e, eyeLoc[e], eyeRot[e]);
+    return true;
+}
+
+// ---- v6 per-weapon muzzle trim (mirror.ini, keyed by weapon class name) ----
+// The automatic part - bone 44's sideways offset from the attach bone - covers
+// each gun's barrel position; this trim absorbs any gun whose effects spawn a
+// little off bone 44. The overlay slider edits the ACTIVE weapon's trim.
+std::map<std::string, float> g_mirrorTrim;
+std::map<std::string, float> g_flashY; // v7: measured flash offset per weapon (rig-local right, UU)
+std::string g_trimKey;
+bool g_trimLoaded = false, g_trimDirty = false;
+uint64_t g_trimDirtyMs = 0;
+
+void mirror_ini_path(wchar_t* out, size_t count) {
+    swprintf_s(out, count, L"%s\\mirror.ini", bvr::log::data_dir());
+}
+
+void load_mirror_trims() {
+    g_trimLoaded = true;
+    wchar_t path[MAX_PATH];
+    mirror_ini_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        char key[64] = {};
+        float v = 0.0f;
+        if (line[0] != '#' &&
+            sscanf_s(line, "%63[^=]=%f", key, static_cast<unsigned>(sizeof key), &v) == 2) {
+            const char* at = strstr(key, "@muzzle2");
+            // v7 "@flash" / v8 "@muzzle" entries were learned from single sightings
+            // (a parked light, an equip frame) - discard them; v9 learns by median.
+            if (strstr(key, "@flash") || (strstr(key, "@muzzle") && !at)) continue;
+            if (at && fabsf(v) > 15.0f) continue;
+            g_mirrorTrim[key] = v;
+            if (at) g_flashY[std::string(key, at - key)] = v;
+        }
+    }
+    fclose(f);
+}
+
+void save_mirror_trims() {
+    wchar_t path[MAX_PATH];
+    mirror_ini_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "# BioShock VR mirror probe - per-weapon muzzle trim (UU), on top of the\n");
+    fprintf(f, "# automatic bone-44 offset. <WeaponClassName>=<uu>\n");
+    for (const auto& [k, v] : g_mirrorTrim) fprintf(f, "%s=%.2f\n", k.c_str(), v);
+    fclose(f);
+    BVR_LOG("[mirror] per-weapon muzzle trims saved (%u)",
+            static_cast<unsigned>(g_mirrorTrim.size()));
+}
+
+// Called once per driven frame: swaps the slider to the active weapon's trim
+// on a weapon change, captures slider edits into the map, saves after a pause.
+float sync_weapon_trim(int hand) {
+    if (!g_trimLoaded) load_mirror_trims();
+    std::string key = hand == 1 ? std::string(aim::active_weapon_key()) : "PlasmidHand";
+    if (key.empty()) key = "UnknownWeapon";
+    const uint64_t now = GetTickCount64();
+    if (key != g_trimKey) {
+        g_trimKey = key;
+        auto it = g_mirrorTrim.find(key);
+        bvr::vm_mirror::set_plane_shift_uu(it != g_mirrorTrim.end() ? it->second : 0.0f);
+    } else {
+        const float cur = bvr::vm_mirror::plane_shift_uu();
+        auto it = g_mirrorTrim.find(key);
+        if (it == g_mirrorTrim.end() ? cur != 0.0f : it->second != cur) {
+            g_mirrorTrim[key] = cur;
+            g_trimDirty = true;
+            g_trimDirtyMs = now;
+        }
+    }
+    if (g_trimDirty && now - g_trimDirtyMs > 1500) {
+        g_trimDirty = false;
+        save_mirror_trims();
+    }
+    return bvr::vm_mirror::plane_shift_uu();
+}
+
+// ---- v7 muzzle-flash locator ------------------------------------------------
+// The weapon skeletons carry NO muzzle bone (ENGINE_NOTES session 20: the
+// shotgun is SG_Body/SG_Pump/SG_Shell), so the flash must be a separate object
+// the game attaches when firing. Unreal actors keep an Attached array; its
+// offset is found by searching the AHands actor for an array holding the
+// weapon. Every frame the gun's and the hands' Attached arrays are watched;
+// anything new is logged with its class and its position in the ENGINE rig's
+// frame (fwd/right/up from the attach anchor). A flash-named child's
+// sideways offset IS the plane shift that makes the engine flash coincide
+// with the mirrored barrel (the v5 derivation: s = rig-local right offset).
+struct TArr {
+    void* data;
+    int32_t num, max;
+};
+int g_attachedOff = -1;
+bool g_attachedSearched = false;
+constexpr int kMaxKids = 24;
+struct Kid {
+    void* obj;
+    int frames;
+    bool logged;
+    int prio;             // muzzle priority (0 = not a muzzle effect)
+    char owner[48];       // owning weapon class ("" = attached to the hands)
+    char cls[48];         // class name, for the effects probe
+};
+Kid g_kids[kMaxKids] = {};
+
+bool read_tarr(const void* p, TArr& out) {
+    uint8_t raw[12];
+    if (!read12(p, raw)) return false;
+    memcpy(&out, raw, sizeof out);
+    return true;
+}
+
+void find_attached_offset(void* hands, void* weapon) {
+    g_attachedSearched = true;
+    int found = 0;
+    for (int off = 0x40; off < 0x900; off += 4) {
+        TArr a{};
+        if (!read_tarr(static_cast<uint8_t*>(hands) + off, a)) continue;
+        if (!a.data || a.num < 1 || a.num > 64 || a.max < a.num || a.max > 1024) continue;
+        for (int i = 0; i < a.num; ++i) {
+            void* e = nullptr;
+            if (!read_ptr(static_cast<void**>(a.data) + i, &e)) break;
+            if (e == weapon) {
+                BVR_LOG("[mirror] Attached-array candidate at actor+0x%X (%d entries) holds the "
+                        "weapon",
+                        off, a.num);
+                if (g_attachedOff < 0) g_attachedOff = off;
+                ++found;
+                break;
+            }
+        }
+    }
+    if (!found)
+        BVR_LOG("[mirror] no array on the hands actor holds the weapon - flash locator off");
+}
+
+// Priority of an attached effect as the weapon's MUZZLE point: 2 = a
+// *MuzzleFX (ShotgunMuzzleFX, Pistol_MuzzleFX), 1 = another muzzle effect
+// (LiquidNitrogenMuzzle, Shotgun_MuzzleSmoke), 0 = not one. Lights are never
+// muzzle points: DynamicLightMuzzleFlash is parked hundreds of UU away between
+// shots (v7's run learned -504 UU from it and threw the rig across the room).
+int muzzle_priority(const wchar_t* cls) {
+    if (!cls) return 0;
+    wchar_t low[64];
+    int i = 0;
+    for (; cls[i] && i < 63; ++i) low[i] = static_cast<wchar_t>(towlower(cls[i]));
+    low[i] = 0;
+    if (wcsstr(low, L"light")) return 0;
+    if (!wcsstr(low, L"muzzle")) return 0;
+    return wcsstr(low, L"muzzlefx") ? 2 : 1;
+}
+constexpr float kMaxMuzzleLateralUu = 15.0f; // any real barrel is within this
+constexpr float kMaxChildReachUu = 150.0f;   // parked/hidden objects are far beyond
+std::map<std::string, int> g_flashPrio;
+
+// v9 learning: every frame a muzzle effect is attached, its sideways offset is
+// sampled into a per-weapon window; the offset is learned only from the MEDIAN
+// once enough samples agree. v8 learned from one sighting and caught equip
+// frames (the Shotgun read -36.9 mid-switch, the Pistol -14.1).
+struct MuzzleSamples {
+    float v[31];
+    int n = 0, next = 0, prio = 0;
+    uint64_t lastSaveMs = 0;
+};
+std::map<std::string, MuzzleSamples> g_muzzleSamples;
+
+void sample_muzzle(const char* owner, int prio, float mr) {
+    MuzzleSamples& m = g_muzzleSamples[owner];
+    if (prio < m.prio) return;          // a better-ranked effect is feeding this weapon
+    if (prio > m.prio) { m = {}; m.prio = prio; }
+    m.v[m.next] = mr;
+    m.next = (m.next + 1) % 31;
+    if (m.n < 31) ++m.n;
+    if (m.n < 12) return;
+    float sorted[31];
+    memcpy(sorted, m.v, sizeof(float) * m.n);
+    std::sort(sorted, sorted + m.n);
+    const float med = sorted[m.n / 2];
+    int agree = 0;
+    for (int i = 0; i < m.n; ++i)
+        if (fabsf(m.v[i] - med) <= 1.0f) ++agree;
+    if (agree * 3 < m.n * 2) return;    // < 2/3 within 1 UU: still noisy, wait
+    auto it = g_flashY.find(owner);
+    const uint64_t now = GetTickCount64();
+    if (it != g_flashY.end() && fabsf(it->second - med) < 0.3f) return;
+    g_flashY[owner] = med;
+    g_mirrorTrim[std::string(owner) + "@muzzle2"] = med;
+    if (now - m.lastSaveMs > 2000) {
+        m.lastSaveMs = now;
+        save_mirror_trims();
+        BVR_LOG("[mirror] %s muzzle offset learned: %.2f UU (median of %d, %d agree)", owner,
+                med, m.n, agree);
+    }
+}
+
+// Watch one actor's Attached array: log new children once, sample muzzle
+// effects every frame.
+void watch_kids(void* parent, const char* who, const GamePose& rig, const char* weaponKey) {
+    if (!parent || g_attachedOff < 0) return;
+    TArr a{};
+    if (!read_tarr(static_cast<uint8_t*>(parent) + g_attachedOff, a)) return;
+    if (!a.data || a.num < 0 || a.num > 64) return;
+    float f[3], r[3], u[3];
+    ue_rot_basis(rig.rot, f, r, u);
+    const bool parentIsWeapon = parent == weapon_actor();
+    for (int i = 0; i < a.num; ++i) {
+        void* e = nullptr;
+        if (!read_ptr(static_cast<void**>(a.data) + i, &e) || !e) continue;
+        Kid* k = nullptr;
+        for (auto& kk : g_kids)
+            if (kk.obj == e) k = &kk;
+        if (!k) {
+            for (auto& kk : g_kids)
+                if (!kk.obj) { k = &kk; break; }
+            if (!k) continue;
+            *k = {};
+            k->obj = e;
+            const wchar_t* cls = patterns::object_class_name(e);
+            if (cls) _snprintf_s(k->cls, sizeof k->cls, _TRUNCATE, "%S", cls);
+            k->prio = muzzle_priority(cls);
+            if (parentIsWeapon) {
+                const wchar_t* wc = patterns::object_class_name(parent);
+                if (wc) _snprintf_s(k->owner, sizeof k->owner, _TRUNCATE, "%S", wc);
+            }
+        }
+        ++k->frames;
+        if (k->frames < 3) continue; // a fresh spawn is placed a frame or two late
+        float loc[3];
+        if (!read12(static_cast<uint8_t*>(e) + patterns::kActorLocOffset, loc)) continue;
+        const float rel[3] = {loc[0] - rig.loc.x, loc[1] - rig.loc.y, loc[2] - rig.loc.z};
+        const float mf = rel[0] * f[0] + rel[1] * f[1] + rel[2] * f[2];
+        const float mr = rel[0] * r[0] + rel[1] * r[1] + rel[2] * r[2];
+        const float mu = rel[0] * u[0] + rel[1] * u[1] + rel[2] * u[2];
+        const float reach = sqrtf(rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]);
+        const bool usable = reach <= kMaxChildReachUu && fabsf(mr) <= kMaxMuzzleLateralUu;
+        if (!k->logged) {
+            k->logged = true;
+            BVR_LOG("[mirror] new child of %s (%s): class %s at rig-local fwd %.1f right %.1f "
+                    "up %.1f UU%s",
+                    who, k->owner[0] ? k->owner : weaponKey, k->cls[0] ? k->cls : "?", mf, mr,
+                    mu, k->prio && usable && k->owner[0] ? " <- muzzle effect (sampling)" : "");
+        }
+        // With the effects flip live, attached effects sit where WE put them -
+        // measuring them would feed the plane back into itself. They need no
+        // learned offset then anyway (any plane lands them on the mirrored gun).
+        if (k->prio > 0 && usable && k->owner[0] && !(g_effectsFlip.load() && g_attachHookLive))
+            sample_muzzle(k->owner, k->prio, mr);
+    }
+}
+
+// Effects probe (v9): the gun's own Location plus up to three of its attached
+// effects, preferring steam, the muzzle FX and smoke - the watchpoints find
+// whichever code repositions attached effects each frame.
+std::atomic<bool> g_fxProbeRequest{false};
+char g_fxProbeStatus[120] = "";
+
+void start_fx_probe(void* weapon) {
+    uintptr_t addr[4] = {};
+    const char* labels[4] = {};
+    static char lbl[4][40];
+    addr[0] = reinterpret_cast<uintptr_t>(weapon) + patterns::kActorLocOffset;
+    _snprintf_s(lbl[0], sizeof lbl[0], _TRUNCATE, "gun Location");
+    labels[0] = lbl[0];
+    int n = 1;
+    static const char* kWant[] = {"steam", "muzzlefx", "smoke", "muzzle", "ion", ""};
+    for (const char* want : kWant) {
+        for (auto& kk : g_kids) {
+            if (n >= 4) break;
+            if (!kk.obj || !kk.owner[0] || !kk.cls[0]) continue;
+            char low[48];
+            int j = 0;
+            for (; kk.cls[j] && j < 47; ++j) low[j] = static_cast<char>(tolower(kk.cls[j]));
+            low[j] = 0;
+            if (strstr(low, "light") || strstr(low, "upgrade") || strstr(low, "ammo")) continue;
+            if (want[0] && !strstr(low, want)) continue;
+            const uintptr_t ad = reinterpret_cast<uintptr_t>(kk.obj) + patterns::kActorLocOffset;
+            bool dup = false;
+            for (int q = 0; q < n; ++q) dup = dup || addr[q] == ad;
+            if (dup) continue;
+            addr[n] = ad;
+            _snprintf_s(lbl[n], sizeof lbl[n], _TRUNCATE, "%s Location", kk.cls);
+            labels[n] = lbl[n];
+            ++n;
+        }
+    }
+    if (n < 2) {
+        strcpy_s(g_fxProbeStatus, "no gun effects attached yet - fire the gun once, then retry");
+        return;
+    }
+    for (int q = n; q < 4; ++q) { // pad unused slots with the gun (harmless duplicates)
+        addr[q] = addr[0];
+        labels[q] = lbl[0];
+    }
+    bonewatch::request_custom(addr, labels);
+    _snprintf_s(g_fxProbeStatus, sizeof g_fxProbeStatus, _TRUNCATE,
+                "watching %d effect position(s) - keep firing for 2 s", n - 1);
+}
+
+void age_kids() {
+    // Recycle only when the table is full, so a permanent attachment logs
+    // once, while pooled flash objects re-used shot to shot still got their
+    // first sighting logged.
+    for (auto& kk : g_kids)
+        if (!kk.obj) return;
+    for (auto& kk : g_kids) kk = {};
+}
+
+// ---- Route B: re-apply the drive right after the engine writes the pose ----
+// Measured (bonewatch, 2026-09-29): the plasmid effects read the wrist through
+// the bone getter AFTER the engine's pose writer and BEFORE the CalcView drive,
+// so they saw the authored hand. Hooking the writer and re-running the drive
+// on its return puts OUR hand in the array for every reader that follows -
+// effects, attachments, the renderer. drive() itself sees a fresh engine pose
+// there (anchor != last written) and adopts it as the reference first, so
+// engine animation (reload, equip) keeps flowing through exactly as before;
+// the CalcView drive later that frame then finds its own write and refines it.
+// Uses the last CalcView's inputs (one frame old) - the hand moves < 1 cm.
+using PoseWriteFn = bool(__fastcall*)(void* self, void* edx);
+PoseWriteFn g_poseWriteOrig = nullptr;
+bool g_poseHookTried = false, g_poseHookLive = false;
+std::atomic<bool> g_effectsFollow{true};
+std::atomic<uint32_t> g_postDrives{0};
+DWORD g_gameTid = 0;
+FrameContext g_postCtx{};
+void* g_postTarget = nullptr;
+GamePose g_postGp{};
+int g_postHand = -1;
+uint64_t g_postStampMs = 0;
+bool g_inPost = false;
+
+bool __fastcall pose_write_detour(void* self, void* edx) {
+    const bool r = g_poseWriteOrig(self, edx);
+    if (!g_inPost && g_effectsFollow.load(std::memory_order_relaxed) && self &&
+        self == bones::skeleton_instance() && GetCurrentThreadId() == g_gameTid &&
+        g_postTarget && g_postHand >= 0 && GetTickCount64() - g_postStampMs < 150) {
+        g_inPost = true;
+        if (bones::drive(g_postCtx, g_postTarget, g_postGp, g_postHand))
+            g_postDrives.fetch_add(1, std::memory_order_relaxed);
+        g_inPost = false;
+    }
+    return r;
+}
+
+void install_pose_hook() {
+    g_poseHookTried = true;
+    uint8_t* target = const_cast<uint8_t*>(g_imageBase) + patterns::kPoseWriteRva;
+    if (!bvr::pattern_scan::is_memory_valid(target, sizeof patterns::kPoseWritePrologue) ||
+        memcmp(target, patterns::kPoseWritePrologue, sizeof patterns::kPoseWritePrologue) != 0) {
+        BVR_LOG("[routeB] pose-writer prologue mismatch at %p - different game build? "
+                "REFUSING hook (effects stay on the game's hand)",
+                target);
+        return;
+    }
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&pose_write_detour),
+                      reinterpret_cast<void**>(&g_poseWriteOrig)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        BVR_LOG("[routeB] could not hook the pose writer at %p", target);
+        return;
+    }
+    g_poseHookLive = true;
+    BVR_LOG("[routeB] pose-writer hook ENABLED (rva 0x%X) - hand effects follow the driven "
+            "hand",
+            patterns::kPoseWriteRva);
+}
+
+// ---- Effects flip: mirror the gun's attached effects with the gun ----------
+// The render mirror flips the gun in the PICTURE; the engine's gun stays right-
+// handed and spawns its effects from right-handed positions, so only one point
+// per gun could ever line up. Reflecting each attached effect's world
+// transform about the SAME plane Pg, right after the engine positions it,
+// puts every effect exactly on the visible (mirrored) gun - for any plane
+// shift, so attached effects need no trim at all. Loose effects (the Tommy
+// gun's flash is not attached) still use the per-gun trim.
+using AttachUpdateFn = uint32_t(__fastcall*)(void* self, void* edx, void* parent, void* child,
+                                             void* a3, void* a4);
+AttachUpdateFn g_attachOrig = nullptr;
+
+// Only EFFECTS get flipped. Some attachments are gun PARTS drawn in the
+// viewmodel (foreground) scene - VisibleAmmoModel (the crossbow bolt, the
+// cartridges), ShotgunShell during a reload - and the render mirror already
+// reflects those; flipping their position too reflected them twice (first
+// in-headset run: cartridges and the bolt floated off the gun). Classified by
+// class name, cached per object; unknown names are left alone (safe side).
+bool effect_class(const wchar_t* cls) {
+    if (!cls) return false;
+    wchar_t low[64];
+    int i = 0;
+    for (; cls[i] && i < 63; ++i) low[i] = static_cast<wchar_t>(towlower(cls[i]));
+    low[i] = 0;
+    static const wchar_t* kParts[] = {L"ammo", L"shell", L"bolt", L"upgrade", L"model",
+                                      L"clip", L"magazine", L"canister"};
+    for (const wchar_t* w : kParts)
+        if (wcsstr(low, w)) return false;
+    static const wchar_t* kFx[] = {L"fx", L"steam", L"smoke", L"muzzle", L"spark", L"ion",
+                                   L"flash", L"light", L"trail", L"glow", L"heat", L"cold",
+                                   L"emitter", L"vapor", L"mist", L"fire", L"flame", L"drip"};
+    for (const wchar_t* w : kFx)
+        if (wcsstr(low, w)) return true;
+    return false;
+}
+
+std::map<void*, bool> g_effectCache; // child object -> is an effect
+
+bool is_effect(void* child) {
+    auto it = g_effectCache.find(child);
+    if (it != g_effectCache.end()) return it->second;
+    if (g_effectCache.size() > 512) g_effectCache.clear(); // pooled objects churn slowly
+    const bool fx = effect_class(patterns::object_class_name(child));
+    g_effectCache[child] = fx;
+    return fx;
+}
+
+void reflect_point(float p[3]) {
+    const float d = (p[0] - g_pgQ[0]) * g_pgN[0] + (p[1] - g_pgQ[1]) * g_pgN[1] +
+                    (p[2] - g_pgQ[2]) * g_pgN[2];
+    for (int i = 0; i < 3; ++i) p[i] -= 2.0f * d * g_pgN[i];
+}
+
+uint32_t __fastcall attach_update_detour(void* self, void* edx, void* parent, void* child,
+                                         void* a3, void* a4) {
+    const uint32_t r = g_attachOrig(self, edx, parent, child, a3, a4);
+    if (!child || !parent || parent != g_flipWeapon ||
+        !g_effectsFlip.load(std::memory_order_relaxed) ||
+        GetCurrentThreadId() != g_gameTid || GetTickCount64() - g_pgStampMs > 150)
+        return r;
+    if (!is_effect(child)) return r; // gun parts: the render mirror already flips them
+    uint8_t* c = static_cast<uint8_t*>(child);
+    float loc[3];
+    int32_t rot[3];
+    if (!read12(c + patterns::kActorLocOffset, loc) || !read12(c + patterns::kActorRotOffset, rot))
+        return r;
+    const float dq[3] = {loc[0] - g_pgQ[0], loc[1] - g_pgQ[1], loc[2] - g_pgQ[2]};
+    if (dq[0] * dq[0] + dq[1] * dq[1] + dq[2] * dq[2] > 150.0f * 150.0f)
+        return r; // parked/hidden attachments (upgrade models) stay where they are
+    reflect_point(loc);
+    FRotator fr{rot[0], rot[1], rot[2]};
+    float f[3], rr[3], u[3], f2[3], u2[3];
+    ue_rot_basis(fr, f, rr, u);
+    reflect_vec(f, g_pgN, f2);
+    reflect_vec(u, g_pgN, u2);
+    const FRotator out = basis_to_rot(f2, u2); // right implied: proper frame
+    const int32_t rot2[3] = {out.pitch, out.yaw, out.roll};
+    if (write12(c + patterns::kActorLocOffset, loc) && write12(c + patterns::kActorRotOffset, rot2))
+        g_flips.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
+
+void install_attach_hook() {
+    g_attachHookTried = true;
+    uint8_t* target = const_cast<uint8_t*>(g_imageBase) + patterns::kAttachUpdateRva;
+    if (!bvr::pattern_scan::is_memory_valid(target, sizeof patterns::kAttachUpdatePrologue) ||
+        memcmp(target, patterns::kAttachUpdatePrologue, sizeof patterns::kAttachUpdatePrologue) !=
+            0) {
+        BVR_LOG("[fxflip] attach-update prologue mismatch at %p - REFUSING hook", target);
+        return;
+    }
+    if (MH_CreateHook(target, reinterpret_cast<void*>(&attach_update_detour),
+                      reinterpret_cast<void**>(&g_attachOrig)) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        BVR_LOG("[fxflip] could not hook the attach update at %p", target);
+        return;
+    }
+    g_attachHookLive = true;
+    BVR_LOG("[fxflip] attach-update hook ENABLED (rva 0x%X) - gun effects follow the mirror",
+            patterns::kAttachUpdateRva);
+}
+
+void route_b_ui() {
+    bool fx = g_effectsFlip.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Flip the gun's effects with the gun (smoke, steam, flash)", &fx))
+        g_effectsFlip.store(fx, std::memory_order_relaxed);
+    bool on = g_effectsFollow.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Plasmid effects follow your real hand", &on))
+        g_effectsFollow.store(on, std::memory_order_relaxed);
+    if (!bvr::overlay::dev_tools()) return;
+
+    ImGui::SeparatorText("Hands + effects diagnostics");
+    static uint32_t s_l = 0, s_r = 0, s_last = 0, s_rate = 0;
+    static uint64_t s_ms = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - s_ms >= 1000) {
+        const uint32_t f = g_flips.load(std::memory_order_relaxed);
+        s_r = f - s_l;
+        s_l = f;
+        const uint32_t c = g_postDrives.load(std::memory_order_relaxed);
+        s_rate = c - s_last;
+        s_last = c;
+        s_ms = now;
+    }
+    ImGui::Text("attach hook: %s | effects flipped/s %u",
+                g_attachHookLive ? "live" : (g_attachHookTried ? "REFUSED (see log)" : "not yet"),
+                s_r);
+    ImGui::Text("pose-writer hook: %s | re-applies/s %u",
+                g_poseHookLive ? "live" : (g_poseHookTried ? "REFUSED (see log)" : "not yet"),
+                s_rate);
+    if (ImGui::Button("Watch gun effects (2 s - keep firing)")) g_fxProbeRequest.store(true);
+    if (g_fxProbeStatus[0]) ImGui::TextWrapped("%s", g_fxProbeStatus);
+    bonewatch::draw_debug_ui();
+}
+
+bool mirror_wanted() {
+    return bvr::input::left_handed() && bvr::input::mirror_viewmodel();
+}
+
+} // namespace
+
 void on_calcview(const FrameContext& ctx) {
+    MirrorArm mirrorArm;
+    g_gameTid = GetCurrentThreadId();
+    if (!g_poseHookTried && g_effectsFollow.load(std::memory_order_relaxed)) install_pose_hook();
+    if (!g_attachHookTried && mirror_wanted() && g_effectsFlip.load(std::memory_order_relaxed))
+        install_attach_hook();
+    {
+        int nb = 0;
+        void* arr = bones::bone_array(&nb);
+        bonewatch::tick(arr, nb);
+    }
+    if (mirror_wanted()) {
+        configure_mirror_once();
+        bvr::vm_mirror::set_game_ui(&route_b_ui);
+        bvr::vm_mirror::set_eye_half_uu(camera::ipd_mm() / 2000.0f * ctx.worldScale);
+        bvr::vm_mirror::set_world_scale(ctx.worldScale);
+    }
     // Overlay request, applied from THIS thread (same rule as aim.cpp: the
     // render thread must never touch engine state directly).
     int pending = g_pendingEnable.exchange(-1, std::memory_order_relaxed);
@@ -657,6 +1427,8 @@ void on_calcview(const FrameContext& ctx) {
     // the aim trim, and both per-hand model offsets below.
     const int hand = active_hand();
     GamePose gp{};
+    bool mirrorPose = false; // the rig pose below is the head-reflected one
+    GamePose headW{};        // the HMD in game space, for the gun-plane mode
     uint64_t now = GetTickCount64();
     if (now < g_test.deadline) {
         // Camera-relative lane: proves the write lands, no pose math involved.
@@ -698,6 +1470,20 @@ void on_calcview(const FrameContext& ctx) {
             quat[1] = hp.qy;
             quat[2] = hp.qz;
             quat[3] = hp.qw;
+            // Mirror probe: the rig gets the reflected pose (a virtual right
+            // controller for the gun); the aim ray, laser and swing keep the
+            // real one - they never pass through here.
+            if (mirror_wanted() && g_mode.load(std::memory_order_relaxed) == 2) {
+                bvr::vr::HeadPose head{};
+                if (bvr::vr::peek_head_pose(head)) {
+                    mirror_pose_about_head(head, pos, quat);
+                    const float hpPos[3] = {head.px, head.py, head.pz};
+                    const float hpQuat[4] = {head.qx, head.qy, head.qz, head.qw};
+                    headW = xr_pose_to_game(mapCtx, hpPos, hpQuat);
+                    mirrorPose = true;
+                    mirrorArm.arm = true;
+                }
+            }
             if (bvr::b1r::bones::telemetry_on()) {
                 static uint64_t lastTlm = 0;
                 if (now - lastTlm >= 200) {
@@ -741,10 +1527,66 @@ void on_calcview(const FrameContext& ctx) {
         // culling, correct engine-side FX anchoring) and the hand CLUSTER
         // moves to the controller instead.
         gp.loc = {loc[0], loc[1], loc[2]};
+        if (mirrorPose) {
+            const float trim = sync_weapon_trim(hand);
+            float muzzle[3] = {0.0f, 0.0f, 0.0f};
+            // Priority: the flash offset MEASURED for this weapon (v7) - it is
+            // where the engine really spawns the flash; else bone 44 (v6).
+            auto learned = hand == 1 ? g_flashY.find(g_trimKey) : g_flashY.end();
+            const bool haveFlash = learned != g_flashY.end();
+            const bool haveMuzzle =
+                haveFlash || (hand == 1 && bones::muzzle_ref_offset(muzzle));
+            if (haveFlash) muzzle[1] = learned->second;
+            float shift = (haveMuzzle ? muzzle[1] : 0.0f) + trim;
+            if (shift > 20.0f) shift = 20.0f; // a sane plane; never throw the rig away
+            if (shift < -20.0f) shift = -20.0f;
+            const bool gunPlane =
+                bvr::vm_mirror::plane_mode() == bvr::vm_mirror::PlaneMode::Gun &&
+                apply_gun_plane(headW, gp, shift);
+            g_flipWeapon = gunPlane && hand == 1 ? weapon_actor() : nullptr;
+            if (!g_flipWeapon) g_pgStampMs = 0;
+            if (!gunPlane) {
+                g_eyePlaneLive = false;
+                publish_head_planes(ctx); // v4 behaviour
+            }
+            static uint64_t s_noteMs = 0;
+            if (now - s_noteMs > 250) {
+                s_noteMs = now;
+                char note[160];
+                _snprintf_s(note, sizeof note, _TRUNCATE,
+                            "Tuning: %s | muzzle offset (%s) %.2f UU + trim %.2f%s",
+                            g_trimKey.c_str(),
+                            haveFlash ? "measured flash" : haveMuzzle ? "bone 44 guess" : "none",
+                            haveMuzzle ? muzzle[1] : 0.0f, trim,
+                            gunPlane ? "" : " | gun plane unavailable - head plane used");
+                bvr::vm_mirror::set_ui_note(note);
+            }
+        }
         // The weapon-scale lane rides the same per-frame slot (session 61);
         // it no-ops at wscale 1.0 and drops itself on weapon switches.
         bones::wskel_drive();
-        if (!bones::drive(ctx, target, gp, hand)) return;
+        bonewatch::mark_drive_begin();
+        const bool drove = bones::drive(ctx, target, gp, hand);
+        bonewatch::mark_drive_end();
+        if (!drove) {
+            mirrorArm.arm = false; // rig not driven: never reflect an unplaced rig
+            g_postTarget = nullptr;
+            return;
+        }
+        // Route B: the inputs the pose-writer hook re-applies next engine write.
+        g_postCtx = ctx;
+        g_postTarget = target;
+        g_postGp = gp;
+        g_postHand = hand;
+        g_postStampMs = now;
+        if (mirrorPose && hand == 1) {
+            void* weapon = weapon_actor();
+            if (weapon && !g_attachedSearched) find_attached_offset(target, weapon);
+            watch_kids(weapon, "weapon", gp, g_trimKey.c_str());
+            watch_kids(target, "hands", gp, g_trimKey.c_str());
+            age_kids();
+            if (weapon && g_fxProbeRequest.exchange(false)) start_fx_probe(weapon);
+        }
     } else {
         uint8_t* p = static_cast<uint8_t*>(target);
         bool wrote = write12(p + patterns::kActorLocOffset, loc);
@@ -1063,6 +1905,17 @@ void draw_debug_ui() {
                 g_lastPitch.load(std::memory_order_relaxed),
                 g_lastYaw.load(std::memory_order_relaxed),
                 g_lastRoll.load(std::memory_order_relaxed));
+}
+
+void on_eye_camera(int eye, const float loc[3], int32_t pitch, int32_t yaw, int32_t roll) {
+    if (eye < 0 || eye > 1 || !g_eyePlaneLive) return;
+    if (!bvr::vm_mirror::armed() ||
+        bvr::vm_mirror::plane_mode() != bvr::vm_mirror::PlaneMode::Gun)
+        return;
+    // Same frame only: the plane is written by on_calcview a moment earlier.
+    if (GetTickCount64() - g_eyePlaneStampMs > 100) return;
+    const int32_t rot[3] = {pitch, yaw, roll};
+    publish_eye_plane(eye, loc, rot);
 }
 
 } // namespace bvr::b1r::hands

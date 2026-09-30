@@ -14,6 +14,7 @@
 
 #include "core/gfx/gfx_hud.h"
 #include "core/gfx/hud_capture.h"
+#include "core/gfx/vm_mirror.h"
 
 #include "core/util/log.h"
 
@@ -520,7 +521,8 @@ HRESULT STDMETHODCALLTYPE MapDetour(ID3D11DeviceContext* ctx, ID3D11Resource* re
                                     UINT sub, D3D11_MAP mapType, UINT flags,
                                     D3D11_MAPPED_SUBRESOURCE* mapped) {
     HRESULT hr = g_origMap(ctx, res, sub, mapType, flags, mapped);
-    if (g_watchArmed.load(std::memory_order_relaxed) && SUCCEEDED(hr) && mapped &&
+    if ((g_watchArmed.load(std::memory_order_relaxed) || bvr::vm_mirror::wants_map_tracking()) &&
+        SUCCEEDED(hr) && mapped &&
         mapped->pData && sub == 0 &&
         (mapType == D3D11_MAP_WRITE_DISCARD || mapType == D3D11_MAP_WRITE ||
          mapType == D3D11_MAP_WRITE_NO_OVERWRITE)) {
@@ -541,6 +543,7 @@ HRESULT STDMETHODCALLTYPE MapDetour(ID3D11DeviceContext* ctx, ID3D11Resource* re
 void STDMETHODCALLTYPE UnmapDetour(ID3D11DeviceContext* ctx, ID3D11Resource* res, UINT sub) {
     if (sub == 0 && res == t_mappedRes) {
         watch_inspect(res, &sub);
+        bvr::vm_mirror::on_unmap(res, t_mappedPtr, t_mappedBytes);
         t_mappedRes = nullptr;
         t_mappedPtr = nullptr;
         t_mappedBytes = 0;
@@ -566,6 +569,8 @@ Event& push_event(EventKind kind, const void* retAddr, void* espHint) {
 
 void STDMETHODCALLTYPE DrawIndexedDetour(ID3D11DeviceContext* ctx, UINT indexCount,
                                          UINT startIndex, INT baseVertex) {
+    if (t_suppress == 0 && bvr::vm_mirror::census_active())
+        bvr::vm_mirror::census_draw(ctx, _AddressOfReturnAddress(), 0, indexCount);
     g_callCensus[CxDrawIndexed].fetch_add(1, std::memory_order_relaxed);
     if (t_suppress == 0) bvr::hud::on_draw_indexed(ctx);
     // Session 34: adapter mesh veto. Checked BEFORE recording on purpose - a
@@ -603,10 +608,21 @@ void STDMETHODCALLTYPE DrawIndexedDetour(ID3D11DeviceContext* ctx, UINT indexCou
             --t_suppress;
         }
     }
+    // Viewmodel mirror probe: reflect fg draws (armed-off cost: one load).
+    bvr::vm_mirror::DrawToken mt;
+    if (t_suppress == 0 && bvr::vm_mirror::armed()) {
+        ++t_suppress; // our Map/Unmap rewrite must not recurse into recording
+        mt = bvr::vm_mirror::before_draw(ctx, _AddressOfReturnAddress());
+        --t_suppress;
+        if (mt.skip) return;
+    }
     g_origDrawIndexed(ctx, indexCount, startIndex, baseVertex);
+    if (mt.restore) bvr::vm_mirror::after_draw(ctx, mt);
 }
 
 void STDMETHODCALLTYPE DrawDetour(ID3D11DeviceContext* ctx, UINT vertexCount, UINT startVertex) {
+    if (t_suppress == 0 && bvr::vm_mirror::census_active())
+        bvr::vm_mirror::census_draw(ctx, _AddressOfReturnAddress(), 1, vertexCount);
     g_callCensus[CxDraw].fetch_add(1, std::memory_order_relaxed);
     if (should_record()) {
         ++t_suppress;
@@ -665,6 +681,8 @@ void STDMETHODCALLTYPE DrawDetour(ID3D11DeviceContext* ctx, UINT vertexCount, UI
 void STDMETHODCALLTYPE DrawIndexedInstancedDetour(ID3D11DeviceContext* ctx, UINT indexCount,
                                                   UINT instances, UINT startIndex, INT baseVertex,
                                                   UINT startInstance) {
+    if (t_suppress == 0 && bvr::vm_mirror::census_active())
+        bvr::vm_mirror::census_draw(ctx, _AddressOfReturnAddress(), 2, indexCount);
     g_callCensus[CxDrawIdxInst].fetch_add(1, std::memory_order_relaxed);
     if (should_record()) {
         ++t_suppress;
@@ -680,6 +698,8 @@ void STDMETHODCALLTYPE DrawIndexedInstancedDetour(ID3D11DeviceContext* ctx, UINT
 
 void STDMETHODCALLTYPE DrawInstancedDetour(ID3D11DeviceContext* ctx, UINT vertexCount,
                                            UINT instances, UINT startVertex, UINT startInstance) {
+    if (t_suppress == 0 && bvr::vm_mirror::census_active())
+        bvr::vm_mirror::census_draw(ctx, _AddressOfReturnAddress(), 3, vertexCount);
     g_callCensus[CxDrawInst].fetch_add(1, std::memory_order_relaxed);
     if (should_record()) {
         ++t_suppress;
@@ -1216,6 +1236,7 @@ void arm(int mode, int count) {
 }
 
 void on_present(IDXGISwapChain*) {
+    bvr::vm_mirror::on_present();
     if (g_recording.load(std::memory_order_relaxed)) {
         g_recording.store(false, std::memory_order_relaxed);
         write_dump();

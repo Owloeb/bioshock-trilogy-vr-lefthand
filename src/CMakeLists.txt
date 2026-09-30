@@ -22,6 +22,7 @@ add_library(bioshockvr SHARED
     core/gfx/blit.cpp
     core/gfx/blit.h
     core/gfx/frame_inspector.cpp
+    core/gfx/vm_mirror.cpp
     core/gfx/frame_inspector.h
     core/gfx/gfx_hud.cpp
     core/gfx/gfx_hud.h
@@ -59,6 +60,7 @@ add_library(bioshockvr SHARED
     game/bioshock1r/body.cpp
     game/bioshock1r/body.h
     game/bioshock1r/bones.cpp
+    game/bioshock1r/bonewatch.cpp
     game/bioshock1r/bones.h
     game/bioshock1r/camera.cpp
     game/bioshock1r/camera.h

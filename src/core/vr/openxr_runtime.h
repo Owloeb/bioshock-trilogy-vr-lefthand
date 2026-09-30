@@ -370,6 +370,11 @@ float rendered_hfov_deg();
 // last image + pose is held for the compositor to reproject on its off frame.
 int current_eye_sign();
 
+// Viewmodel mirror probe: the eye tag of the frame the render thread is drawing
+// right now (the oldest unpopped SR tag; it is popped at that frame's Present).
+// 0 = no tag pending (mono / AlternateEye).
+int sr_peek_eye();
+
 // --- M4 rung 2: SequentialReentry stereo ------------------------------------
 // The game adapter double-calls the engine's scene build, rendering two
 // frames per game tick (left eye then right - DR-5). Because every submitted

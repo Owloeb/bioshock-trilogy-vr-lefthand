@@ -53,4 +53,7 @@ void restore_game_fov_if_stale(uint64_t staleMs);
 // Called from the overlay through IGameAdapter::drawDebugUi().
 void draw_debug_ui();
 
+// The stereo IPD the eye offsets use (mm) - the viewmodel mirror needs it.
+float ipd_mm();
+
 } // namespace bvr::b1r::camera

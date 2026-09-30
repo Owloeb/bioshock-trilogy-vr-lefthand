@@ -1192,9 +1192,23 @@ void save_weapon_profiles() {
 // The origin offset rides the FINAL (trimmed) ray frame - both lanes, the
 // synthetic test lane included, which is what makes it flat-assertable via
 // the ray origins in `vraim status`.
+// Mirror mode (left-handed + viewmodel mirror): every calibration value was
+// tuned against the RIGHT-handed model in the right hand (and the plasmid
+// hand's against the left). With the model mirrored, the ray must mirror too:
+// the SIDEWAYS parts flip - yaw trim, lateral origin offset, model yaw/roll
+// trim - while pitch, forward and up stay. Applied only where the values are
+// CONSUMED, so the stored calibration, profiles and weapons.ini stay in their
+// right-handed form (saving and toggling modes never corrupts them).
+// Measured symptom this fixes: the Pistol (yaw -4.2) and Crossbow (-6.65)
+// fired visibly left of the mirrored model; the plasmid hand's +37 yaw trim
+// threw Electro Bolt / Incinerate far off the right hand.
+float mirror_side() {
+    return bvr::input::left_handed() && bvr::input::mirror_viewmodel() ? -1.0f : 1.0f;
+}
+
 void apply_origin_offset(int i, Ray& out, float worldScale) {
     float of = g_posFwdCm[i].load(std::memory_order_relaxed);
-    float orr = g_posRightCm[i].load(std::memory_order_relaxed);
+    float orr = g_posRightCm[i].load(std::memory_order_relaxed) * mirror_side();
     float ou = g_posUpCm[i].load(std::memory_order_relaxed);
     if (of == 0.0f && orr == 0.0f && ou == 0.0f) return;
     float fwd[3], right[3], up[3];
@@ -1308,7 +1322,8 @@ void on_calcview(const FrameContext& ctx) {
         // with `vraim synccheck` (roll forced 0 there - the camera owns roll).
         GamePose gp = ray_pose_from_xr(ctx, pos, quat,
                                        g_pitchOffsetDeg[i].load(std::memory_order_relaxed),
-                                       g_yawOffsetDeg[i].load(std::memory_order_relaxed));
+                                       g_yawOffsetDeg[i].load(std::memory_order_relaxed) *
+                                           mirror_side());
         out.origin = gp.loc;
         out.rot = gp.rot;
 
@@ -1323,8 +1338,8 @@ void on_calcview(const FrameContext& ctx) {
             if (bvr::b1r::bones::barrel_ref_axis(d0)) {
                 GamePose mgp = model_pose_from_xr(ctx, pos, quat,
                                                   hands::model_trim_pitch_deg(1),
-                                                  hands::model_trim_yaw_deg(1),
-                                                  hands::model_trim_roll_deg(1));
+                                                  hands::model_trim_yaw_deg(1) * mirror_side(),
+                                                  hands::model_trim_roll_deg(1) * mirror_side());
                 float qt[4], dirW[3];
                 ue_rot_to_quat(mgp.rot, qt);
                 quat_rotate(qt[0], qt[1], qt[2], qt[3], d0, dirW);
@@ -1344,9 +1359,9 @@ void on_calcview(const FrameContext& ctx) {
     lc.hand = hands::active_hand();
     int lh = lc.hand == 0 ? 0 : 1;
     lc.pitchTrimDeg = g_pitchOffsetDeg[lh].load(std::memory_order_relaxed);
-    lc.yawTrimDeg = g_yawOffsetDeg[lh].load(std::memory_order_relaxed);
+    lc.yawTrimDeg = g_yawOffsetDeg[lh].load(std::memory_order_relaxed) * mirror_side();
     lc.posFwdCm = g_posFwdCm[lh].load(std::memory_order_relaxed);
-    lc.posRightCm = g_posRightCm[lh].load(std::memory_order_relaxed);
+    lc.posRightCm = g_posRightCm[lh].load(std::memory_order_relaxed) * mirror_side();
     lc.posUpCm = g_posUpCm[lh].load(std::memory_order_relaxed);
     lc.dots = g_laserDots.load(std::memory_order_relaxed);
     lc.nearM = g_laserNearM.load(std::memory_order_relaxed);
@@ -1362,8 +1377,8 @@ void on_calcview(const FrameContext& ctx) {
             lc.muzzleD0[1] = d0[2];
             lc.muzzleD0[2] = -d0[0];
             lc.modelPitchTrimDeg = hands::model_trim_pitch_deg(1);
-            lc.modelYawTrimDeg = hands::model_trim_yaw_deg(1);
-            lc.modelRollTrimDeg = hands::model_trim_roll_deg(1);
+            lc.modelYawTrimDeg = hands::model_trim_yaw_deg(1) * mirror_side();
+            lc.modelRollTrimDeg = hands::model_trim_roll_deg(1) * mirror_side();
         }
     }
     bvr::vr::set_laser(lc);
@@ -1761,6 +1776,8 @@ bool hook_live() {
 void* learned_weapon_object() {
     return g_objRight;
 }
+
+const char* active_weapon_key() { return g_weaponKey.c_str(); }
 
 bool weapon_key_is(const char* name) {
     // The profile key IS the equipped holdable's class name, maintained by

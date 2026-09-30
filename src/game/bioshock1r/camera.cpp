@@ -1073,6 +1073,10 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
             g_eyeCamLoc[1] = *loc; // fg view-sync stash, RIGHT eye
             g_eyeCamRot[1] = *rot;
             g_eyeCamStampMs[1] = GetTickCount64();
+            {
+                const float el[3] = {loc->x, loc->y, loc->z};
+                hands::on_eye_camera(1, el, rot->pitch, rot->yaw, rot->roll);
+            }
         } else if (rot) {
             rot->yaw += static_cast<int32_t>(reentryYawDeg * kRotUnitsPerDegree);
         }
@@ -1701,6 +1705,10 @@ void __fastcall CalcViewDetour(void* self, void* edx, void** viewActor,
         g_eyeCamLoc[0] = *loc; // fg view-sync stash, LEFT eye
         g_eyeCamRot[0] = *rot;
         g_eyeCamStampMs[0] = GetTickCount64();
+        {
+            const float el[3] = {loc->x, loc->y, loc->z};
+            hands::on_eye_camera(0, el, rot->pitch, rot->yaw, rot->roll);
+        }
     } else {
         g_srBaseValid = false;
     }
@@ -2179,5 +2187,7 @@ void draw_debug_ui() {
         }
     }
 }
+
+float ipd_mm() { return g_ipdMm.load(std::memory_order_relaxed); }
 
 } // namespace bvr::b1r::camera

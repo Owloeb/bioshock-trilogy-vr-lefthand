@@ -142,6 +142,26 @@ inline constexpr uint8_t kFrameSubmitPrologue[10] = {0x55, 0x8B, 0xEC, 0x51,
 // data is baked into the queue during THIS function, so SequentialReentry
 // must re-enter here.
 inline constexpr uint32_t kSceneBuildRva = 0x4CCE70;
+// Route B (2026-09-29, bonewatch hardware-watchpoint capture + capstone): the
+// SkeletonInstance POSE WRITER. __thiscall bool(SkeletonInstance* this), no
+// stack args (plain `ret`), dispatched from a job table (call eax at
+// 0x732758). Its store loop at +0x246 (0x597F36) bulk-writes the evaluated
+// pose into [this+0x48]. Every bone query that follows in the frame - the
+// effect attach reads through the bone getter 0x598310 - sees whatever the
+// array holds after this returns, so the drive re-applies right here.
+// Effects flip (2026-09-29, v9 effects watchpoints + capstone): the ATTACHED-
+// ACTOR UPDATE. __thiscall(ParentMeshData* this, AActor* parent, AActor* child,
+// ?, ?), `ret 0x10`. Computes the child's world transform from the parent's
+// bone table (+0x100, 48-byte hkQsTransforms) and WRITES child Location
+// (+0x1D8, at +0x47E) and Rotation (+0x1E4). The gun's attached effects
+// (ShotgunMuzzleFX, Shotgun_Steam, ...) are positioned here every tick.
+inline constexpr uint32_t kAttachUpdateRva = 0x3FA1E0;
+inline constexpr uint8_t kAttachUpdatePrologue[9] = {0x53, 0x8B, 0xDC, 0x83, 0xEC,
+                                                     0x08, 0x83, 0xE4, 0xF0};
+inline constexpr uint32_t kActorRotOffset = 0x1E4; // AActor::Rotation (FRotator ints)
+inline constexpr uint32_t kPoseWriteRva = 0x597CF0;
+inline constexpr uint8_t kPoseWritePrologue[9] = {0x53, 0x8B, 0xDC, 0x83, 0xEC,
+                                                  0x08, 0x83, 0xE4, 0xF0};
 // The STEADY-STATE GAMEPLAY caller's return RVA for the scene build (live
 // hook telemetry, sessions 6-7). Loads/transitions call the build from other
 // sites; pass 2 doubles ONLY gameplay-caller builds - doubling (or any 1t

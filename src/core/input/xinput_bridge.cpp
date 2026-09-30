@@ -1,4 +1,5 @@
 #include "core/input/xinput_bridge.h"
+#include "core/gfx/vm_mirror.h"
 
 #include "core/hooks/pattern_scan.h"
 #include "core/input/swing.h"
@@ -116,6 +117,7 @@ std::atomic<int> g_ammoMod{1}; // AmmoMod::Thumbrest (user's call, session 23)
 // Left-handed mode + stick swap (see xinput_bridge.h). Default off.
 std::atomic<bool> g_leftHanded{false};
 std::atomic<bool> g_swapSticks{false};
+std::atomic<bool> g_mirrorVm{false};
 // Session 44: which per-game map the XR composer builds. 0 == PadProfile::
 // Bioshock1, the historical hardcoded semantics, so BS1 and BS2 (which never
 // call the setter) compose exactly what they composed before.
@@ -802,10 +804,11 @@ void set_ammo_mod(AmmoMod m) {
     g_ammoMod.store(static_cast<int>(m), std::memory_order_relaxed);
 }
 
-// Hand-setup persistence (handedness.ini, shared by every game). Saved the
-// moment a setting changes and loaded at init, independent of any per-game
-// preset - a preset is only written by an explicit Save, so a checkbox change
-// kept there would be lost at the next launch.
+// Handedness persistence (handedness.ini, shared by every game). These three
+// used to ride the per-game VR preset, which is only written by an explicit
+// Save - so a checkbox change was lost at the next launch, and an older saved
+// preset could switch left-handed mode back off. Now each change saves itself
+// and the file loads at init, before any preset.
 bool g_handLoading = false;
 bool g_handLoaded = false;
 
@@ -820,8 +823,8 @@ void save_handedness() {
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "# BioShock VR - hand setup (saved automatically)\n");
-    fprintf(f, "leftHanded=%d\nswapSticks=%d\n", g_leftHanded.load() ? 1 : 0,
-            g_swapSticks.load() ? 1 : 0);
+    fprintf(f, "leftHanded=%d\nswapSticks=%d\nmirrorViewmodel=%d\n",
+            g_leftHanded.load() ? 1 : 0, g_swapSticks.load() ? 1 : 0, g_mirrorVm.load() ? 1 : 0);
     fclose(f);
 }
 
@@ -839,11 +842,12 @@ void load_handedness() {
         if (sscanf_s(line, "%47[^=]=%d", key, static_cast<unsigned>(sizeof key), &v) != 2) continue;
         if (strcmp(key, "leftHanded") == 0) set_left_handed(v != 0);
         else if (strcmp(key, "swapSticks") == 0) set_swap_sticks(v != 0);
+        else if (strcmp(key, "mirrorViewmodel") == 0) set_mirror_viewmodel(v != 0);
     }
     g_handLoading = false;
     fclose(f);
-    BVR_LOG("input: hand setup loaded (%s-handed%s)", g_leftHanded.load() ? "left" : "right",
-            g_swapSticks.load() ? ", sticks swapped" : "");
+    BVR_LOG("input: hand setup loaded (%s-handed%s%s)", g_leftHanded.load() ? "left" : "right",
+            g_mirrorVm.load() ? ", mirrored" : "", g_swapSticks.load() ? ", sticks swapped" : "");
 }
 
 bool left_handed() { return g_leftHanded.load(std::memory_order_relaxed); }
@@ -854,6 +858,12 @@ void set_left_handed(bool on) {
         BVR_LOG("input: handedness %s - weapon (aim, laser, viewmodel, fire trigger, "
                 "weapon grip, swing) on the %s controller, plasmid on the %s",
                 on ? "LEFT" : "right", on ? "LEFT" : "right", on ? "right" : "left");
+}
+bool mirror_viewmodel() { return g_mirrorVm.load(std::memory_order_relaxed); }
+void set_mirror_viewmodel(bool on) {
+    const bool was = g_mirrorVm.exchange(on, std::memory_order_relaxed);
+    if (was != on) save_handedness();
+    if (was != on) BVR_LOG("input: viewmodel mirror probe %s", on ? "ON" : "off");
 }
 bool swap_sticks() { return g_swapSticks.load(std::memory_order_relaxed); }
 void set_swap_sticks(bool on) {
@@ -1157,6 +1167,16 @@ void draw_debug_ui() {
                           "swing-to-attack move to the LEFT controller; plasmids to the right.\n"
                           "Buttons (A/B/X/Y/menu) stay where they are. Per-hand tuning follows\n"
                           "the role, so re-check the weapon offsets once after switching.");
+    if (lh) {
+        ImGui::Indent();
+        bool mv = g_mirrorVm.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox("Mirror hands + weapon (real left hand)", &mv)) set_mirror_viewmodel(mv);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Draws a real LEFT hand on the gun and a right hand for plasmids,\n"
+                              "by reflecting the finished viewmodel. Experimental.");
+        ImGui::Unindent();
+        if (mv) bvr::vm_mirror::draw_debug_ui();
+    }
     bool ss = g_swapSticks.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Swap sticks (move right, turn left)", &ss)) set_swap_sticks(ss);
 

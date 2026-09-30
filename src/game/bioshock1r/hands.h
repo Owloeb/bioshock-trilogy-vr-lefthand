@@ -33,6 +33,13 @@ void init(const bvr::pattern_scan::ProcessImage& image);
 // afterwards to win.
 void on_calcview(const FrameContext& ctx);
 
+// Left-handed mirror, gun-plane mode: called by the camera the moment each
+// stereo eye's camera is FINAL (eye 0 = left, the normal pass; 1 = right, the
+// reentry pass), right before that eye's scene is built. Re-expresses this
+// frame's world-space gun plane in that exact eye's view so both eyes reflect
+// about the same world plane - no one-frame-stale eye while moving.
+void on_eye_camera(int eye, const float loc[3], int32_t pitch, int32_t yaw, int32_t roll);
+
 // Seam command handler: args after the "vrhands" verb (game thread).
 //   on | off | status
 //   mode bones|hands|gun    bones (default, M7-v2) drives the hand-cluster

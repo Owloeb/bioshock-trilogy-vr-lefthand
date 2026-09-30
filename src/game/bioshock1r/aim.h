@@ -79,6 +79,8 @@ void* learned_weapon_object();
 // is the equipped holdable (the key is maintained from Hands.CurrentHoldable).
 // Session 31's swing gesture gates on weapon_key_is("Wrench"). Game thread.
 bool weapon_key_is(const char* name);
+// The ACTIVE per-weapon profile key (weapon class name), "" if none. Game thread.
+const char* active_weapon_key();
 
 // The live aim trim (degrees), PER HAND (0 = left/plasmid, 1 = right/weapon)
 // since session 16 part 3 - shared so the laser, the fire ray and the M7
