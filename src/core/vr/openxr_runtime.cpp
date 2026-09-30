@@ -4497,6 +4497,8 @@ void set_two_hand_grip(bool on, const float grabLocal[3], const float offRelQuat
 }
 float hand_squeeze(int role) { return input_hand_squeeze(role); }
 void reserve_grip_bumper(int role, bool on) { input_reserve_grip_bumper(role, on); }
+float hand_trigger(int role) { return input_hand_trigger(role); }
+void reserve_trigger(int role, bool on) { input_reserve_trigger(role, on); }
 void haptic_pulse(int role, float amplitude, int durationMs) {
     input_haptic_pulse(role, amplitude, durationMs);
 }
@@ -5249,6 +5251,8 @@ bool get_raw_hand_pose(int, bool, HeadPose&) { return false; }
 void set_two_hand_grip(bool, const float[3], const float[4]) {}
 float hand_squeeze(int) { return 0.0f; }
 void reserve_grip_bumper(int, bool) {}
+float hand_trigger(int) { return 0.0f; }
+void reserve_trigger(int, bool) {}
 void haptic_pulse(int, float, int) {}
 void set_sim_hand_pose(int, bool, bool, const float[3], const float[4]) {}
 void clear_sim_hand_poses() {}

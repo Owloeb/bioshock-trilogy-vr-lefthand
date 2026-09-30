@@ -38,6 +38,20 @@ bool gripped();          // two-handing right now
 // while the hand is inside the grab zone (a preview of the hold).
 bool preview_grip();
 
+// A rigid transform in a controller's local XR frame: x' = t + q * x.
+struct Rigid {
+    float t[3];
+    float q[4];
+};
+// Hand calibration changed a hand model's offset transform (controller-local
+// XR, as hands.cpp applies it: position p + R(q trim) o, rotation q trim).
+// Re-express every grab point of the current hand setup so the held off hand
+// keeps its place ON THE GUN: G' = Aw Tw' Tw^-1 Aw^-1 G Ao To To'^-1 Ao^-1,
+// with A = grip->aim when the model follows the aim pose and T conjugated by
+// the local x-flip when mirrored. Game thread.
+void rebase_grab_points(bool aimPose, bool mirrored, const Rigid& twOld, const Rigid& twNew,
+                        const Rigid& toOld, const Rigid& toNew);
+
 // F10 section (render thread).
 void draw_debug_ui();
 

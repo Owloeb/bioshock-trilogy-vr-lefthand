@@ -69,5 +69,9 @@ float input_hand_squeeze(int role);
 void input_reserve_grip_bumper(int role, bool on);
 // Queue one haptic pulse on the controller holding `role`.
 void input_haptic_pulse(int role, float amplitude, int durationMs);
+// Raw trigger 0..1 by role, and per-role trigger reservation (refresh each
+// frame; expires after 200 ms): a reserved trigger composes as released.
+float input_hand_trigger(int role);
+void input_reserve_trigger(int role, bool on);
 
 } // namespace bvr::vr

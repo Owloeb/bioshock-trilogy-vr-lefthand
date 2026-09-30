@@ -1333,7 +1333,11 @@ bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actor
     v_cross(ue0, ew0, nRef);
     v_sub(E, S, se);
     v_sub(Wt, E, ew);
-    v_cross(se, ew, nNew);
+    // The solved bend plane's normal from the POLE, not from the two segments:
+    // cross(se, ew) = a d sinA (pp x n), same direction - but it vanishes as the
+    // arm straightens and its sign then flips on noise, which spun the whole
+    // arm half a turn in one frame (the collapse). pp x n never degenerates.
+    v_cross(pp, n, nNew);
     if (v_len(nRef) < 1e-4f) {
         // The reference arm is straight: take its bend plane from the pole.
         float ref_dir[3] = {uw0[0], uw0[1], uw0[2]};
@@ -1377,6 +1381,19 @@ bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actor
         quat_conj(implied, wqInv);
         quat_mul(wq, wqInv, delta);
         twist_about(delta, ax, tw);
+        // Shortest way round, and never past 150 deg: beyond that the skin
+        // between the helpers folds through itself.
+        if (tw[3] < 0.0f)
+            for (float& c : tw) c = -c;
+        {
+            const float ang = 2.0f * acosf(tw[3] > 1.0f ? 1.0f : tw[3]);
+            constexpr float kMaxTwist = 150.0f / 57.29578f;
+            if (ang > kMaxTwist) {
+                float lim[4];
+                quat_scale_angle(tw, kMaxTwist / ang, lim);
+                memcpy(tw, lim, sizeof lim);
+            }
+        }
         const int helpers[2] = {tw1, tw2};
         const float frac[2] = {0.33f, 0.66f};
         for (int k = 0; k < 2; ++k) {

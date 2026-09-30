@@ -72,6 +72,8 @@ bool get_raw_hand_pose(int hand, bool aimPose, HeadPose& out);
 void set_two_hand_grip(bool on, const float grabLocal[3], const float offRelQuat[4]);
 float hand_squeeze(int role);
 void reserve_grip_bumper(int role, bool on);
+float hand_trigger(int role);             // raw 0..1 by role
+void reserve_trigger(int role, bool on);  // refresh each frame; composes as released
 void haptic_pulse(int role, float amplitude, int durationMs);
 
 // --- Session 20: vrrec record+replay support ---------------------------------
