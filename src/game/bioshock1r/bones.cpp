@@ -168,6 +168,22 @@ bool g_barrelLocalValid = false;
 Qts g_liveL[kMaxBones];
 Qts g_gripShape[kMaxBones];
 bool g_gripShapeValid = false;
+// Grip placement, weapon hand: the palm-to-gun relation the controller is
+// matched against, taken from the gun AT REST ([0] weapon wrist, [1] attach).
+// Solving against the live reference instead pinned the palm and cancelled
+// every authored gun motion that moves hand and gun together (the shotgun
+// rocking through its pump, the grenade launcher's twist, the crossbow
+// prime) - while the support-hand follow still applied that motion, so the
+// held hand slid off the gun. With the rest relation the gun is rigid to the
+// controller exactly as in aim-pose mode and animations play on top of it;
+// at rest the reference IS the rest pose, so the palm still sits exactly on
+// your palm. Dropped on a weapon or hand change (an equip keeps the palm
+// pinned, then the new rest blends in); refreshed every frame at rest.
+Qts g_placeRest[2];
+bool g_placeRestValid = false;
+uint64_t g_placeRestMs = 0;
+char g_placeWeapon[64] = {};
+bool g_refTracking = false; // the sway-killed reference is following an animation
 Qts g_restCand[2];   // candidate rest pose, and since when it has held
 uint64_t g_restCandMs = 0;
 constexpr float kRestHoldUu = 1.0f;     // idle sway is sub-UU (session 20)
@@ -920,6 +936,7 @@ void on_world_change() {
     g_palm[0].valid = g_palm[1].valid = false;
     g_lastActorValid = false;
     g_barrelLocalValid = false;
+    g_placeRestValid = false;
     if (g_skelInst) BVR_LOG("[bones] world changed - skeleton cache cleared");
     g_skelInst = nullptr;
     g_bones = nullptr;
@@ -1806,6 +1823,50 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
     return true;
 }
 
+// Grip placement rest (see g_placeRest): called every frame the weapon hand is
+// at rest. The first take after a weapon/hand change is exact (the reference
+// equals what the live solve just used, so nothing moves); later takes blend
+// in over ~80 ms, so a re-freeze of the idle a hair off the old rest re-seats
+// the palm smoothly instead of stepping.
+void update_place_rest(int anchor) {
+    const int w = wrist_of(1);
+    if (w >= g_boneCount || anchor >= g_boneCount) return;
+    const Qts* now[2] = {&g_ref[w], &g_ref[anchor]};
+    const uint64_t t = GetTickCount64();
+    if (!g_placeRestValid) {
+        g_placeRest[0] = *now[0];
+        g_placeRest[1] = *now[1];
+        g_placeRestValid = true;
+        g_placeRestMs = t;
+        return;
+    }
+    const float dt = static_cast<float>(t - g_placeRestMs);
+    g_placeRestMs = t;
+    if (dt <= 0.0f) return;
+    const float a = 1.0f - expf(-dt / 80.0f);
+    for (int k = 0; k < 2; ++k) {
+        Qts& r = g_placeRest[k];
+        const Qts& n = *now[k];
+        for (int i = 0; i < 3; ++i) r.p[i] += (n.p[i] - r.p[i]) * a;
+        const float d = r.q[0] * n.q[0] + r.q[1] * n.q[1] + r.q[2] * n.q[2] + r.q[3] * n.q[3];
+        const float sgn = d < 0.0f ? -1.0f : 1.0f;
+        float len2 = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            r.q[i] += (sgn * n.q[i] - r.q[i]) * a;
+            len2 += r.q[i] * r.q[i];
+        }
+        const float inv = len2 > 1e-12f ? 1.0f / sqrtf(len2) : 1.0f;
+        for (float& c : r.q) c *= inv;
+    }
+}
+
+void set_active_weapon(const char* key) {
+    if (!key) key = "";
+    if (strncmp(key, g_placeWeapon, sizeof g_placeWeapon - 1) == 0) return;
+    strncpy_s(g_placeWeapon, sizeof g_placeWeapon, key, _TRUNCATE);
+    g_placeRestValid = false; // a new gun holds differently: live until it settles
+}
+
 bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int hand) {
     // Telemetry window: opened here (the once-per-frame pass-1 path) so every
     // module's lines for one sample land together in the log.
@@ -1883,6 +1944,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             // Track through the animation AND a settle window past its last
             // big frame, so the eventual freeze holds the SETTLED pose.
             adopt = (nowMs - g_lastBigDeltaMs) < kSwaySettleMs;
+            g_refTracking = adopt;
             if (g_telemetry.load(std::memory_order_relaxed) &&
                 nowMs - g_lastSwayTlmMs >= 1000) {
                 g_lastSwayTlmMs = nowMs;
@@ -1891,6 +1953,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
                         adopt ? "TRACKING" : "frozen");
             }
         }
+        if (!g_swayKill.load(std::memory_order_relaxed)) g_refTracking = false;
         if (adopt || !g_refValid) {
             // Session 61: pin the scale rows of bones OUR scale writes own.
             // If the bank still holds exactly what we last wrote, the engine
@@ -1930,6 +1993,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         if (rt >= 30) s_lastTriggerMs = GetTickCount64();
     }
     const bool firingWindow = GetTickCount64() - s_lastTriggerMs < 1000;
+    if (hand != 1) g_placeRestValid = false; // plasmid up: the next raise re-settles
     if (g_liveValid && firingWindow) g_restCandMs = 0; // restart the hold once it ends
     if (g_liveValid && !firingWindow) {
         const uint64_t nowR = GetTickCount64();
@@ -1953,6 +2017,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             // The grip shape is taken only while the weapon hand is raised:
             // that is when the engine's left hand is the one on the gun.
             if (hand == 1) {
+                if (!g_refTracking) update_place_rest(anchor);
                 {
                     float qi[4];
                     static const float kX[3] = {1.0f, 0.0f, 0.0f};
@@ -2213,16 +2278,21 @@ bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float g
     const int w = wrist_of(hand);
     if (w >= g_boneCount || anchor >= g_boneCount) return false;
     const PalmLocal& pl = g_palm[hand];
+    // The weapon hand solves against the gun's REST relation (g_placeRest) so
+    // the gun stays rigid to the controller through its own animations.
+    const bool rest = driven && hand == 1 && g_placeRestValid;
+    const Qts& W = rest ? g_placeRest[0] : src[w];
+    const Qts& A = rest ? g_placeRest[1] : src[anchor];
     // Palm frame in component space for the pose that will actually be drawn.
     float qPalm[4], pw[3], face[3];
-    quat_mul(src[w].q, pl.q, qPalm);
-    qts_rotate(src[w].q, pl.p, pw);
-    qts_rotate(src[w].q, pl.face, face);
+    quat_mul(W.q, pl.q, qPalm);
+    qts_rotate(W.q, pl.p, pw);
+    qts_rotate(W.q, pl.face, face);
     const float s = g_scale[hand].load(std::memory_order_relaxed);
     // Relative to the anchor, scaled like the cluster, then pushed toward the
     // palm surface: the grip origin sits inside the fist, a handle's radius in.
     float rel[3];
-    for (int i = 0; i < 3; ++i) rel[i] = (src[w].p[i] + pw[i] - src[anchor].p[i]) * s + face[i] * palmDepthUu;
+    for (int i = 0; i < 3; ++i) rel[i] = (W.p[i] + pw[i] - A.p[i]) * s + face[i] * palmDepthUu;
     // Drive frame: q = qGrip * qPalm^-1, anchor = gripLoc - q * rel.
     float pinv[4], rr[3];
     quat_conj(qPalm, pinv);

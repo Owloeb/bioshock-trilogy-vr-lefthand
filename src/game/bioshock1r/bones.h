@@ -63,6 +63,10 @@ void set_off_follow(bool on);
 // the rig has a reference pose.
 bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float gripQ[4],
                     float palmDepthUu, float outLoc[3], float outQ[4]);
+// The weapon now in hand (class key). A change drops the weapon hand's rest
+// relation, so the new gun is placed live until it settles. Game thread,
+// before grip_to_anchor for the driven weapon hand.
+void set_active_weapon(const char* key);
 // World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
 bool written_world(int idx, float out[3]);
 // The gun's barrel direction in the drive target's frame: its idle forward,

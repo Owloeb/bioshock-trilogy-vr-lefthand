@@ -2001,6 +2001,7 @@ void on_calcview(const FrameContext& ctx) {
         // culling, correct engine-side FX anchoring) and the hand CLUSTER
         // moves to the controller instead.
         gp.loc = {loc[0], loc[1], loc[2]};
+        if (hand == 1) bones::set_active_weapon(aim::active_weapon_key());
         to_anchor(ctx, hand, true, gp); // grip placement: palm on your palm
         const GamePose gpPreKick = gp;  // the barrel the bullets follow (no recoil)
         ability_haptics(hand);
