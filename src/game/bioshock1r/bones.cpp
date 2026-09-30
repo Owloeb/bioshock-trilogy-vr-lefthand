@@ -159,6 +159,12 @@ bool g_followBaseValid = false;
 // is drawn from the REST shape - a closed grip on the gun - and only moved by
 // the engine's wrist motion, so an animation that relaxes the engine's
 // fingers (or a sway-kill reference caught mid-stroke) cannot open the palm.
+// The gun's barrel in the attach bone's (43) own frame: the game authors every
+// weapon's idle pose pointing straight down the view (component +X), so at rest
+// conj(q43) * X is the barrel - unlike 43->44, which runs from the grip (below
+// the barrel) up to the tip and tilts every shot upward.
+float g_barrelLocal[3] = {1, 0, 0};
+bool g_barrelLocalValid = false;
 Qts g_liveL[kMaxBones];
 Qts g_gripShape[kMaxBones];
 bool g_gripShapeValid = false;
@@ -913,6 +919,7 @@ void on_world_change() {
     g_offTrack = false;
     g_palm[0].valid = g_palm[1].valid = false;
     g_lastActorValid = false;
+    g_barrelLocalValid = false;
     if (g_skelInst) BVR_LOG("[bones] world changed - skeleton cache cleared");
     g_skelInst = nullptr;
     g_bones = nullptr;
@@ -1160,6 +1167,7 @@ std::atomic<float> g_armLength{1.0f}; // bone-length multiplier (reach vs Jack's
 bool g_armTargetValid[2] = {false, false};
 float g_armShoulderW[2][3] = {};
 float g_armPoleW[2][3] = {};
+float g_armOutW[2][3] = {}; // the arm's outward side: the elbow never points past the body line
 std::atomic<uint32_t> g_armSolves{0}, g_armStretched{0};
 
 void v_sub(const float a[3], const float b[3], float o[3]) {
@@ -1305,6 +1313,8 @@ bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actor
         qts_rotate(qaInv, dW, S);
         qts_rotate(qaInv, g_armPoleW[hand], P);
     }
+    float O[3];
+    qts_rotate(qaInv, g_armOutW[hand], O);
     const float sc = g_scale[hand].load(std::memory_order_relaxed);
     const float* U0 = g_ref[upa].p;
     const float* E0 = g_ref[elb].p;
@@ -1324,7 +1334,10 @@ bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actor
     float d = v_len(sw);
     if (d < 1e-3f) return false;
     float n[3] = {sw[0] / d, sw[1] / d, sw[2] / d};
-    const float maxR = (a + b) * 0.995f, minR = fabsf(a - b) * 1.05f + 0.5f;
+    // A hand pulled right in (a stock at the shoulder) must not fold the arm
+    // flat: below 40% of full reach the shoulder gives instead.
+    const float maxR = (a + b) * 0.995f;
+    const float minR = fmaxf(fabsf(a - b) * 1.05f + 0.5f, (a + b) * 0.40f);
     if (d > maxR || d < minR) {
         const float dd = d > maxR ? maxR : minR;
         for (int i = 0; i < 3; ++i) S[i] = Wt[i] - n[i] * dd;
@@ -1337,6 +1350,20 @@ bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actor
     float pp[3];
     const float pd = v_dot(P, n);
     for (int i = 0; i < 3; ++i) pp[i] = P[i] - pd * n[i];
+    // Crossing the hand toward the body tilts the projected pole INWARD (the
+    // outward part of the pole is mostly removed by the projection and the
+    // remainder picks up the hand's medial direction): never let the elbow
+    // point inside the arm's own side.
+    {
+        float op[3];
+        const float od = v_dot(O, n);
+        for (int i = 0; i < 3; ++i) op[i] = O[i] - od * n[i];
+        if (v_norm(op)) {
+            const float inward = v_dot(pp, op);
+            if (inward < 0.0f)
+                for (int i = 0; i < 3; ++i) pp[i] -= inward * op[i];
+        }
+    }
     if (!v_norm(pp)) return false;
     float E[3];
     for (int i = 0; i < 3; ++i) E[i] = S[i] + n[i] * a * cosA + pp[i] * a * sinA;
@@ -1926,6 +1953,13 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             // The grip shape is taken only while the weapon hand is raised:
             // that is when the engine's left hand is the one on the gun.
             if (hand == 1) {
+                {
+                    float qi[4];
+                    static const float kX[3] = {1.0f, 0.0f, 0.0f};
+                    quat_conj(g_ref[patterns::kBoneWeaponAttach].q, qi);
+                    qts_rotate(qi, kX, g_barrelLocal);
+                    g_barrelLocalValid = true;
+                }
                 int lf = 0, ll = 0, la = 0;
                 cluster_of(0, &lf, &ll, &la);
                 for (int i = lf; i <= ll && i < g_boneCount; ++i)
@@ -2149,12 +2183,14 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     return true;
 }
 
-void set_arm_target(int hand, bool valid, const float shoulderW[3], const float poleW[3]) {
+void set_arm_target(int hand, bool valid, const float shoulderW[3], const float poleW[3],
+                    const float outW[3]) {
     if (hand != 0 && hand != 1) return;
-    g_armTargetValid[hand] = valid && shoulderW && poleW;
+    g_armTargetValid[hand] = valid && shoulderW && poleW && outW;
     if (!g_armTargetValid[hand]) return;
     memcpy(g_armShoulderW[hand], shoulderW, 12);
     memcpy(g_armPoleW[hand], poleW, 12);
+    memcpy(g_armOutW[hand], outW, 12);
 }
 void set_arms(bool on) { g_armsOn.store(on, std::memory_order_relaxed); }
 void set_arm_length(float m) { g_armLength.store(m, std::memory_order_relaxed); }
@@ -2193,6 +2229,32 @@ bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float g
     quat_mul(gripQ, pinv, outQ);
     qts_rotate(outQ, rel, rr);
     for (int i = 0; i < 3; ++i) outLoc[i] = gripLoc[i] - rr[i];
+    return true;
+}
+
+bool barrel_dir_target(float out[3]) {
+    if (!g_refValid || g_boneCount <= patterns::kBoneWeaponAttach) return false;
+    if (!g_barrelLocalValid) return barrel_ref_axis(out);
+    // Carried by the attach bone's CURRENT reference rotation, so the barrel
+    // follows the gun through its own animations (a pump rocks it back).
+    qts_rotate(g_ref[patterns::kBoneWeaponAttach].q, g_barrelLocal, out);
+    return true;
+}
+
+bool palm_in_target(int hand, bool driven, float palmDepthUu, float out[3]) {
+    if (hand != 0 && hand != 1) return false;
+    if (!g_palm[hand].valid && !compute_palm_local(hand)) return false;
+    int first = 0, last = 0, anchor = 0;
+    cluster_of(hand, &first, &last, &anchor);
+    const Qts* src = draw_source(hand, driven);
+    const int w = wrist_of(hand);
+    const PalmLocal& pl = g_palm[hand];
+    float pw[3], face[3];
+    qts_rotate(src[w].q, pl.p, pw);
+    qts_rotate(src[w].q, pl.face, face);
+    const float s = g_scale[hand].load(std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i)
+        out[i] = (src[w].p[i] + pw[i] - src[anchor].p[i]) * s + face[i] * palmDepthUu;
     return true;
 }
 

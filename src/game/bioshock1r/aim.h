@@ -89,6 +89,9 @@ uint32_t player_shot_count();
 // valid=false clears it. Game thread, once per frame from hands.cpp.
 void set_barrel(bool valid, const float origin[3], const float dir[3], const float laserOrigin[3],
                 const float laserDir[3]);
+// Plasmid cast origin: Jack's palm (game space) and its offset from the plasmid
+// hand's grip pose (XR, for the laser; may be null). valid=false clears it.
+void set_palm(bool valid, const float point[3], const float laserOrigin[3]);
 // Player ability fires (plasmid casts AND wrench swings - both use the
 // ability fire seam), same debounce. For haptics.
 uint32_t player_ability_count();

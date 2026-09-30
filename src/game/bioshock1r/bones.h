@@ -65,13 +65,21 @@ bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float g
                     float palmDepthUu, float outLoc[3], float outQ[4]);
 // World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
 bool written_world(int idx, float out[3]);
+// The gun's barrel direction in the drive target's frame: its idle forward,
+// learned at rest in the attach bone's frame and carried through animations.
+// Falls back to 43->44 before the first rest.
+bool barrel_dir_target(float out[3]);
+// Jack's palm centroid relative to the anchor, in the drive target's frame,
+// for the pose `hand` is drawn with (same solve as grip_to_anchor).
+bool palm_in_target(int hand, bool driven, float palmDepthUu, float out[3]);
 
 // Arms (two-bone IK, experimental): instead of collapsing a visible hand's
 // sleeve, pose clavicle / upper arm / elbow / twist helpers from a shoulder
 // point to the written wrist. Targets are in ENGINE world space (already
 // mirrored when the viewmodel mirror is on) and persist until changed; pole =
 // the direction the elbow bends toward. Game thread, before drive().
-void set_arm_target(int hand, bool valid, const float shoulderW[3], const float poleW[3]);
+void set_arm_target(int hand, bool valid, const float shoulderW[3], const float poleW[3],
+                    const float outW[3]);
 void set_arms(bool on);
 void set_arm_length(float mult); // 1.0 = Jack's own arm (reference pose)
 float arm_length();

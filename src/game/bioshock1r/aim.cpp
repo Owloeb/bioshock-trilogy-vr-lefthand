@@ -1355,6 +1355,24 @@ void set_barrel(bool valid, const float origin[3], const float dir[3], const flo
 
 bool barrel_fresh() { return g_barrelValid && GetTickCount64() - g_barrelMs < 150; }
 
+// Plasmid cast origin (hands.cpp publish_palm): Jack's palm, as seen.
+bool g_palmValid = false;
+uint64_t g_palmMs = 0;
+float g_palmP[3] = {};
+bool g_palmLaser = false;
+float g_palmLO[3] = {};
+
+void set_palm(bool valid, const float point[3], const float laserOrigin[3]) {
+    g_palmValid = valid && point;
+    if (!g_palmValid) return;
+    memcpy(g_palmP, point, 12);
+    g_palmLaser = laserOrigin != nullptr;
+    if (g_palmLaser) memcpy(g_palmLO, laserOrigin, 12);
+    g_palmMs = GetTickCount64();
+}
+
+bool palm_fresh() { return g_palmValid && GetTickCount64() - g_palmMs < 150; }
+
 void on_calcview(const FrameContext& ctx) {
     uint64_t now = GetTickCount64();
     g_rayStampMs = now;
@@ -1481,6 +1499,9 @@ void on_calcview(const FrameContext& ctx) {
         }
 
         apply_origin_offset(i, out, ctx.worldScale);
+        // Plasmid casts leave Jack's palm (the hand sits on your real palm);
+        // the direction stays the calibrated pointing ray.
+        if (i == 0 && palm_fresh()) out.origin = {g_palmP[0], g_palmP[1], g_palmP[2]};
         out.valid = true;
     }
 
@@ -1570,6 +1591,27 @@ void on_calcview(const FrameContext& ctx) {
             lc.modelPitchTrimDeg = hands::model_trim_pitch_deg(1);
             lc.modelYawTrimDeg = hands::model_trim_yaw_deg(1) * mirror_side();
             lc.modelRollTrimDeg = hands::model_trim_roll_deg(1) * mirror_side();
+        }
+    }
+    if (lc.hand == 0 && palm_fresh() && g_palmLaser && g_ray[0].valid) {
+        bvr::vr::HeadPose gp0{};
+        if (bvr::vr::get_hand_pose(0, false, gp0)) {
+            float dir[3], xa[3], xb[3];
+            ue_rot_to_dir(g_ray[0].rot, dir);
+            const float k = ctx.worldScale * 0.5f;
+            game_point_to_xr(ctx, g_ray[0].origin, xa);
+            game_point_to_xr(ctx,
+                             FVector{g_ray[0].origin.x + dir[0] * k, g_ray[0].origin.y + dir[1] * k,
+                                     g_ray[0].origin.z + dir[2] * k},
+                             xb);
+            float xd[3] = {xb[0] - xa[0], xb[1] - xa[1], xb[2] - xa[2]};
+            const float xl = sqrtf(xd[0] * xd[0] + xd[1] * xd[1] + xd[2] * xd[2]);
+            if (xl > 1e-5f) {
+                for (float& c : xd) c /= xl;
+                lc.gripLocal = true;
+                memcpy(lc.gripOrigin, g_palmLO, 12);
+                quat_rotate(-gp0.qx, -gp0.qy, -gp0.qz, gp0.qw, xd, lc.gripDir);
+            }
         }
     }
     if (lc.hand == 1 && barrel_fresh() && g_barrelLaser) {

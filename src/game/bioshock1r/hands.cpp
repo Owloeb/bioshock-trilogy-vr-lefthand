@@ -1064,14 +1064,14 @@ void publish_arm_targets(const FrameContext& ctx, bool mirrorPose, bool gunPlane
     if (g_armsSave.exchange(false)) arms_save();
     bones::set_arms(g_armsOn.load(std::memory_order_relaxed));
     if (!g_armsOn.load(std::memory_order_relaxed)) {
-        bones::set_arm_target(0, false, nullptr, nullptr);
-        bones::set_arm_target(1, false, nullptr, nullptr);
+        bones::set_arm_target(0, false, nullptr, nullptr, nullptr);
+        bones::set_arm_target(1, false, nullptr, nullptr, nullptr);
         return;
     }
     bvr::vr::HeadPose head{};
     if (!ctx.vrDriving || !bvr::vr::peek_head_pose(head)) {
-        bones::set_arm_target(0, false, nullptr, nullptr);
-        bones::set_arm_target(1, false, nullptr, nullptr);
+        bones::set_arm_target(0, false, nullptr, nullptr, nullptr);
+        bones::set_arm_target(1, false, nullptr, nullptr, nullptr);
         return;
     }
     const float hp[3] = {head.px, head.py, head.pz};
@@ -1108,10 +1108,11 @@ void publish_arm_targets(const FrameContext& ctx, bool mirrorPose, bool gunPlane
         // cluster keeps its own side; unmirrored, it follows its controller.
         float sgn = c == 1 ? 1.0f : -1.0f;
         if (!mirrorPose && lh) sgn = -sgn;
-        float S[3], P[3];
+        float S[3], P[3], O[3];
         for (int i = 0; i < 3; ++i) {
             S[i] = (&hw.loc.x)[i] - u[i] * down + r[i] * side * sgn - f[i] * back;
             P[i] = -u[i] + r[i] * out * sgn - f[i] * 0.3f;
+            O[i] = r[i] * sgn; // this arm's outward side
         }
         if (gunPlane) {
             reflect_point(S, g_hdH, g_hdN);
@@ -1119,8 +1120,10 @@ void publish_arm_targets(const FrameContext& ctx, bool mirrorPose, bool gunPlane
             float t[3];
             reflect_vec(P, g_hdN, t);
             reflect_vec(t, g_eyePlaneN, P);
+            reflect_vec(O, g_hdN, t);
+            reflect_vec(t, g_eyePlaneN, O);
         }
-        bones::set_arm_target(c, true, S, P);
+        bones::set_arm_target(c, true, S, P, O);
     }
 }
 
@@ -1158,7 +1161,7 @@ bool to_anchor(const FrameContext& ctx, int hand, bool driven, GamePose& gp) {
 void publish_barrel(const FrameContext& ctx, const GamePose& gpV, bool mirrorPose,
                     const GamePose& headW) {
     float d0[3], m0[3];
-    if (!bones::barrel_ref_axis(d0) || !bones::muzzle_ref_offset(m0)) {
+    if (!bones::barrel_dir_target(d0) || !bones::muzzle_ref_offset(m0)) {
         aim::set_barrel(false, nullptr, nullptr, nullptr, nullptr);
         return;
     }
@@ -1205,6 +1208,41 @@ void publish_barrel(const FrameContext& ctx, const GamePose& gpV, bool mirrorPos
         }
     }
     aim::set_barrel(true, o, d, laserOk ? lo : nullptr, laserOk ? ldir : nullptr);
+}
+
+// Plasmid casts: with the hand on your real palm, the cast has to leave JACK'S
+// palm, not the controller's pointing-ray origin a few centimetres away. The
+// palm point (rig space -> as SEEN when mirroring) and its offset from the
+// plasmid hand's grip pose (XR, for the laser) go to aim.cpp; the direction
+// stays the calibrated pointing ray.
+void publish_palm(const FrameContext& ctx, const GamePose& gpV, bool mirrorPose,
+                  const GamePose& headW) {
+    float rel[3];
+    const float depth = g_palmDepthCm.load(std::memory_order_relaxed) * ctx.worldScale / 100.0f;
+    if (!bones::palm_in_target(0, true, depth, rel)) {
+        aim::set_palm(false, nullptr, nullptr);
+        return;
+    }
+    float f[3], r[3], u[3], p[3];
+    ue_rot_basis(gpV.rot, f, r, u);
+    for (int i = 0; i < 3; ++i) p[i] = (&gpV.loc.x)[i] + f[i] * rel[0] + r[i] * rel[1] + u[i] * rel[2];
+    if (mirrorPose) {
+        float hf[3], hr[3], hu[3];
+        ue_rot_basis(headW.rot, hf, hr, hu);
+        const float H[3] = {headW.loc.x, headW.loc.y, headW.loc.z};
+        reflect_point(p, H, hr);
+    }
+    float lo[3] = {0, 0, 0};
+    bool laserOk = false;
+    bvr::vr::HeadPose hp{};
+    if (bvr::vr::get_hand_pose(0, false, hp)) {
+        float xo[3];
+        game_point_to_xr(ctx, FVector{p[0], p[1], p[2]}, xo);
+        const float d[3] = {xo[0] - hp.px, xo[1] - hp.py, xo[2] - hp.pz};
+        quat_rotate(-hp.qx, -hp.qy, -hp.qz, hp.qw, d, lo);
+        laserOk = true;
+    }
+    aim::set_palm(true, p, laserOk ? lo : nullptr);
 }
 
 // Always-visible off hand: the OTHER role's controller through the same chain
@@ -2036,6 +2074,10 @@ void on_calcview(const FrameContext& ctx) {
             publish_barrel(ctx, gpPreKick, mirrorPose, headW);
         else
             aim::set_barrel(false, nullptr, nullptr, nullptr, nullptr);
+        if (hand == 0 && g_gripPlace.load(std::memory_order_relaxed))
+            publish_palm(ctx, gpPreKick, mirrorPose, headW);
+        else
+            aim::set_palm(false, nullptr, nullptr);
         // Route B: the inputs the pose-writer hook re-applies next engine write.
         g_postCtx = ctx;
         g_postTarget = target;
