@@ -1,4 +1,226 @@
-# bioshock-vr
+# bioshock-vr, left-handed edition
+
+A fork of [VR-Stereo-Hub/bioshock-trilogy-vr](https://github.com/VR-Stereo-Hub/bioshock-trilogy-vr)
+that makes BioShock Remastered play properly left-handed in VR, and adds the two-handed,
+physical feel that VR shooters need.
+
+- **Weapon in your left hand, plasmids in your right**, with a mirrored viewmodel so you see a
+  real left hand holding the gun.
+- **Both hands always visible.** Your off hand follows its controller instead of vanishing.
+- **Two-handed grips** on any weapon. Hold the shotgun's pump or the Tommy gun's foregrip with
+  your real hand, and the gun aims along both hands.
+- **Recoil and haptics** on every weapon, wrench hits and plasmid casts.
+- **Plasmid aim calibration** for your hand, plus an aim dot for plasmids.
+- **Solid HUD bars.** The health and EVE fills no longer show the world through them.
+
+Everything is **off by default**: right-handed players get the upstream mod unchanged. Left-handed
+mode and its saved settings work in all three games; everything else is **BioShock 1 only** for
+now.
+
+> The full upstream README, covering install, runtimes, troubleshooting and controls, is kept
+> below this section. Read it first if you're new to the mod.
+
+---
+
+## Getting it running
+
+There's no release zip for the fork, so build from source (the upstream "Build from source"
+section below covers the Visual Studio 2022 Build Tools prerequisite). In PowerShell, from the
+repo folder:
+
+```powershell
+git clone https://github.com/Owloeb/bioshock-trilogy-vr-lefthand.git
+cd bioshock-trilogy-vr-lefthand
+Set-ExecutionPolicy -Scope Process Bypass
+.\tools\build.ps1 -Release
+.\tools\install.ps1 -Release -GamePath "C:\Program Files (x86)\Steam\steamapps\common\BioShock Remastered\Build\Final"
+```
+
+Pass `-GamePath` explicitly. The script's default path belongs to the upstream developer's
+machine.
+
+### First run checklist
+
+1. Press **F10** in game. Under the input section, tick **Left-handed**, and optionally
+   **Swap sticks** (move on the right stick, turn on the left).
+2. Tick **Mirror hands + weapon** to get a real left hand on the gun.
+3. Raise any plasmid (not Telekinesis) and hold it still for a moment. That teaches the mod a
+   relaxed off-hand pose.
+4. In **Decoupled aim**, press **Calibrate plasmid aim**, point at the dot, and squeeze your
+   plasmid-hand grip.
+5. For each gun you want to hold with two hands: open **Off hand + two-handed grip**, press
+   **Set grab point**, hold the gun, put your off hand where the grip belongs, and squeeze.
+
+All of these save themselves. You do this once, not every launch.
+
+---
+
+## What changed, and how it works
+
+### 1. Left-handed mode (all three games)
+
+**What you get:** the weapon trigger, grip, aim and viewmodel move to the left controller;
+plasmids move to the right. The optional stick swap moves locomotion to the right stick.
+
+**How it works:** the mod swaps controller *roles*, not bindings. The physical left controller
+fills the "weapon" role and the right fills "plasmid". Every system that reads a role (aim ray,
+laser, viewmodel, swing-to-attack, per-hand tuning) follows automatically. Face buttons and the
+menu button stay physical, so every controller profile keeps working.
+
+**Saved in:** `handedness.ini`. It saves on every change and loads at startup, and no VR preset
+can override it.
+
+### 2. Mirrored viewmodel (BioShock 1, experimental)
+
+**What you get:** without the mirror, left-handed mode still shows a *right* hand holding the
+gun. With it on, you see a real left hand on the weapon and a right plasmid hand, and muzzle
+flashes, smoke, steam, tracers and plasmid effects come from where you see them.
+
+**How it works:** the game only has a right-handed rig, so the mod mirrors the finished image
+rather than the skeleton:
+
+- **Render mirror.** Viewmodel draw calls are recognised by where they're called from in the
+  engine, then reflected about a plane through the gun, with triangle winding flipped. Each
+  eye's plane comes from that eye's final camera, so the gun stays solid while you move.
+- **Engine rig placement.** The engine's gun is placed at the mirror image of what you should
+  see. The engine's muzzle and the visible muzzle are then the same point, so flashes and
+  tracers leave the barrel you're looking at.
+- **Effects.** Plasmid effects follow your real hand, and effects attached to the gun (smoke,
+  steam, flash) are flipped with it.
+- **Aim.** Sideways aim calibration is mirrored too, so the pistol and crossbow fire where
+  they point.
+
+**What to expect:** most guns line up out of the box. If a gun's flash sits a little off the
+barrel, adjust **Muzzle trim for this weapon** in F10. It's saved per weapon in `mirror.ini`.
+
+### 3. Always-visible off hand (BioShock 1)
+
+**What you get:** the hand you're not using follows its controller all the time. A free off
+hand is relaxed and open. While a plasmid is raised, your empty weapon hand shows and the
+holstered gun stays hidden.
+
+**How it works:** upstream hides the unused hand. This fork places it at its own controller
+every frame with the same rigid bone move as the active hand. The relaxed pose is captured
+from the game's own plasmid-hand idle and saved in `offhand_neutral.ini`.
+
+### 4. Two-handed grip (BioShock 1)
+
+**What you get:** once a gun has a grab point, bringing your off hand near it buzzes that
+controller. Squeeze the grip to take hold:
+
+- the gun aims along the line from your back hand to your front hand;
+- your off hand stays on the grip, exactly where you placed it;
+- the hand rides the gun's animations, such as the shotgun pump and the chemical thrower
+  lever, and keeps a closed grip while it does;
+- let go of the grip, or slide your hand more than 35 cm along the gun, to release.
+
+**How it works:** grab points are recorded relative to the weapon controller, per weapon and
+per hand setup, in `twohand.ini`. The two-handed pose is applied where the mod first reads the
+controllers, so the viewmodel, bullets, laser, mirror and swing detection all agree without
+extra code. Inside the grab zone, your off-hand grip is kept from sending its usual "raise
+plasmid" input, so reaching for the fore-end never switches you to plasmids.
+
+**Settings:** grab radius (12 cm), slide-off distance (35 cm), and the buzz on/off. Guns
+without a grab point stay one-handed, deliberately.
+
+### 5. Recoil and haptics (BioShock 1)
+
+**What you get:**
+
+| Weapon | Kick | Buzz |
+|---|---|---|
+| Shotgun | big kick up and back, slow return | heavy |
+| Tommy gun | small per round, climbs a little in a burst | light, per round |
+| Pistol | quick snap | sharp |
+| Grenade launcher | heavy, slow return | thump |
+| Crossbow | light | twang |
+| Chemical thrower | a shimmer while spraying | light rumble |
+| Research camera | none | shutter click |
+
+A wrench hit thumps the weapon hand and a plasmid cast buzzes the plasmid hand. With two
+hands on the gun, the kick is about half as strong and both hands move with it.
+
+**How it works:** a shot counter at the engine's fire point drives a spring on the *drawn* gun
+only. The bullets still go where the controller points, so **recoil never costs accuracy**.
+There's one on/off switch and a strength slider in F10 ("Hands + weapon").
+
+### 6. Plasmid aim (BioShock 1)
+
+**What you get:** a one-press calibration for your plasmid hand, and an aim dot that shows
+where a plasmid will go.
+
+**Why it matters:** upstream ships a plasmid aim correction of 37° sideways and 11° down. That
+is one player's left-wrist posture, and on anyone else's hand, especially a right hand, it
+throws casts well off target. **Calibrate plasmid aim** replaces it with yours. It's saved per
+hand setup in `aim_plasmid.ini`, and **Reset** restores the shipped value. In mirror mode the
+sideways aim sliders now show values as you see them, so dragging right always moves the shot
+right.
+
+### 7. Solid HUD bars (all games using the HUD panel)
+
+**What you get:** the health and EVE bar fills render solid on the VR HUD panel instead of
+glowing and see-through.
+
+**How it works:** the HUD is drawn to its own layer, and the mod rebuilds each pixel's opacity
+before showing it. Upstream's rule could leave a bright red fill about 10% opaque. This fork
+makes every coloured pixel at least as opaque as its brightest colour channel. There's an F10
+toggle to compare with the old behaviour.
+
+### 8. Developer tools
+
+The investigation tooling (draw census, one-frame draw trace, hardware-watchpoint bone probe,
+effects probe and mirror internals) is kept but hidden. Tick **Developer tools** at the top of
+F10 to show it.
+
+---
+
+## Settings files
+
+All live in `%LOCALAPPDATA%\BioshockVR\`, next to the upstream files. Delete any one to reset
+that feature.
+
+| File | Holds |
+|---|---|
+| `handedness.ini` | left-handed, stick swap, mirror |
+| `twohand.ini` | off-hand and grip settings, grab points per weapon |
+| `mirror.ini` | per-weapon muzzle trims (mirror mode) |
+| `aim_plasmid.ini` | plasmid aim calibration, plasmid aim dot |
+| `offhand_neutral.ini` | the relaxed off-hand pose |
+| `overlay.ini` | F10 text size, Developer tools |
+
+## Known limits
+
+- **Telekinesis is aimed by your head.** It skips the aiming code the mod hooks for every other
+  weapon and plasmid, so it can't be pointed with your hand yet.
+- **The pump and lever follow copies the game's own hand animation.** Where the game moves a
+  part of the gun without moving its hand, the held hand won't follow that part.
+- **Mirror mode can need a per-gun muzzle trim** where a gun's flash isn't attached to the
+  barrel.
+- **Tested by one player on one setup.** Controller profiles other than Quest Touch get the
+  same bindings (haptics included), but haven't been tried on hardware.
+
+## Branches
+
+| Branch | What it is |
+|---|---|
+| `lefthand` (default) | everything, plus this README |
+| `pr/left-handed` | left-handed mode only, proposed upstream |
+| `pr/mirror-viewmodel` | adds the mirrored viewmodel |
+| `pr/hands-haptics` | adds the off hand, grips, recoil and haptics, plasmid aim and HUD bars |
+
+## Credits
+
+- **[VR-Stereo-Hub/bioshock-trilogy-vr](https://github.com/VR-Stereo-Hub/bioshock-trilogy-vr)**,
+  the mod this is built on. All the hard parts (stereo, head tracking, the bone drive, the aim
+  hooks) are theirs.
+- **BioVRDev's BioVR**, whose design the always-visible off hand and two-handed grip are
+  modelled on: the grab and release distances, the grab-zone buzz, and aiming along both hands.
+- Built by Owen with Claude (Anthropic).
+
+---
+---
+
+# The upstream mod: bioshock-vr
 
 A native VR mod for **BioShock Remastered**, **BioShock 2 Remastered** and **BioShock
 Infinite** (PC, Steam): stereoscopic rendering, 6DOF head tracking, and motion controllers -
