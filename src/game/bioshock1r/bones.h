@@ -72,7 +72,9 @@ bool written_world(int idx, float out[3]);
 // The gun's barrel direction in the drive target's frame: its idle forward,
 // learned at rest in the attach bone's frame and carried through animations.
 // Falls back to 43->44 before the first rest.
-bool barrel_dir_target(float out[3]);
+// yaw/pitch (deg, right+/up+, un-mirrored rig frame) = that weapon's own barrel
+// angle in its idle pose.
+bool barrel_dir_target(float yawDeg, float pitchDeg, float out[3]);
 // Jack's palm centroid relative to the anchor, in the drive target's frame,
 // for the pose `hand` is drawn with (same solve as grip_to_anchor).
 bool palm_in_target(int hand, bool driven, float palmDepthUu, float out[3]);
@@ -91,6 +93,9 @@ bool arms();
 void set_arm_scale_skin(bool on); // scale the arm skin like the hands (default on)
 bool arm_scale_skin();
 void arm_stats(unsigned* solves, unsigned* stretched);
+// The wrist's roll about the forearm the helpers carry, after the elbow lift
+// (deg; readout).
+float arm_twist_deg(int hand);
 // Draw the off hand in its grip shape without following (grab-point recording,
 // grab-zone preview). Game thread, before drive().
 void set_off_preview(bool on);

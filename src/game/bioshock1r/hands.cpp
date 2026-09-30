@@ -48,6 +48,7 @@
 #include <cstring>
 #include <cwctype>
 #include <map>
+#include <mutex>
 #include <string>
 
 namespace bvr::b1r::hands {
@@ -1153,6 +1154,66 @@ bool to_anchor(const FrameContext& ctx, int hand, bool driven, GamePose& gp) {
     return true;
 }
 
+// ---- Per-weapon barrel angle (barrel.ini, keyed by weapon class name) ----
+// "Bullets follow the barrel" takes each gun's idle forward as its barrel. Most
+// models are authored straight down the view; a few are toed in toward the
+// crosshair. The defaults are those models' angles from the shipped aim
+// profile (the pistol's and crossbow's sideways trims - the other guns ship
+// at ~0). Stored in the rig's own un-mirrored frame, so one value serves both
+// hands; the F10 sliders show it as you see it.
+struct BarrelAngle {
+    float yaw = 0.0f, pitch = 0.0f;
+};
+std::mutex g_barrelMx;
+std::map<std::string, BarrelAngle> g_barrelAngle; // user-set entries only
+std::string g_barrelKey;                          // the weapon in hand
+bool g_barrelLoaded = false;
+
+BarrelAngle barrel_default(const std::string& key) {
+    if (key == "Pistol") return {-4.20f, 0.0f};
+    if (key == "Crossbow") return {-6.65f, 0.0f};
+    return {};
+}
+
+void barrel_ini_path(wchar_t* out, size_t count) {
+    swprintf_s(out, count, L"%s\\barrel.ini", bvr::log::data_dir());
+}
+
+void load_barrel_angles() { // caller holds g_barrelMx
+    g_barrelLoaded = true;
+    wchar_t path[MAX_PATH];
+    barrel_ini_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    char line[160];
+    while (fgets(line, sizeof line, f)) {
+        char key[64] = {};
+        BarrelAngle a;
+        if (line[0] != '#' && sscanf_s(line, "%63[^=]=%f,%f", key, static_cast<unsigned>(sizeof key),
+                                       &a.yaw, &a.pitch) == 3)
+            g_barrelAngle[key] = a;
+    }
+    fclose(f);
+}
+
+void save_barrel_angles() { // caller holds g_barrelMx
+    wchar_t path[MAX_PATH];
+    barrel_ini_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "# BioShock VR - each weapon's barrel angle in its idle pose, for\n");
+    fprintf(f, "# \"Bullets follow the gun barrel\". <WeaponClassName>=<yaw>,<pitch> (deg,\n");
+    fprintf(f, "# right+/up+, right-handed rig frame). Delete a line for the default.\n");
+    for (const auto& [k, v] : g_barrelAngle) fprintf(f, "%s=%.2f,%.2f\n", k.c_str(), v.yaw, v.pitch);
+    fclose(f);
+}
+
+BarrelAngle barrel_angle_for(const std::string& key) { // caller holds g_barrelMx
+    if (!g_barrelLoaded) load_barrel_angles();
+    auto it = g_barrelAngle.find(key);
+    return it != g_barrelAngle.end() ? it->second : barrel_default(key);
+}
+
 // Barrel aim: the gun's rendered barrel (hand-rig bones 43 -> 44), taken from
 // the weapon hand's drive target BEFORE the recoil kick (recoil stays visual)
 // and in the rig's own space, then mirrored about the head when the viewmodel
@@ -1161,7 +1222,13 @@ bool to_anchor(const FrameContext& ctx, int hand, bool driven, GamePose& gp) {
 void publish_barrel(const FrameContext& ctx, const GamePose& gpV, bool mirrorPose,
                     const GamePose& headW) {
     float d0[3], m0[3];
-    if (!bones::barrel_dir_target(d0) || !bones::muzzle_ref_offset(m0)) {
+    BarrelAngle ba;
+    {
+        std::lock_guard<std::mutex> lk(g_barrelMx);
+        g_barrelKey = aim::active_weapon_key();
+        ba = barrel_angle_for(g_barrelKey);
+    }
+    if (!bones::barrel_dir_target(ba.yaw, ba.pitch, d0) || !bones::muzzle_ref_offset(m0)) {
         aim::set_barrel(false, nullptr, nullptr, nullptr, nullptr);
         return;
     }
@@ -2353,6 +2420,31 @@ void draw_debug_ui() {
             g_barrelAim.store(ba);
             save_config();
         }
+        if (ba) {
+            // As SEEN: in the mirrored view the rig's right is your left.
+            const bool seenFlip =
+                bvr::input::left_handed() && bvr::input::mirror_viewmodel();
+            std::lock_guard<std::mutex> lk(g_barrelMx);
+            if (!g_barrelKey.empty()) {
+                BarrelAngle a = barrel_angle_for(g_barrelKey);
+                float yawSeen = seenFlip ? -a.yaw : a.yaw;
+                ImGui::TextDisabled("Barrel angle for %s (moves the laser and the shots):",
+                                    g_barrelKey.c_str());
+                bool changed = ImGui::SliderFloat("barrel left/right (deg)", &yawSeen, -12.0f, 12.0f, "%.2f");
+                bool done = ImGui::IsItemDeactivatedAfterEdit();
+                changed |= ImGui::SliderFloat("barrel down/up (deg)", &a.pitch, -8.0f, 8.0f, "%.2f");
+                done |= ImGui::IsItemDeactivatedAfterEdit();
+                if (changed) {
+                    a.yaw = seenFlip ? -yawSeen : yawSeen;
+                    g_barrelAngle[g_barrelKey] = a;
+                }
+                if (ImGui::Button("Default for this weapon")) {
+                    g_barrelAngle.erase(g_barrelKey);
+                    done = true;
+                }
+                if (done) save_barrel_angles();
+            }
+        }
         ImGui::TextDisabled("The offset/trim sliders below now fine-tune from your palm.");
     }
 
@@ -2489,6 +2581,8 @@ void draw_arms_ui() {
     ImGui::Text("arms posed/s %u | at full reach/s %u", s_rs, s_rt);
     ImGui::TextDisabled("Lots of 'full reach'? Raise the arm length or lower the shoulders.");
     if (bvr::overlay::dev_tools()) {
+        ImGui::Text("forearm roll L %.0f | R %.0f deg (elbow lifts past 80)",
+                    bones::arm_twist_deg(0), bones::arm_twist_deg(1));
         bool sk = bones::arm_scale_skin();
         if (ImGui::Checkbox("Scale the arm skin like the hands", &sk)) {
             bones::set_arm_scale_skin(sk);

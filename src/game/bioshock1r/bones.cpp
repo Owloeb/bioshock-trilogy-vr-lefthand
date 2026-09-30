@@ -164,6 +164,8 @@ bool g_followBaseValid = false;
 // conj(q43) * X is the barrel - unlike 43->44, which runs from the grip (below
 // the barrel) up to the tip and tilts every shot upward.
 float g_barrelLocal[3] = {1, 0, 0};
+float g_barrelRightLocal[3] = {0, 1, 0}; // the gun's right and up at rest, same frame:
+float g_barrelUpLocal[3] = {0, 0, 1};    // a per-weapon barrel trim turns about these
 bool g_barrelLocalValid = false;
 Qts g_liveL[kMaxBones];
 Qts g_gripShape[kMaxBones];
@@ -184,6 +186,13 @@ bool g_placeRestValid = false;
 uint64_t g_placeRestMs = 0;
 char g_placeWeapon[64] = {};
 bool g_refTracking = false; // the sway-killed reference is following an animation
+uint64_t g_refTrackingSince = 0;
+// Tracking an animation right now? A weapon whose idle alone exceeds the sway
+// thresholds keeps the reference tracking forever; after 2.5 s that is its
+// idle, not an animation, and must not block rest acceptance.
+bool ref_animating() {
+    return g_refTracking && GetTickCount64() - g_refTrackingSince < 2500;
+}
 Qts g_restCand[2];   // candidate rest pose, and since when it has held
 uint64_t g_restCandMs = 0;
 constexpr float kRestHoldUu = 1.0f;     // idle sway is sub-UU (session 20)
@@ -1186,6 +1195,10 @@ float g_armShoulderW[2][3] = {};
 float g_armPoleW[2][3] = {};
 float g_armOutW[2][3] = {}; // the arm's outward side: the elbow never points past the body line
 std::atomic<uint32_t> g_armSolves{0}, g_armStretched{0};
+constexpr float kPi = 3.14159265f;
+float g_armTwist[2] = {0.0f, 0.0f};  // forearm roll, followed continuously (rad)
+uint64_t g_armTwistMs[2] = {0, 0};
+std::atomic<float> g_armTwistDeg[2] = {0.0f, 0.0f}; // readout
 
 void v_sub(const float a[3], const float b[3], float o[3]) {
     for (int i = 0; i < 3; ++i) o[i] = a[i] - b[i];
@@ -1364,37 +1377,21 @@ bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actor
     // Elbow: law of cosines, bent toward the pole.
     const float cosA = (a * a + d * d - b * b) / (2.0f * a * d);
     const float sinA = sqrtf(fmaxf(0.0f, 1.0f - cosA * cosA));
-    float pp[3];
+    float pp0[3];
     const float pd = v_dot(P, n);
-    for (int i = 0; i < 3; ++i) pp[i] = P[i] - pd * n[i];
-    // Crossing the hand toward the body tilts the projected pole INWARD (the
-    // outward part of the pole is mostly removed by the projection and the
-    // remainder picks up the hand's medial direction): never let the elbow
-    // point inside the arm's own side.
+    for (int i = 0; i < 3; ++i) pp0[i] = P[i] - pd * n[i];
+    if (!v_norm(pp0)) return false;
+    // The arm's outward side, in the plane the elbow swings in.
+    float op[3];
+    bool haveOut = false;
     {
-        float op[3];
         const float od = v_dot(O, n);
         for (int i = 0; i < 3; ++i) op[i] = O[i] - od * n[i];
-        if (v_norm(op)) {
-            const float inward = v_dot(pp, op);
-            if (inward < 0.0f)
-                for (int i = 0; i < 3; ++i) pp[i] -= inward * op[i];
-        }
+        haveOut = v_norm(op);
     }
-    if (!v_norm(pp)) return false;
-    float E[3];
-    for (int i = 0; i < 3; ++i) E[i] = S[i] + n[i] * a * cosA + pp[i] * a * sinA;
 
-    // Segment frames: reference vs solved.
-    float nRef[3], nNew[3], se[3], ew[3];
+    float nRef[3];
     v_cross(ue0, ew0, nRef);
-    v_sub(E, S, se);
-    v_sub(Wt, E, ew);
-    // The solved bend plane's normal from the POLE, not from the two segments:
-    // cross(se, ew) = a d sinA (pp x n), same direction - but it vanishes as the
-    // arm straightens and its sign then flips on noise, which spun the whole
-    // arm half a turn in one frame (the collapse). pp x n never degenerates.
-    v_cross(pp, n, nNew);
     if (v_len(nRef) < 1e-4f) {
         // The reference arm is straight: take its bend plane from the pole.
         float ref_dir[3] = {uw0[0], uw0[1], uw0[2]};
@@ -1402,9 +1399,88 @@ bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actor
         float down[3] = {0.0f, 0.0f, -1.0f};
         v_cross(ref_dir, down, nRef);
     }
-    float qUp[4], qFore[4];
-    if (!frame_rotation(ue0, nRef, se, nNew, qUp)) return false;
-    if (!frame_rotation(ew0, nRef, ew, nNew, qFore)) return false;
+    float wq[4];
+    if (!read_n(g_bones[wri].q, wq, 16)) return false; // the wrist as the drive wrote it
+
+    // One elbow solve for a given swivel of the pole about the shoulder->wrist
+    // line; returns the wrist's remaining roll about the forearm (radians,
+    // in (-pi, pi]) and everything needed to write the arm.
+    float E[3], ew[3], qUp[4], qFore[4], ax[3];
+    auto solve = [&](float swivel) -> float {
+        float pp[3];
+        {
+            const float h = 0.5f * swivel;
+            const float qs[4] = {n[0] * sinf(h), n[1] * sinf(h), n[2] * sinf(h), cosf(h)};
+            qts_rotate(qs, pp0, pp);
+        }
+        // Never let the elbow point inside the arm's own side. The inward part
+        // is replaced by a small outward lean rather than removed: removing it
+        // left almost nothing when the pole pointed straight inward (a hand
+        // turned or crossed hard), and that remainder's direction was noise -
+        // the elbow spun and the arm twisted through itself.
+        if (haveOut) {
+            const float o = v_dot(pp, op);
+            constexpr float kMinOut = 0.25f;
+            if (o < kMinOut)
+                for (int i = 0; i < 3; ++i) pp[i] += (kMinOut - o) * op[i];
+            v_norm(pp);
+        }
+        for (int i = 0; i < 3; ++i) E[i] = S[i] + n[i] * a * cosA + pp[i] * a * sinA;
+        float se[3], nNew[3];
+        v_sub(E, S, se);
+        v_sub(Wt, E, ew);
+        // The solved bend plane's normal from the POLE, not from the two
+        // segments: cross(se, ew) vanishes as the arm straightens and its sign
+        // then flips on noise. pp x n never degenerates.
+        v_cross(pp, n, nNew);
+        if (!frame_rotation(ue0, nRef, se, nNew, qUp)) return NAN;
+        if (!frame_rotation(ew0, nRef, ew, nNew, qFore)) return NAN;
+        memcpy(ax, ew, sizeof ax);
+        if (!v_norm(ax)) return NAN;
+        float implied[4], wqInv[4], delta[4], tw[4];
+        quat_mul(qFore, g_ref[wri].q, implied);
+        quat_conj(implied, wqInv);
+        quat_mul(wq, wqInv, delta);
+        twist_about(delta, ax, tw);
+        const float sn = tw[0] * ax[0] + tw[1] * ax[1] + tw[2] * ax[2];
+        float ang = 2.0f * atan2f(sn, tw[3]);
+        if (ang > kPi) ang -= 2.0f * kPi;
+        if (ang <= -kPi) ang += 2.0f * kPi;
+        return ang;
+    };
+    auto unwrap = [](float raw, float near_) {
+        float dlt = raw - near_;
+        while (dlt > kPi) dlt -= 2.0f * kPi;
+        while (dlt <= -kPi) dlt += 2.0f * kPi;
+        return near_ + dlt;
+    };
+
+    // Forearm roll, followed continuously: the shortest-way-round reading
+    // flips sign at 180 deg, which spun the helpers a full turn in one frame.
+    const uint64_t nowMs = GetTickCount64();
+    const bool fresh = nowMs - g_armTwistMs[hand] < 250;
+    float twist = solve(0.0f);
+    if (twist != twist) return false;
+    if (fresh) twist = unwrap(twist, g_armTwist[hand]);
+    // Past a comfortable roll, the elbow lifts out to carry the excess - the
+    // way a real arm turns the whole forearm from the shoulder once the wrist
+    // runs out of range - instead of the forearm wringing itself.
+    constexpr float kComfort = 80.0f / 57.29578f, kMaxSwivel = 70.0f / 57.29578f;
+    float swivel = 0.0f;
+    if (fabsf(twist) > kComfort) {
+        swivel = fabsf(twist) - kComfort;
+        if (swivel > kMaxSwivel) swivel = kMaxSwivel;
+        if (twist < 0.0f) swivel = -swivel;
+        const float t2 = solve(swivel);
+        if (t2 != t2) return false;
+        twist = unwrap(t2, twist - swivel);
+    }
+    constexpr float kTrack = 330.0f / 57.29578f; // keep the tracked value bounded
+    if (twist > kTrack) twist = kTrack;
+    if (twist < -kTrack) twist = -kTrack;
+    g_armTwist[hand] = twist;
+    g_armTwistMs[hand] = nowMs;
+    g_armTwistDeg[hand].store(twist * 57.29578f, std::memory_order_relaxed);
 
     const float sS = g_armScaleS.load(std::memory_order_relaxed) ? sc : 1.0f;
     float q[4], p[3], rel[3], relR[3];
@@ -1428,42 +1504,28 @@ bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actor
         write_arm_bone(cla, p, q, sS);
     }
 
-    // Twist helpers: along the forearm (reference offset from the elbow, forearm
-    // rotation), sharing out the wrist's twist about the forearm axis.
+    // Twist helpers: along the forearm (reference offset from the elbow,
+    // forearm rotation), sharing out the remaining roll - never past 150 deg,
+    // beyond which the skin between the helpers folds through itself.
     {
-        float implied[4], wq[4], wqInv[4], delta[4], tw[4], ax[3] = {ew[0], ew[1], ew[2]};
-        v_norm(ax);
-        quat_mul(qFore, g_ref[wri].q, implied);
-        if (!read_n(g_bones[wri].q, wq, 16)) return false; // the wrist as the drive wrote it
-        quat_conj(implied, wqInv);
-        quat_mul(wq, wqInv, delta);
-        twist_about(delta, ax, tw);
-        // Shortest way round, and never past 150 deg: beyond that the skin
-        // between the helpers folds through itself.
-        if (tw[3] < 0.0f)
-            for (float& c : tw) c = -c;
-        {
-            const float ang = 2.0f * acosf(tw[3] > 1.0f ? 1.0f : tw[3]);
-            constexpr float kMaxTwist = 150.0f / 57.29578f;
-            if (ang > kMaxTwist) {
-                float lim[4];
-                quat_scale_angle(tw, kMaxTwist / ang, lim);
-                memcpy(tw, lim, sizeof lim);
-            }
-        }
+        constexpr float kMaxTwist = 150.0f / 57.29578f;
+        float tw = twist;
+        if (tw > kMaxTwist) tw = kMaxTwist;
+        if (tw < -kMaxTwist) tw = -kMaxTwist;
         const int helpers[2] = {tw1, tw2};
         const float frac[2] = {0.33f, 0.66f};
         for (int k = 0; k < 2; ++k) {
-            const int h = helpers[k];
-            float part[4], qh[4];
-            quat_scale_angle(tw, frac[k], part);
-            v_sub(g_ref[h].p, E0, rel);
+            const int hb = helpers[k];
+            const float h = 0.5f * tw * frac[k];
+            const float part[4] = {ax[0] * sinf(h), ax[1] * sinf(h), ax[2] * sinf(h), cosf(h)};
+            float qh[4];
+            v_sub(g_ref[hb].p, E0, rel);
             for (float& c : rel) c *= sc;
             qts_rotate(qFore, rel, relR);
             for (int i = 0; i < 3; ++i) p[i] = E[i] + relR[i];
-            quat_mul(qFore, g_ref[h].q, qh);
+            quat_mul(qFore, g_ref[hb].q, qh);
             quat_mul(part, qh, q);
-            write_arm_bone(h, p, q, sS);
+            write_arm_bone(hb, p, q, sS);
         }
     }
     g_armSolves.fetch_add(1, std::memory_order_relaxed);
@@ -1944,6 +2006,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             // Track through the animation AND a settle window past its last
             // big frame, so the eventual freeze holds the SETTLED pose.
             adopt = (nowMs - g_lastBigDeltaMs) < kSwaySettleMs;
+            if (adopt && !g_refTracking) g_refTrackingSince = nowMs;
             g_refTracking = adopt;
             if (g_telemetry.load(std::memory_order_relaxed) &&
                 nowMs - g_lastSwayTlmMs >= 1000) {
@@ -1994,8 +2057,13 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     }
     const bool firingWindow = GetTickCount64() - s_lastTriggerMs < 1000;
     if (hand != 1) g_placeRestValid = false; // plasmid up: the next raise re-settles
-    if (g_liveValid && firingWindow) g_restCandMs = 0; // restart the hold once it ends
-    if (g_liveValid && !firingWindow) {
+    // Nor while the reference is following an animation: the grenade
+    // launcher's reload twists the whole gun with the engine's left hand
+    // holding still ON it, so the hand-to-gun relation alone looked like rest
+    // mid-twist - the tilt then reset and the held hand jumped off the gun.
+    const bool animating = ref_animating();
+    if (g_liveValid && (firingWindow || animating)) g_restCandMs = 0;
+    if (g_liveValid && !firingWindow && !animating) {
         const uint64_t nowR = GetTickCount64();
         auto rel_dist = [](const Qts* a, const Qts* b) {
             float d2 = 0.0f;
@@ -2017,12 +2085,16 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             // The grip shape is taken only while the weapon hand is raised:
             // that is when the engine's left hand is the one on the gun.
             if (hand == 1) {
-                if (!g_refTracking) update_place_rest(anchor);
+                update_place_rest(anchor);
                 {
                     float qi[4];
                     static const float kX[3] = {1.0f, 0.0f, 0.0f};
+                    static const float kY[3] = {0.0f, 1.0f, 0.0f};
+                    static const float kZ[3] = {0.0f, 0.0f, 1.0f};
                     quat_conj(g_ref[patterns::kBoneWeaponAttach].q, qi);
                     qts_rotate(qi, kX, g_barrelLocal);
+                    qts_rotate(qi, kY, g_barrelRightLocal);
+                    qts_rotate(qi, kZ, g_barrelUpLocal);
                     g_barrelLocalValid = true;
                 }
                 int lf = 0, ll = 0, la = 0;
@@ -2263,6 +2335,9 @@ float arm_length() { return g_armLength.load(std::memory_order_relaxed); }
 bool arms() { return g_armsOn.load(std::memory_order_relaxed); }
 void set_arm_scale_skin(bool on) { g_armScaleS.store(on, std::memory_order_relaxed); }
 bool arm_scale_skin() { return g_armScaleS.load(std::memory_order_relaxed); }
+float arm_twist_deg(int hand) {
+    return hand == 0 || hand == 1 ? g_armTwistDeg[hand].load(std::memory_order_relaxed) : 0.0f;
+}
 void arm_stats(unsigned* solves, unsigned* stretched) {
     *solves = g_armSolves.load(std::memory_order_relaxed);
     *stretched = g_armStretched.load(std::memory_order_relaxed);
@@ -2302,12 +2377,20 @@ bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float g
     return true;
 }
 
-bool barrel_dir_target(float out[3]) {
+bool barrel_dir_target(float yawDeg, float pitchDeg, float out[3]) {
     if (!g_refValid || g_boneCount <= patterns::kBoneWeaponAttach) return false;
     if (!g_barrelLocalValid) return barrel_ref_axis(out);
+    // The weapon's own barrel angle in its idle pose (yaw right+, pitch up+,
+    // the rig's un-mirrored frame): some models are authored toed in toward
+    // the crosshair rather than straight down the view.
+    const float y = yawDeg / 57.29578f, pt = pitchDeg / 57.29578f;
+    const float cf = cosf(pt) * cosf(y), cr = cosf(pt) * sinf(y), cu = sinf(pt);
+    float local[3];
+    for (int i = 0; i < 3; ++i)
+        local[i] = g_barrelLocal[i] * cf + g_barrelRightLocal[i] * cr + g_barrelUpLocal[i] * cu;
     // Carried by the attach bone's CURRENT reference rotation, so the barrel
     // follows the gun through its own animations (a pump rocks it back).
-    qts_rotate(g_ref[patterns::kBoneWeaponAttach].q, g_barrelLocal, out);
+    qts_rotate(g_ref[patterns::kBoneWeaponAttach].q, local, out);
     return true;
 }
 
