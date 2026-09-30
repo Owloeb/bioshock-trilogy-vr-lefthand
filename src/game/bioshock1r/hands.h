@@ -40,6 +40,8 @@ void on_calcview(const FrameContext& ctx);
 // about the same world plane - no one-frame-stale eye while moving.
 // Arms (experimental) F10 section (render thread).
 void draw_arms_ui();
+// True while the hands are placed by the grip pose (your real palm).
+bool grip_placement();
 
 void on_eye_camera(int eye, const float loc[3], int32_t pitch, int32_t yaw, int32_t roll);
 

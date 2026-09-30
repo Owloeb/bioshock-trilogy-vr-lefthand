@@ -129,6 +129,17 @@ int g_collapsedHand = -1; // whose sleeve g_wasCollapsed refers to
 // the drive does NOT own this frame goes. Stored rather than passed so the
 // Route B re-drive (pose-writer hook) replays the same off-hand target.
 bool g_offTrack = false;
+struct PalmLocal {
+    bool valid = false;
+    float p[3];    // palm centroid, wrist-local (reference units)
+    float q[4];    // palm frame (fwd = tube, right = grip +X, up), wrist-local
+    float face[3]; // toward the palm surface, wrist-local unit vector
+};
+PalmLocal g_palm[2];
+bool g_palmLogged[2] = {false, false};
+float g_lastQa[4] = {0, 0, 0, 1};
+float g_lastActorLoc[3] = {};
+bool g_lastActorValid = false;
 GamePose g_offGp{};
 // Held on the gun (two-handed grip): the off hand also follows what the
 // ENGINE's own off hand is doing relative to the gun - pumping the shotgun,
@@ -900,6 +911,8 @@ void init(const bvr::pattern_scan::ProcessImage& image) {
 
 void on_world_change() {
     g_offTrack = false;
+    g_palm[0].valid = g_palm[1].valid = false;
+    g_lastActorValid = false;
     if (g_skelInst) BVR_LOG("[bones] world changed - skeleton cache cleared");
     g_skelInst = nullptr;
     g_bones = nullptr;
@@ -1426,6 +1439,137 @@ void written_wrist(int hand, int anchor, const float ptc[3], const float qtc[4],
     for (int i = 0; i < 3; ++i) Wt[i] = ptc[i] + r[i];
 }
 
+// ---- Grip-pose placement: Jack's palm on your palm ---------------------------
+// OpenXR's GRIP pose is anchored to the user's hand, not to the controller's
+// pointing ray: origin at the palm centroid, -Z through the tube the curled
+// fingers make (little finger -> thumb), +X along the palm normal (away from
+// the palm on the left hand, into it on the right: "right" for both). The same
+// frame is measured on Jack's hand from its own bones - wrist, the four finger
+// base knuckles, the thumb - expressed in the WRIST's local frame (it rides
+// the wrist rigidly, whatever the animation does to the fingers). Placing the
+// hand is then one rigid solve: put that palm frame on the grip frame.
+
+int wrist_of(int hand) { return hand == 1 ? patterns::kBoneRClusterFirst : patterns::kBoneLWrist; }
+
+bool compute_palm_local(int hand) {
+    if (!g_refValid || !g_skelInst) return false;
+    int first = 0, last = 0, anchor = 0;
+    cluster_of(hand, &first, &last, &anchor);
+    const int w = wrist_of(hand);
+    if (w < 0 || w + 15 >= g_boneCount) return false;
+    // Finger bases: by NAME first (3ds Max biped: Finger0 = thumb, Finger1..4 =
+    // index..little), else the measured layout - wrist, thumb x3, then four
+    // chains of three (the right cluster 27 | 28-30 | 31-42 is documented; the
+    // left 6 | 7-9 | 10-21 has the same shape).
+    int thumb0 = w + 1, thumb1 = w + 2, base[4] = {w + 4, w + 7, w + 10, w + 13};
+    bool named = false;
+    {
+        Skel sk{g_skelInst, g_bones, g_boneCount};
+        const wchar_t* names[kMaxBones] = {};
+        if (resolve_bone_names(sk, names, g_boneCount) > 0) {
+            int f[5] = {-1, -1, -1, -1, -1};
+            for (int i = first; i <= last && i < g_boneCount; ++i) {
+                if (!names[i]) continue;
+                const size_t n = wcslen(names[i]);
+                if (n < 7) continue;
+                const wchar_t* tail = names[i] + n - 7; // "FingerN"
+                if (_wcsnicmp(tail, L"Finger", 6) == 0 && tail[6] >= L'0' && tail[6] <= L'4')
+                    f[tail[6] - L'0'] = i;
+            }
+            if (f[0] >= 0 && f[1] >= 0 && f[2] >= 0 && f[3] >= 0 && f[4] >= 0) {
+                thumb0 = f[0];
+                thumb1 = f[0] + 1 <= last ? f[0] + 1 : f[0];
+                base[0] = f[1]; base[1] = f[2]; base[2] = f[3]; base[3] = f[4];
+                named = true;
+            }
+            if (!g_palmLogged[hand]) {
+                BVR_LOG("[bones] %s hand bones: %ls | %ls | %ls %ls %ls %ls (%s)",
+                        hand == 1 ? "right" : "left", names[w] ? names[w] : L"?",
+                        names[thumb0] ? names[thumb0] : L"?", names[base[0]] ? names[base[0]] : L"?",
+                        names[base[1]] ? names[base[1]] : L"?", names[base[2]] ? names[base[2]] : L"?",
+                        names[base[3]] ? names[base[3]] : L"?", named ? "by name" : "by layout");
+            }
+        }
+    }
+    const float* W = g_ref[w].p;
+    // Index = the base nearest the thumb, little = the farthest.
+    int idx = 0, lit = 0;
+    float dmin = 1e30f, dmax = -1.0f;
+    for (int k = 0; k < 4; ++k) {
+        float d[3];
+        v_sub(g_ref[base[k]].p, g_ref[thumb0].p, d);
+        const float l = v_len(d);
+        if (l < dmin) { dmin = l; idx = k; }
+        if (l > dmax) { dmax = l; lit = k; }
+    }
+    if (idx == lit) return false;
+    float K[3] = {0, 0, 0};
+    for (int k = 0; k < 4; ++k)
+        for (int i = 0; i < 3; ++i) K[i] += g_ref[base[k]].p[i] * 0.25f;
+    float f[3], wk[3], nrm[3];
+    v_sub(g_ref[base[idx]].p, g_ref[base[lit]].p, f); // little -> index: the tube
+    if (!v_norm(f)) return false;
+    v_sub(K, W, wk);
+    v_cross(wk, f, nrm);
+    if (!v_norm(nrm)) return false;
+    // Palm side: the thumb sits palm-side of the knuckle plane and curled
+    // fingertips fall on it.
+    float score = 0.0f;
+    {
+        float t[3];
+        v_sub(g_ref[thumb1].p, W, t);
+        score += 2.0f * v_dot(t, nrm);
+        for (int k = 0; k < 4; ++k) {
+            const int tip = base[k] + 2 <= last ? base[k] + 2 : base[k];
+            float c[3];
+            v_sub(g_ref[tip].p, g_ref[base[k]].p, c);
+            score += v_dot(c, nrm);
+        }
+    }
+    float face[3] = {nrm[0], nrm[1], nrm[2]};
+    if (score < 0.0f)
+        for (float& c : face) c = -c;
+    // Grip +X: into the right palm / away from the left palm.
+    float r[3];
+    for (int i = 0; i < 3; ++i) r[i] = hand == 1 ? -face[i] : face[i];
+    const float fr = v_dot(r, f);
+    for (int i = 0; i < 3; ++i) r[i] -= fr * f[i];
+    if (!v_norm(r)) return false;
+    float u[3];
+    v_cross(f, r, u);
+    const float m[3][3] = {{f[0], r[0], u[0]}, {f[1], r[1], u[1]}, {f[2], r[2], u[2]}};
+    float qp[4];
+    mat_to_quat(m, qp);
+    // Palm centroid: halfway from the wrist to the knuckle line.
+    const float C[3] = {(W[0] + K[0]) * 0.5f, (W[1] + K[1]) * 0.5f, (W[2] + K[2]) * 0.5f};
+    float wqInv[4], dC[3];
+    quat_conj(g_ref[w].q, wqInv);
+    v_sub(C, W, dC);
+    PalmLocal& pl = g_palm[hand];
+    qts_rotate(wqInv, dC, pl.p);
+    quat_mul(wqInv, qp, pl.q);
+    qts_rotate(wqInv, face, pl.face);
+    pl.valid = true;
+    if (!g_palmLogged[hand]) {
+        g_palmLogged[hand] = true;
+        float dk[3];
+        v_sub(K, W, dk);
+        BVR_LOG("[bones] %s palm frame: wrist->knuckles %.1f, index %d little %d, palm-side score "
+                "%.1f",
+                hand == 1 ? "right" : "left", v_len(dk), base[idx], base[lit], score);
+    }
+    return true;
+}
+
+// The pose `src` draws `hand` with (mirrors drive() / drive_off_hand()).
+const Qts* draw_source(int hand, bool driven) {
+    if (driven || hand == 1) return g_ref;
+    const bool wantGrip = g_offFollow || g_offPreview;
+    if (!wantGrip && g_neutralValid) return g_neutral;
+    if (wantGrip && g_gripShapeValid) return g_gripShape;
+    return g_ref;
+}
+
 // One cluster, moved rigidly: rotate its reference pose by qtc about its
 // reference anchor point, then put the anchor point at ptc. Appends every write
 // to the reapply cache (the caller resets it once per drive).
@@ -1848,6 +1992,9 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
 
     float qa[4], qt[4], qaInv[4], qtc[4];
     ue_rot_to_quat(actorRot, qa);
+    memcpy(g_lastQa, qa, sizeof qa);
+    memcpy(g_lastActorLoc, actorLoc, sizeof actorLoc);
+    g_lastActorValid = true;
     ue_rot_to_quat(gp.rot, qt);
     quat_conj(qa, qaInv);
     quat_mul(qaInv, qt, qtc); // target rotation, component space
@@ -2018,6 +2165,46 @@ bool arm_scale_skin() { return g_armScaleS.load(std::memory_order_relaxed); }
 void arm_stats(unsigned* solves, unsigned* stretched) {
     *solves = g_armSolves.load(std::memory_order_relaxed);
     *stretched = g_armStretched.load(std::memory_order_relaxed);
+}
+
+bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float gripQ[4],
+                    float palmDepthUu, float outLoc[3], float outQ[4]) {
+    if (hand != 0 && hand != 1) return false;
+    if (!g_palm[hand].valid && !compute_palm_local(hand)) return false;
+    int first = 0, last = 0, anchor = 0;
+    cluster_of(hand, &first, &last, &anchor);
+    const Qts* src = draw_source(hand, driven);
+    const int w = wrist_of(hand);
+    if (w >= g_boneCount || anchor >= g_boneCount) return false;
+    const PalmLocal& pl = g_palm[hand];
+    // Palm frame in component space for the pose that will actually be drawn.
+    float qPalm[4], pw[3], face[3];
+    quat_mul(src[w].q, pl.q, qPalm);
+    qts_rotate(src[w].q, pl.p, pw);
+    qts_rotate(src[w].q, pl.face, face);
+    const float s = g_scale[hand].load(std::memory_order_relaxed);
+    // Relative to the anchor, scaled like the cluster, then pushed toward the
+    // palm surface: the grip origin sits inside the fist, a handle's radius in.
+    float rel[3];
+    for (int i = 0; i < 3; ++i) rel[i] = (src[w].p[i] + pw[i] - src[anchor].p[i]) * s + face[i] * palmDepthUu;
+    // Drive frame: q = qGrip * qPalm^-1, anchor = gripLoc - q * rel.
+    float pinv[4], rr[3];
+    quat_conj(qPalm, pinv);
+    quat_mul(gripQ, pinv, outQ);
+    qts_rotate(outQ, rel, rr);
+    for (int i = 0; i < 3; ++i) outLoc[i] = gripLoc[i] - rr[i];
+    return true;
+}
+
+bool written_world(int idx, float out[3]) {
+    for (int k = 0; k < g_cacheCount; ++k) {
+        if (g_cache[k].idx != idx) continue;
+        float r[3];
+        qts_rotate(g_lastQa, g_cache[k].p, r);
+        for (int i = 0; i < 3; ++i) out[i] = g_lastActorLoc[i] + r[i];
+        return g_lastActorValid;
+    }
+    return false;
 }
 
 void set_off_follow(bool on) { g_offFollow = on; }

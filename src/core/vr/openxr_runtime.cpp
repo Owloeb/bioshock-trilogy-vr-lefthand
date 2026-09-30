@@ -81,6 +81,9 @@ std::atomic<float> g_laserNearM{0.30f}, g_laserFarM{6.0f}, g_laserSizeDeg{0.7f};
 // Session 20 muzzle ray (see LaserConfig): beam along the rendered barrel.
 std::atomic<bool> g_laserMuzzle{false};
 std::atomic<float> g_laserMuzzleD0[3] = {0.0f, 0.0f, -1.0f};
+std::atomic<bool> g_laserGripLocal{false};
+std::atomic<float> g_laserGripO[3];
+std::atomic<float> g_laserGripD[3];
 std::atomic<float> g_laserModelPitchTrim{0.0f}, g_laserModelYawTrim{0.0f},
     g_laserModelRollTrim{0.0f};
 std::atomic<uint32_t> g_laserLayersSubmitted{0};
@@ -3113,6 +3116,9 @@ struct LaserSnapshot {
     bool muzzle = false;
     float d0[3] = {0.0f, 0.0f, -1.0f};
     float modelPitch = 0.0f, modelYaw = 0.0f, modelRoll = 0.0f;
+    bool gripLocal = false;
+    float gripO[3] = {0.0f, 0.0f, 0.0f};
+    float gripD[3] = {0.0f, 0.0f, -1.0f};
 };
 
 // Fill `quads` with the dots along one laser's ray and return how many were
@@ -3124,6 +3130,16 @@ uint32_t build_laser_from(const LaserSnapshot& ls, XrCompositionLayerQuad* quads
 
     int hand = ls.hand;
     float pos[3], quat[4];
+    constexpr float kDegToRad = 3.14159265f / 180.0f;
+    float d[3];
+    if (ls.gripLocal) {
+        // Barrel aim: fixed in the GRIP frame - no trims, no origin offsets.
+        if (!input_get_hand_pose(hand, false, pos, quat)) return 0;
+        float o[3];
+        bvr::xrmath::quat_rotate(quat[0], quat[1], quat[2], quat[3], ls.gripO, o);
+        bvr::xrmath::quat_rotate(quat[0], quat[1], quat[2], quat[3], ls.gripD, d);
+        for (int i = 0; i < 3; ++i) pos[i] += o[i];
+    } else {
     if (!input_get_hand_pose(hand, true, pos, quat)) return 0; // AIM pose = the fire ray
 
     // Session 20 unification: the laser composes its pitch/yaw trim as a
@@ -3132,9 +3148,8 @@ uint32_t build_laser_from(const LaserSnapshot& ls, XrCompositionLayerQuad* quads
     // decomposition added the trim in world angles, which matched the other
     // two only at the tuning pose. If these ever disagree again the laser
     // stops being a calibration tool and becomes a lie.
-    constexpr float kDegToRad = 3.14159265f / 180.0f;
     const float fwd[3] = {0.0f, 0.0f, -1.0f};
-    float trim[4], q2[4], d[3];
+    float trim[4], q2[4];
     if (ls.muzzle) {
         // Muzzle ray: the beam follows the RENDERED barrel - the MODEL's trim
         // (roll included: it moves an off-axis vector) applied to the barrel
@@ -3173,6 +3188,8 @@ uint32_t build_laser_from(const LaserSnapshot& ls, XrCompositionLayerQuad* quads
             pos[2] += d[2] * ofM + right[2] * orM + up2[2] * ouM;
         }
     }
+
+    } // !gripLocal
 
     // Billboard against the head (midpoint of the two eyes).
     float head[3] = {(g_views[0].pose.position.x + g_views[1].pose.position.x) * 0.5f,
@@ -3261,6 +3278,11 @@ LaserSnapshot snapshot_laser_slot(int slot) {
     ls.modelPitch = g_laserModelPitchTrim.load(std::memory_order_relaxed);
     ls.modelYaw = g_laserModelYawTrim.load(std::memory_order_relaxed);
     ls.modelRoll = g_laserModelRollTrim.load(std::memory_order_relaxed);
+    ls.gripLocal = g_laserGripLocal.load(std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i) {
+        ls.gripO[i] = g_laserGripO[i].load(std::memory_order_relaxed);
+        ls.gripD[i] = g_laserGripD[i].load(std::memory_order_relaxed);
+    }
     return ls;
 }
 
@@ -5041,6 +5063,11 @@ void set_laser(const LaserConfig& cfg) {
     g_laserModelPitchTrim.store(cfg.modelPitchTrimDeg, std::memory_order_relaxed);
     g_laserModelYawTrim.store(cfg.modelYawTrimDeg, std::memory_order_relaxed);
     g_laserModelRollTrim.store(cfg.modelRollTrimDeg, std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i) {
+        g_laserGripO[i].store(cfg.gripOrigin[i], std::memory_order_relaxed);
+        g_laserGripD[i].store(cfg.gripDir[i], std::memory_order_relaxed);
+    }
+    g_laserGripLocal.store(cfg.gripLocal, std::memory_order_relaxed);
 }
 
 void set_aim_dot(const AimDotConfig& cfg) {

@@ -60,6 +60,14 @@ std::atomic<int> g_pendingEnable{-1}; // overlay -> game thread (see aim.cpp)
 std::atomic<int> g_mode{2};           // 0 = gun (inert), 1 = hands (actor pin,
                                       // retired), 2 = bones (M7-v2, default)
 std::atomic<bool> g_useAimPose{true}; // aim pose = the ray the laser/bullet use
+// Grip-pose placement (arms branch): the hands sit where YOUR hands are - the
+// OpenXR grip pose matched to Jack's measured palm frame (bones::grip_to_anchor)
+// - instead of pinning the gun at the controller's pointing ray. With it, the
+// bullets follow the rendered barrel so wherever the gun you see points is where
+// it shoots, independent of hand placement.
+std::atomic<bool> g_gripPlace{true};
+std::atomic<float> g_palmDepthCm{2.0f};
+std::atomic<bool> g_barrelAim{true};
 std::atomic<int> g_handMode{2};       // 0 left, 1 right, 2 auto
 std::atomic<int> g_autoHand{1};       // the latched auto choice
 // Model offsets, PER HAND (0 left / 1 right, same convention as aim.cpp): the
@@ -416,6 +424,8 @@ void save_config() {
     fprintf(f, "# suffix-less key (posFwdCm=...) still loads and applies to BOTH hands.\n");
     fprintf(f, "mode=%d\n", g_mode.load(std::memory_order_relaxed));
     fprintf(f, "aimPose=%d\n", g_useAimPose.load(std::memory_order_relaxed) ? 1 : 0);
+    fprintf(f, "gripPlacement=%d\npalmDepthCm=%.2f\nbarrelAim=%d\n", g_gripPlace.load() ? 1 : 0,
+            g_palmDepthCm.load(), g_barrelAim.load() ? 1 : 0);
     for (int h = 0; h < 2; ++h) {
         const char* s = h == 0 ? "L" : "R";
         fprintf(f, "posFwdCm%s=%.2f\n", s, g_posFwdCm[h].load(std::memory_order_relaxed));
@@ -464,6 +474,9 @@ void load_config() {
             g_mode.store(m < 0 ? 0 : m > 2 ? 2 : m, std::memory_order_relaxed);
         }
         else if (strcmp(key, "aimPose") == 0) g_useAimPose.store(v != 0.0f, std::memory_order_relaxed);
+        else if (strcmp(key, "gripPlacement") == 0) g_gripPlace.store(v != 0.0f);
+        else if (strcmp(key, "palmDepthCm") == 0) g_palmDepthCm.store(v);
+        else if (strcmp(key, "barrelAim") == 0) g_barrelAim.store(v != 0.0f);
         else if (store_hand_key(key, "posFwdCm", g_posFwdCm, v)) {}
         else if (store_hand_key(key, "posRightCm", g_posRightCm, v)) {}
         else if (store_hand_key(key, "posUpCm", g_posUpCm, v)) {}
@@ -1111,6 +1124,89 @@ void publish_arm_targets(const FrameContext& ctx, bool mirrorPose, bool gunPlane
     }
 }
 
+// Pose source for a hand's MODEL: the grip pose in grip-placement mode,
+// otherwise the historical choice (aim pose = the laser's ray).
+bool model_uses_aim_pose() {
+    return !g_gripPlace.load(std::memory_order_relaxed) &&
+           g_useAimPose.load(std::memory_order_relaxed);
+}
+
+// Grip-placement: turn a GRIP pose (game space, fine-tune trims and offsets
+// already applied in the grip's own frame) into the drive target that puts
+// Jack's palm on it. False = no palm frame yet (the pose is left as is).
+bool to_anchor(const FrameContext& ctx, int hand, bool driven, GamePose& gp) {
+    if (!g_gripPlace.load(std::memory_order_relaxed)) return false;
+    float gq[4], oq[4], ol[3];
+    ue_rot_to_quat(gp.rot, gq);
+    const float gl[3] = {gp.loc.x, gp.loc.y, gp.loc.z};
+    const float depth = g_palmDepthCm.load(std::memory_order_relaxed) * ctx.worldScale / 100.0f;
+    if (!bones::grip_to_anchor(hand, driven, gl, gq, depth, ol, oq)) return false;
+    static const float kX[3] = {1.0f, 0.0f, 0.0f}, kZ[3] = {0.0f, 0.0f, 1.0f};
+    float f[3], u[3];
+    quat_rotate(oq[0], oq[1], oq[2], oq[3], kX, f);
+    quat_rotate(oq[0], oq[1], oq[2], oq[3], kZ, u);
+    gp.rot = basis_to_rot(f, u);
+    gp.loc = {ol[0], ol[1], ol[2]};
+    return true;
+}
+
+// Barrel aim: the gun's rendered barrel (hand-rig bones 43 -> 44), taken from
+// the weapon hand's drive target BEFORE the recoil kick (recoil stays visual)
+// and in the rig's own space, then mirrored about the head when the viewmodel
+// mirror is on - what you SEE, in both mirror modes. Published for the next
+// shot (aim.cpp) and, as an offset from the weapon grip, for the laser.
+void publish_barrel(const FrameContext& ctx, const GamePose& gpV, bool mirrorPose,
+                    const GamePose& headW) {
+    float d0[3], m0[3];
+    if (!bones::barrel_ref_axis(d0) || !bones::muzzle_ref_offset(m0)) {
+        aim::set_barrel(false, nullptr, nullptr, nullptr, nullptr);
+        return;
+    }
+    float f[3], r[3], u[3];
+    ue_rot_basis(gpV.rot, f, r, u);
+    float o[3], d[3];
+    for (int i = 0; i < 3; ++i) {
+        o[i] = (&gpV.loc.x)[i] + f[i] * m0[0] + r[i] * m0[1] + u[i] * m0[2];
+        d[i] = f[i] * d0[0] + r[i] * d0[1] + u[i] * d0[2];
+    }
+    if (mirrorPose) {
+        float hf[3], hr[3], hu[3];
+        ue_rot_basis(headW.rot, hf, hr, hu);
+        const float H[3] = {headW.loc.x, headW.loc.y, headW.loc.z};
+        reflect_point(o, H, hr);
+        float t[3];
+        reflect_vec(d, hr, t);
+        memcpy(d, t, sizeof t);
+    }
+    const float dl = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (dl < 1e-4f) {
+        aim::set_barrel(false, nullptr, nullptr, nullptr, nullptr);
+        return;
+    }
+    for (float& c : d) c /= dl;
+    // Laser: the same barrel as an offset from the weapon GRIP pose (XR), so the
+    // render thread can follow the controller at full rate.
+    float lo[3] = {0, 0, 0}, ldir[3] = {0, 0, -1};
+    bool laserOk = false;
+    bvr::vr::HeadPose hp{};
+    if (bvr::vr::get_hand_pose(1, false, hp)) {
+        float xo[3], xt[3];
+        game_point_to_xr(ctx, FVector{o[0], o[1], o[2]}, xo);
+        const float k = ctx.worldScale * 0.5f;
+        game_point_to_xr(ctx, FVector{o[0] + d[0] * k, o[1] + d[1] * k, o[2] + d[2] * k}, xt);
+        float xd[3] = {xt[0] - xo[0], xt[1] - xo[1], xt[2] - xo[2]};
+        const float xl = sqrtf(xd[0] * xd[0] + xd[1] * xd[1] + xd[2] * xd[2]);
+        if (xl > 1e-5f) {
+            for (float& c : xd) c /= xl;
+            const float rel[3] = {xo[0] - hp.px, xo[1] - hp.py, xo[2] - hp.pz};
+            quat_rotate(-hp.qx, -hp.qy, -hp.qz, hp.qw, rel, lo);
+            quat_rotate(-hp.qx, -hp.qy, -hp.qz, hp.qw, xd, ldir);
+            laserOk = true;
+        }
+    }
+    aim::set_barrel(true, o, d, laserOk ? lo : nullptr, laserOk ? ldir : nullptr);
+}
+
 // Always-visible off hand: the OTHER role's controller through the same chain
 // as the driven hand - XR pose (two-handed pose when gripped), the head-mirror
 // when mirroring, that hand's model trims and offsets, and in gun-plane mode
@@ -1120,7 +1216,7 @@ bool off_hand_pose(const FrameContext& ctx, int offHand, bool mirrorPose, bool g
                    const Kick* kick, GamePose& out) {
     bvr::vr::HeadPose hp{};
     if (!ctx.vrDriving ||
-        !bvr::vr::get_hand_pose(offHand, g_useAimPose.load(std::memory_order_relaxed), hp))
+        !bvr::vr::get_hand_pose(offHand, model_uses_aim_pose(), hp))
         return false;
     float pos[3] = {hp.px, hp.py, hp.pz};
     float quat[4] = {hp.qx, hp.qy, hp.qz, hp.qw};
@@ -1142,6 +1238,7 @@ bool off_hand_pose(const FrameContext& ctx, int offHand, bool mirrorPose, bool g
     gp.loc = {gp.loc.x + fwd[0] * of + right[0] * orr + up[0] * ou,
               gp.loc.y + fwd[1] * of + right[1] * orr + up[1] * ou,
               gp.loc.z + fwd[2] * of + right[2] * orr + up[2] * ou};
+    to_anchor(ctx, offHand, false, gp); // grip placement: palm on your palm
     if (kick) apply_kick(*kick, gp); // held on the gun: ride its recoil
     if (gunPlane) {
         reflect_pose(gp, g_hdH, g_hdN);
@@ -1799,7 +1896,7 @@ void on_calcview(const FrameContext& ctx) {
             mapCtx.recenterPx = mapCtx.recenterPy = mapCtx.recenterPz = 0.0f;
         } else {
             bvr::vr::HeadPose hp{};
-            bool aimPose = g_useAimPose.load(std::memory_order_relaxed);
+            bool aimPose = model_uses_aim_pose();
             if (!ctx.vrDriving || !bvr::vr::get_hand_pose(hand, aimPose, hp)) return;
             pos[0] = hp.px;
             pos[1] = hp.py;
@@ -1866,6 +1963,8 @@ void on_calcview(const FrameContext& ctx) {
         // culling, correct engine-side FX anchoring) and the hand CLUSTER
         // moves to the controller instead.
         gp.loc = {loc[0], loc[1], loc[2]};
+        to_anchor(ctx, hand, true, gp); // grip placement: palm on your palm
+        const GamePose gpPreKick = gp;  // the barrel the bullets follow (no recoil)
         ability_haptics(hand);
         Kick kick{};
         const bool kicked = hand == 1 && recoil_kick(ctx, gp, twohand::gripped(), kick);
@@ -1914,13 +2013,15 @@ void on_calcview(const FrameContext& ctx) {
         {
             GamePose offGp{};
             const bool held = hand == 1 && twohand::gripped();
+            // Shape flags first: the grip placement solves against the pose
+            // the off hand will actually be drawn with.
+            bones::set_off_follow(held);
+            bones::set_off_preview(hand == 1 && twohand::preview_grip());
             const bool track =
                 twohand::off_hand_enabled() &&
                 off_hand_pose(ctx, 1 - hand, mirrorPose, gunPlaneLive,
                               held && kicked ? &kick : nullptr, offGp);
             bones::set_off_target(track, track ? &offGp : nullptr);
-            bones::set_off_follow(held);
-            bones::set_off_preview(hand == 1 && twohand::preview_grip());
         }
         bonewatch::mark_drive_begin();
         const bool drove = bones::drive(ctx, target, gp, hand);
@@ -1930,6 +2031,11 @@ void on_calcview(const FrameContext& ctx) {
             g_postTarget = nullptr;
             return;
         }
+        if (hand == 1 && g_gripPlace.load(std::memory_order_relaxed) &&
+            g_barrelAim.load(std::memory_order_relaxed))
+            publish_barrel(ctx, gpPreKick, mirrorPose, headW);
+        else
+            aim::set_barrel(false, nullptr, nullptr, nullptr, nullptr);
         // Route B: the inputs the pose-writer hook re-applies next engine write.
         g_postCtx = ctx;
         g_postTarget = target;
@@ -2188,6 +2294,25 @@ void save_offsets() {
 void draw_debug_ui() {
     if (!ImGui::CollapsingHeader("Hands + weapon (M7)")) return;
 
+    bool gpl = g_gripPlace.load();
+    if (ImGui::Checkbox("Hands match your real hands (grip pose)", &gpl)) {
+        g_gripPlace.store(gpl);
+        save_config();
+    }
+    if (gpl) {
+        float pd = g_palmDepthCm.load();
+        if (ImGui::SliderFloat("palm depth (cm into the fist)", &pd, -2.0f, 5.0f)) {
+            g_palmDepthCm.store(pd);
+            save_config();
+        }
+        bool ba = g_barrelAim.load();
+        if (ImGui::Checkbox("Bullets follow the gun barrel", &ba)) {
+            g_barrelAim.store(ba);
+            save_config();
+        }
+        ImGui::TextDisabled("The offset/trim sliders below now fine-tune from your palm.");
+    }
+
     bool rc = g_recoilOn.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Recoil + haptics (every weapon, wrench hits, plasmid casts)", &rc))
         g_recoilOn.store(rc, std::memory_order_relaxed);
@@ -2270,6 +2395,8 @@ void draw_debug_ui() {
                 g_lastYaw.load(std::memory_order_relaxed),
                 g_lastRoll.load(std::memory_order_relaxed));
 }
+
+bool grip_placement() { return g_gripPlace.load(std::memory_order_relaxed); }
 
 void draw_arms_ui() {
     if (!ImGui::CollapsingHeader("Arms (experimental)")) return;

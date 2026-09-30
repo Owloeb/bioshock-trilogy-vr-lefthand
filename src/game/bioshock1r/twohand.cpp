@@ -5,6 +5,7 @@
 #include "core/util/xr_math.h"
 #include "core/vr/openxr_runtime.h"
 #include "game/bioshock1r/aim.h"
+#include "game/bioshock1r/hands.h"
 
 #include <windows.h>
 
@@ -58,9 +59,14 @@ uint64_t g_lastBuzzMs = 0;
 char g_keyUi[96] = "";
 std::atomic<bool> g_saveRequest{false};
 
+// Grab points are recorded against what you SEE, so each hand-placement mode
+// keeps its own set: the grip-pose placement ("G") moves both drawn hands, and
+// switching back must find the old points exactly where they were.
 const char* setup_tag() {
-    if (!bvr::input::left_handed()) return "R";
-    return bvr::input::mirror_viewmodel() ? "LM" : "L";
+    const bool g = hands::grip_placement();
+    if (!bvr::input::left_handed()) return g ? "RG" : "R";
+    if (bvr::input::mirror_viewmodel()) return g ? "LMG" : "LM";
+    return g ? "LG" : "L";
 }
 
 void ini_path(wchar_t* out, size_t n) {

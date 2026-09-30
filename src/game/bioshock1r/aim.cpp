@@ -1331,6 +1331,30 @@ void apply_origin_offset(int i, Ray& out, float worldScale) {
 static FrameContext g_lastCtx{};
 static bool g_haveCtx = false;
 
+// Barrel aim (hands.cpp publish_barrel): the next weapon shot leaves the
+// rendered muzzle along the rendered barrel. Game thread writes and reads.
+bool g_barrelValid = false;
+uint64_t g_barrelMs = 0;
+float g_barrelO[3] = {}, g_barrelD[3] = {1, 0, 0};
+bool g_barrelLaser = false;
+float g_barrelLO[3] = {}, g_barrelLD[3] = {0, 0, -1};
+
+void set_barrel(bool valid, const float origin[3], const float dir[3], const float laserOrigin[3],
+                const float laserDir[3]) {
+    g_barrelValid = valid && origin && dir;
+    if (!g_barrelValid) return;
+    memcpy(g_barrelO, origin, 12);
+    memcpy(g_barrelD, dir, 12);
+    g_barrelLaser = laserOrigin && laserDir;
+    if (g_barrelLaser) {
+        memcpy(g_barrelLO, laserOrigin, 12);
+        memcpy(g_barrelLD, laserDir, 12);
+    }
+    g_barrelMs = GetTickCount64();
+}
+
+bool barrel_fresh() { return g_barrelValid && GetTickCount64() - g_barrelMs < 150; }
+
 void on_calcview(const FrameContext& ctx) {
     uint64_t now = GetTickCount64();
     g_rayStampMs = now;
@@ -1426,6 +1450,15 @@ void on_calcview(const FrameContext& ctx) {
         GamePose gp = ray_pose_from_xr(ctx, pos, quat, eff_pitch(i), eff_yaw(i) * mirror_side());
         out.origin = gp.loc;
         out.rot = gp.rot;
+
+        // Barrel aim (grip placement): the shot leaves the RENDERED muzzle
+        // along the RENDERED barrel - the gun you see is the gun that fires.
+        if (i == 1 && barrel_fresh()) {
+            out.origin = {g_barrelO[0], g_barrelO[1], g_barrelO[2]};
+            out.rot = ue_dir_to_rot(g_barrelD);
+            out.valid = true;
+            continue;
+        }
 
         // Muzzle ray (session 20, right hand only): the bullet leaves along
         // the RENDERED barrel. The model's target rotation is recomputed here
@@ -1538,6 +1571,11 @@ void on_calcview(const FrameContext& ctx) {
             lc.modelYawTrimDeg = hands::model_trim_yaw_deg(1) * mirror_side();
             lc.modelRollTrimDeg = hands::model_trim_roll_deg(1) * mirror_side();
         }
+    }
+    if (lc.hand == 1 && barrel_fresh() && g_barrelLaser) {
+        lc.gripLocal = true;
+        memcpy(lc.gripOrigin, g_barrelLO, 12);
+        memcpy(lc.gripDir, g_barrelLD, 12);
     }
     bvr::vr::set_laser(lc);
 
@@ -1947,6 +1985,7 @@ void* learned_weapon_object() {
 }
 
 const char* active_weapon_key() { return g_weaponKey.c_str(); }
+
 uint32_t player_shot_count() { return g_playerShots.load(std::memory_order_relaxed); }
 uint32_t player_ability_count() { return g_playerAbilities.load(std::memory_order_relaxed); }
 

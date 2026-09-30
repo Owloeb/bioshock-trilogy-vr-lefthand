@@ -55,6 +55,17 @@ void set_off_target(bool track, const GamePose* gp);
 // crank) onto it. Game thread, before drive().
 void set_off_follow(bool on);
 
+// Grip-pose placement: given where the OpenXR GRIP pose is (game space, the
+// quaternion in the skeleton convention - ue_rot_to_quat), the drive target
+// (anchor location + frame) that puts Jack's measured palm frame exactly on
+// it, for the pose `hand` will be drawn with (driven = the raised hand).
+// palmDepthUu pushes the palm centroid toward the palm surface. False until
+// the rig has a reference pose.
+bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float gripQ[4],
+                    float palmDepthUu, float outLoc[3], float outQ[4]);
+// World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
+bool written_world(int idx, float out[3]);
+
 // Arms (two-bone IK, experimental): instead of collapsing a visible hand's
 // sleeve, pose clavicle / upper arm / elbow / twist helpers from a shoulder
 // point to the written wrist. Targets are in ENGINE world space (already
