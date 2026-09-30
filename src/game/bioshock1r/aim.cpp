@@ -527,6 +527,11 @@ bool substitute(Slot& slot, Hand h, float* const* out, int count) {
 // AWeapon::GetPerfectFireStart(FVector* outA, FVector* outB, void* outC).
 // `this` is the weapon; [this+0x454] is the pawn holding it, which is how a
 // player shot is told from a splicer's.
+std::atomic<uint32_t> g_playerShots{0};
+std::atomic<uint64_t> g_lastShotMs{0};
+std::atomic<uint32_t> g_playerAbilities{0};
+std::atomic<uint64_t> g_lastAbilityMs{0};
+
 void __fastcall WeaponFireDetour(void* self, void* edx, float* outA, float* outB, float* outC) {
     using WeaponFireFn = void(__fastcall*)(void*, void*, float*, float*, float*);
     reinterpret_cast<WeaponFireFn>(g_weaponFire.original)(self, edx, outA, outB, outC);
@@ -538,6 +543,14 @@ void __fastcall WeaponFireDetour(void* self, void* edx, float* outA, float* outB
     read12(outC, c);
 
     const char* note = "";
+    // Shot counter for the viewmodel recoil (hands.cpp). Calls within 40 ms are
+    // one shot - a shotgun asks once per pellet.
+    if (owner_is_player_pawn(self)) {
+        const uint64_t t = GetTickCount64();
+        if (t - g_lastShotMs.load(std::memory_order_relaxed) > 40)
+            g_playerShots.fetch_add(1, std::memory_order_relaxed);
+        g_lastShotMs.store(t, std::memory_order_relaxed);
+    }
     if (g_subWeapon.load(std::memory_order_relaxed) && owner_is_player_pawn(self)) {
         Hand h = hand_for_object(self, Hand::Right);
         float* outs[3] = {outA, outB, outC};
@@ -567,6 +580,12 @@ void __fastcall AbilityFireDetour(void* self, void* edx, void* instigator, float
     read12(outC, c);
 
     const char* note = "";
+    if (is_player_pawn(instigator)) { // haptics: a plasmid cast or a wrench swing
+        const uint64_t t = GetTickCount64();
+        if (t - g_lastAbilityMs.load(std::memory_order_relaxed) > 40)
+            g_playerAbilities.fetch_add(1, std::memory_order_relaxed);
+        g_lastAbilityMs.store(t, std::memory_order_relaxed);
+    }
     if (g_subAbility.load(std::memory_order_relaxed) && is_player_pawn(instigator)) {
         // Plasmids are the left hand; the wrench's melee ability also lands
         // here, and the trigger-keyed map moves it back to the right hand the
@@ -1202,6 +1221,90 @@ void save_weapon_profiles() {
 // Measured symptom this fixes: the Pistol (yaw -4.2) and Crossbow (-6.65)
 // fired visibly left of the mirrored model; the plasmid hand's +37 yaw trim
 // threw Electro Bolt / Incinerate far off the right hand.
+// ---- Plasmid aim calibration (per hand setup, aim_plasmid.ini) --------------
+// The shipped plasmid trim (-11 / +37 deg) is the original developer's wrist
+// posture on a LEFT controller. One press re-derives it for YOUR plasmid hand:
+// a dot appears ahead of you, you point at it the way you naturally would to
+// cast, and squeeze that hand's grip. The result overrides the L trims for the
+// current hand setup and is saved on its own, so no preset can undo it.
+struct PlasmidCal {
+    bool valid = false;
+    float pitch = 0.0f, yaw = 0.0f; // stored in the L-trim convention (pre mirror_side)
+};
+std::mutex g_calMx;
+std::map<std::string, PlasmidCal> g_cal;
+bool g_calLoaded = false;
+std::atomic<bool> g_calArmed{false};
+std::atomic<uint64_t> g_calArmedMs{0};
+std::atomic<int> g_calClear{0};
+bool g_calHaveTarget = false;
+float g_calTarget[3] = {};
+bool g_calSqueeze = false;
+std::atomic<bool> g_plasmidDot{true};
+
+const char* cal_setup() {
+    if (!bvr::input::left_handed()) return "R";
+    return bvr::input::mirror_viewmodel() ? "LM" : "L";
+}
+
+void cal_path(wchar_t* out, size_t n) {
+    swprintf_s(out, n, L"%s\\aim_plasmid.ini", bvr::log::data_dir());
+}
+
+void cal_load() {
+    g_calLoaded = true;
+    wchar_t path[MAX_PATH];
+    cal_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        char key[16] = {};
+        float p = 0.0f, y = 0.0f;
+        if (sscanf_s(line, "%15[^=]=%f %f", key, static_cast<unsigned>(sizeof key), &p, &y) == 3) {
+            std::lock_guard<std::mutex> lk(g_calMx);
+            g_cal[key] = {true, p, y};
+        } else if (sscanf_s(line, "plasmidDot=%f", &p) == 1) {
+            g_plasmidDot.store(p != 0.0f);
+        }
+    }
+    fclose(f);
+}
+
+void cal_save() {
+    wchar_t path[MAX_PATH];
+    cal_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "# plasmid aim calibration: <R|L|LM>=pitch yaw (deg)\n");
+    fprintf(f, "plasmidDot=%d\n", g_plasmidDot.load() ? 1 : 0);
+    std::lock_guard<std::mutex> lk(g_calMx);
+    for (const auto& [k, c] : g_cal)
+        if (c.valid) fprintf(f, "%s=%.2f %.2f\n", k.c_str(), c.pitch, c.yaw);
+    fclose(f);
+}
+
+bool cal_get(PlasmidCal* out) {
+    std::lock_guard<std::mutex> lk(g_calMx);
+    auto it = g_cal.find(cal_setup());
+    if (it == g_cal.end() || !it->second.valid) return false;
+    *out = it->second;
+    return true;
+}
+
+// The trims the ray, the laser and the sliders actually use: the plasmid hand
+// takes the calibration when this setup has one.
+float eff_pitch(int i) {
+    PlasmidCal c;
+    if (i == 0 && cal_get(&c)) return c.pitch;
+    return g_pitchOffsetDeg[i].load(std::memory_order_relaxed);
+}
+float eff_yaw(int i) {
+    PlasmidCal c;
+    if (i == 0 && cal_get(&c)) return c.yaw;
+    return g_yawOffsetDeg[i].load(std::memory_order_relaxed);
+}
+
 float mirror_side() {
     return bvr::input::left_handed() && bvr::input::mirror_viewmodel() ? -1.0f : 1.0f;
 }
@@ -1320,10 +1423,7 @@ void on_calcview(const FrameContext& ctx) {
         const float quat[4] = {hp.qx, hp.qy, hp.qz, hp.qw};
         // The trimmed chain is a pure function in frame_context.h, shared
         // with `vraim synccheck` (roll forced 0 there - the camera owns roll).
-        GamePose gp = ray_pose_from_xr(ctx, pos, quat,
-                                       g_pitchOffsetDeg[i].load(std::memory_order_relaxed),
-                                       g_yawOffsetDeg[i].load(std::memory_order_relaxed) *
-                                           mirror_side());
+        GamePose gp = ray_pose_from_xr(ctx, pos, quat, eff_pitch(i), eff_yaw(i) * mirror_side());
         out.origin = gp.loc;
         out.rot = gp.rot;
 
@@ -1351,6 +1451,64 @@ void on_calcview(const FrameContext& ctx) {
         out.valid = true;
     }
 
+    // ---- plasmid aim calibration ------------------------------------------
+    if (!g_calLoaded) cal_load();
+    if (g_calClear.exchange(0) == 1) {
+        {
+            std::lock_guard<std::mutex> lk(g_calMx);
+            g_cal.erase(cal_setup());
+        }
+        cal_save();
+        BVR_LOG("[aim] plasmid calibration cleared for setup %s", cal_setup());
+    }
+    if (g_calArmed.load() && now - g_calArmedMs.load() > 30000) {
+        g_calArmed.store(false);
+        BVR_LOG("[aim] plasmid calibration timed out");
+    }
+    if (!g_calArmed.load()) g_calHaveTarget = false;
+    if (g_calArmed.load() && ctx.vrDriving) {
+        bvr::vr::HeadPose head{};
+        if (!g_calHaveTarget && bvr::vr::peek_head_pose(head)) {
+            // 4 m straight along your gaze, fixed in the room once placed.
+            const float fwd[3] = {0.0f, 0.0f, -1.0f};
+            float d[3];
+            quat_rotate(head.qx, head.qy, head.qz, head.qw, fwd, d);
+            for (int k = 0; k < 3; ++k) g_calTarget[k] = (&head.px)[k] + d[k] * 4.0f;
+            g_calHaveTarget = true;
+        }
+        bvr::vr::reserve_grip_bumper(0, true); // this squeeze must not raise plasmids
+        const float sq = bvr::vr::hand_squeeze(0);
+        const bool was = g_calSqueeze;
+        g_calSqueeze = g_calSqueeze ? sq >= 0.55f : sq >= 0.70f;
+        bvr::vr::HeadPose aimP{};
+        if (g_calHaveTarget && g_calSqueeze && !was &&
+            bvr::vr::get_raw_hand_pose(0, g_useAimPose.load(std::memory_order_relaxed), aimP)) {
+            // Direction to the dot in the controller's own frame, then the
+            // trim angles that turn its forward (-Z) onto it - the exact
+            // inverse of xr_local_trim_quat's forward: (cp sy, sp, -cp cy).
+            float to[3] = {g_calTarget[0] - aimP.px, g_calTarget[1] - aimP.py,
+                           g_calTarget[2] - aimP.pz};
+            const float n = sqrtf(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
+            if (n > 0.2f) {
+                for (float& c : to) c /= n;
+                float v[3];
+                quat_rotate(-aimP.qx, -aimP.qy, -aimP.qz, aimP.qw, to, v);
+                const float pitch = asinf(v[1] < -1.0f ? -1.0f : v[1] > 1.0f ? 1.0f : v[1]) * kRadToDeg;
+                const float yaw = atan2f(v[0], -v[2]) * kRadToDeg;
+                PlasmidCal c{true, pitch, yaw * mirror_side()};
+                {
+                    std::lock_guard<std::mutex> lk(g_calMx);
+                    g_cal[cal_setup()] = c;
+                }
+                cal_save();
+                g_calArmed.store(false);
+                bvr::vr::haptic_pulse(0, 0.8f, 120);
+                BVR_LOG("[aim] plasmid aim calibrated for setup %s: pitch %.1f yaw %.1f",
+                        cal_setup(), pitch, yaw);
+            }
+        }
+    }
+
     // Publish the laser for the render thread. It reads the aim pose itself at
     // submit time (later than this, so the dots are as fresh as the frame), and
     // takes the trim from here so the beam and the bullet are one ray.
@@ -1358,8 +1516,8 @@ void on_calcview(const FrameContext& ctx) {
     lc.enabled = g_laser.load(std::memory_order_relaxed) && ctx.vrDriving && g_gameplayView;
     lc.hand = hands::active_hand();
     int lh = lc.hand == 0 ? 0 : 1;
-    lc.pitchTrimDeg = g_pitchOffsetDeg[lh].load(std::memory_order_relaxed);
-    lc.yawTrimDeg = g_yawOffsetDeg[lh].load(std::memory_order_relaxed) * mirror_side();
+    lc.pitchTrimDeg = eff_pitch(lh);
+    lc.yawTrimDeg = eff_yaw(lh) * mirror_side();
     lc.posFwdCm = g_posFwdCm[lh].load(std::memory_order_relaxed);
     lc.posRightCm = g_posRightCm[lh].load(std::memory_order_relaxed) * mirror_side();
     lc.posUpCm = g_posUpCm[lh].load(std::memory_order_relaxed);
@@ -1388,7 +1546,10 @@ void on_calcview(const FrameContext& ctx) {
     // visible if and only if a shot fired right now would be substituted -
     // which makes the dot an instrument as well as a sight.
     bvr::vr::AimDotConfig dc{};
-    dc.enabled = g_dot.load(std::memory_order_relaxed);
+    // The dot also shows for the PLASMID hand by default: plasmids have no
+    // barrel to sight along, so without it every cast is a guess.
+    dc.enabled = g_dot.load(std::memory_order_relaxed) ||
+                 (lh == 0 && g_plasmidDot.load(std::memory_order_relaxed));
     dc.sizeDeg = g_dotSizeDeg.load(std::memory_order_relaxed);
     const Ray& dr = g_ray[lh];
     if (dc.enabled && g_enabled.load(std::memory_order_relaxed) && g_gameplayView && dr.valid) {
@@ -1416,6 +1577,14 @@ void on_calcview(const FrameContext& ctx) {
                     err < 0.05f ? "EXACT, the dot is the fire-seam point"
                                 : "NOT EXACT - do not trust the dot as calibration");
         }
+    }
+    if (g_calArmed.load() && g_calHaveTarget) {
+        // Calibrating: the dot is the TARGET to point at, not the ray.
+        dc.enabled = true;
+        dc.valid = true;
+        dc.posXr[0] = g_calTarget[0];
+        dc.posXr[1] = g_calTarget[1];
+        dc.posXr[2] = g_calTarget[2];
     }
     bvr::vr::set_aim_dot(dc);
 }
@@ -1778,6 +1947,8 @@ void* learned_weapon_object() {
 }
 
 const char* active_weapon_key() { return g_weaponKey.c_str(); }
+uint32_t player_shot_count() { return g_playerShots.load(std::memory_order_relaxed); }
+uint32_t player_ability_count() { return g_playerAbilities.load(std::memory_order_relaxed); }
 
 bool weapon_key_is(const char* name) {
     // The profile key IS the equipped holdable's class name, maintained by
@@ -1852,15 +2023,49 @@ void draw_debug_ui() {
     float rp = g_pitchOffsetDeg[1].load(std::memory_order_relaxed);
     if (ImGui::SliderFloat("R aim pitch trim (deg)", &rp, -90.0f, 90.0f))
         g_pitchOffsetDeg[1].store(rp, std::memory_order_relaxed);
-    float ry = g_yawOffsetDeg[1].load(std::memory_order_relaxed);
+    // Sideways values are stored in right-handed terms and negated at use in
+    // mirror mode, so the sliders show and edit them as you SEE them: dragging
+    // right always moves the shot right. (side is +-1, its own inverse.)
+    const float side = mirror_side();
+    float ry = g_yawOffsetDeg[1].load(std::memory_order_relaxed) * side;
     if (ImGui::SliderFloat("R aim yaw trim (deg)", &ry, -90.0f, 90.0f))
-        g_yawOffsetDeg[1].store(ry, std::memory_order_relaxed);
+        g_yawOffsetDeg[1].store(ry * side, std::memory_order_relaxed);
+    ImGui::Separator();
+    {
+        PlasmidCal c;
+        const bool have = cal_get(&c);
+        if (g_calArmed.load()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f),
+                               "Plasmid aim: point your plasmid hand at the dot the way you'd "
+                               "cast, then squeeze that hand's grip.");
+            if (ImGui::Button("Cancel##plcal")) g_calArmed.store(false);
+        } else {
+            if (ImGui::Button("Calibrate plasmid aim")) {
+                g_calArmedMs.store(GetTickCount64());
+                g_calArmed.store(true);
+            }
+            if (have) {
+                ImGui::SameLine();
+                if (ImGui::Button("Reset##plcal")) g_calClear.store(1);
+                ImGui::SameLine();
+                ImGui::Text("calibrated: pitch %.1f yaw %.1f", c.pitch, c.yaw * side);
+            }
+        }
+        bool pd = g_plasmidDot.load();
+        if (ImGui::Checkbox("Aim dot for plasmids", &pd)) {
+            g_plasmidDot.store(pd);
+            cal_save();
+        }
+        if (have) ImGui::TextDisabled("L trims below are overridden by the calibration.");
+    }
     float lp = g_pitchOffsetDeg[0].load(std::memory_order_relaxed);
     if (ImGui::SliderFloat("L aim pitch trim (deg)", &lp, -90.0f, 90.0f))
         g_pitchOffsetDeg[0].store(lp, std::memory_order_relaxed);
-    float ly = g_yawOffsetDeg[0].load(std::memory_order_relaxed);
+    float ly = g_yawOffsetDeg[0].load(std::memory_order_relaxed) * side;
     if (ImGui::SliderFloat("L aim yaw trim (deg)", &ly, -90.0f, 90.0f))
-        g_yawOffsetDeg[0].store(ly, std::memory_order_relaxed);
+        g_yawOffsetDeg[0].store(ly * side, std::memory_order_relaxed);
+    if (side < 0.0f)
+        ImGui::TextDisabled("Mirrored: sideways trims shown as you see them.");
 
     // Ray ORIGIN offsets (session 18 part 2): move the laser + fire origin to
     // line up with the controller and the tuned model. Selector like the
@@ -1874,9 +2079,9 @@ void draw_debug_ui() {
     float pf = g_posFwdCm[posHand].load(std::memory_order_relaxed);
     if (ImGui::SliderFloat("ray offset forward (cm)", &pf, -30.0f, 30.0f))
         g_posFwdCm[posHand].store(pf, std::memory_order_relaxed);
-    float pr = g_posRightCm[posHand].load(std::memory_order_relaxed);
+    float pr = g_posRightCm[posHand].load(std::memory_order_relaxed) * side;
     if (ImGui::SliderFloat("ray offset right (cm)", &pr, -30.0f, 30.0f))
-        g_posRightCm[posHand].store(pr, std::memory_order_relaxed);
+        g_posRightCm[posHand].store(pr * side, std::memory_order_relaxed);
     float pu = g_posUpCm[posHand].load(std::memory_order_relaxed);
     if (ImGui::SliderFloat("ray offset up (cm)", &pu, -30.0f, 30.0f))
         g_posUpCm[posHand].store(pu, std::memory_order_relaxed);

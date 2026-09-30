@@ -22,6 +22,7 @@
 //   +0x450, adjacent to Owner at +0x454, the classic UE2 pair.
 
 #include "game/bioshock1r/hands.h"
+#include "game/bioshock1r/twohand.h"
 
 #include "core/gfx/hud_capture.h"
 #include "core/gfx/vm_mirror.h"
@@ -737,6 +738,10 @@ void publish_head_planes(const FrameContext& ctx) {
 // weapon whose barrel sits off the attach bone's plane (R' then moves by 2x the
 // shift, keeping F where it was).
 // Returns false when the per-eye cameras are unavailable (caller falls back).
+// Head plane of the last apply_gun_plane (point, normal), for the off hand.
+float g_hdH[3] = {};
+float g_hdN[3] = {};
+
 // World-space render plane (gun-plane mode), re-expressed per eye.
 float g_eyePlaneQ[3] = {};
 float g_eyePlaneN[3] = {};
@@ -793,6 +798,11 @@ bool apply_gun_plane(const GamePose& headW, GamePose& gp, float shift) {
     gp.loc.z = Tf[2] + 2.0f * shift * fr[2];
     gp.rot = basis_to_rot(ff, fu);
 
+    // The head plane too: the off hand goes through the same two reflections.
+    for (int i = 0; i < 3; ++i) {
+        g_hdH[i] = H[i];
+        g_hdN[i] = hr[i];
+    }
     // Effects flip: the same plane in WORLD space.
     for (int i = 0; i < 3; ++i) {
         g_pgQ[i] = Q[i];
@@ -812,6 +822,205 @@ bool apply_gun_plane(const GamePose& headW, GamePose& gp, float shift) {
     // on_eye_camera overwrites each eye with its exact current camera right
     // before that eye renders; this only covers a frame where it does not run.
     for (int e = 0; e < 2; ++e) publish_eye_plane(e, eyeLoc[e], eyeRot[e]);
+    return true;
+}
+
+// Reflect a rig pose about the plane through P with unit normal n. The result
+// is rebuilt as a PROPER frame from the reflected forward and up (right flips),
+// so two of these compose to the rigid motion both planes describe.
+void reflect_pose(GamePose& gp, const float P[3], const float n[3]) {
+    float f[3], r[3], u[3];
+    ue_rot_basis(gp.rot, f, r, u);
+    const float rel[3] = {gp.loc.x - P[0], gp.loc.y - P[1], gp.loc.z - P[2]};
+    float relR[3], fR[3], uR[3];
+    reflect_vec(rel, n, relR);
+    reflect_vec(f, n, fR);
+    reflect_vec(u, n, uR);
+    gp.loc = {P[0] + relR[0], P[1] + relR[1], P[2] + relR[2]};
+    gp.rot = basis_to_rot(fR, uR);
+}
+
+// ---- Viewmodel recoil -----------------------------------------------------
+// The shotgun and the Tommy gun fire dead flat in VR. Each player shot (the fire
+// seam's counter, aim.cpp) kicks the RENDERED gun: muzzle up, a little sideways,
+// back into the hand, then a spring back. Visual only - the fire ray is built
+// from the controller, so accuracy is untouched - plus a haptic thump. Held
+// two-handed, the kick is smaller and the off hand rides it.
+struct RecoilSpec {
+    const char* weapon;
+    float pitchDeg, yawDeg, backCm; // per shot
+    float returnMs;                 // spring-back time constant
+    float hapticAmp;
+    int hapticMs;
+};
+// Per shot. The chemical thrower fires a stream of small "shots" (one per
+// projectile tick), so its numbers are a shimmer that settles, not a kick; the
+// research camera only clicks.
+const RecoilSpec kRecoil[] = {
+    {"Shotgun", 11.0f, 1.5f, 5.0f, 170.0f, 1.0f, 90},
+    {"MachineGun", 2.4f, 1.0f, 1.4f, 90.0f, 0.55f, 35},
+    {"Pistol", 5.5f, 1.0f, 2.2f, 110.0f, 0.75f, 45},
+    {"GrenadeLauncher", 9.0f, 0.8f, 4.5f, 230.0f, 1.0f, 110},
+    {"Crossbow", 3.5f, 0.4f, 1.6f, 160.0f, 0.6f, 60},
+    {"ChemicalThrower", 0.35f, 0.4f, 0.25f, 120.0f, 0.3f, 50},
+    {"ResearchCamera", 0.0f, 0.0f, 0.0f, 100.0f, 0.4f, 25},
+};
+
+std::atomic<bool> g_recoilOn{true};
+
+// Plasmid casts and wrench swings share the ability fire seam; which one it
+// was is which hand owns the viewmodel. Haptics only.
+uint32_t g_abShots = 0;
+bool g_abSeeded = false;
+void ability_haptics(int hand) {
+    const uint32_t n = aim::player_ability_count();
+    if (!g_abSeeded) {
+        g_abShots = n;
+        g_abSeeded = true;
+    }
+    if (n == g_abShots) return;
+    g_abShots = n;
+    if (!g_recoilOn.load(std::memory_order_relaxed)) return;
+    if (hand == 1 && strcmp(aim::active_weapon_key(), "Wrench") == 0)
+        bvr::vr::haptic_pulse(1, 0.85f, 70); // the wrench connects
+    else if (hand == 0)
+        bvr::vr::haptic_pulse(0, 0.6f, 90); // a plasmid leaves the palm
+}
+std::atomic<float> g_recoilScale{1.0f};
+float g_rcTarget[3] = {}; // pitch deg, yaw deg, back cm
+float g_rcCur[3] = {};
+uint32_t g_rcShots = 0;
+bool g_rcShotsSeeded = false;
+uint64_t g_rcLastMs = 0;
+
+// A rigid kick about the weapon hand: old and new bases, pivot, push-back.
+struct Kick {
+    float P[3];
+    float f[3], r[3], u[3];    // before
+    float f2[3], r2[3], u2[3]; // after
+    float back[3];             // translation, UU
+};
+
+void kick_vec(const Kick& k, const float v[3], float out[3]) {
+    const float cf = v[0] * k.f[0] + v[1] * k.f[1] + v[2] * k.f[2];
+    const float cr = v[0] * k.r[0] + v[1] * k.r[1] + v[2] * k.r[2];
+    const float cu = v[0] * k.u[0] + v[1] * k.u[1] + v[2] * k.u[2];
+    for (int i = 0; i < 3; ++i) out[i] = cf * k.f2[i] + cr * k.r2[i] + cu * k.u2[i];
+}
+
+void apply_kick(const Kick& k, GamePose& gp) {
+    const float rel[3] = {gp.loc.x - k.P[0], gp.loc.y - k.P[1], gp.loc.z - k.P[2]};
+    float relK[3];
+    kick_vec(k, rel, relK);
+    gp.loc = {k.P[0] + relK[0] + k.back[0], k.P[1] + relK[1] + k.back[1],
+              k.P[2] + relK[2] + k.back[2]};
+    float f[3], r[3], u[3], fK[3], uK[3];
+    ue_rot_basis(gp.rot, f, r, u);
+    kick_vec(k, f, fK);
+    kick_vec(k, u, uK);
+    gp.rot = basis_to_rot(fK, uK);
+}
+
+// Advance the recoil spring and build this frame's kick for the weapon pose.
+// False when there is nothing to apply.
+bool recoil_kick(const FrameContext& ctx, const GamePose& gp, bool held, Kick& k) {
+    const uint64_t now = GetTickCount64();
+    float dt = g_rcLastMs ? (now - g_rcLastMs) / 1000.0f : 0.0f;
+    g_rcLastMs = now;
+    if (dt > 0.1f) dt = 0.1f;
+    const uint32_t shots = aim::player_shot_count();
+    if (!g_rcShotsSeeded) {
+        g_rcShots = shots;
+        g_rcShotsSeeded = true;
+    }
+    const RecoilSpec* spec = nullptr;
+    const char* key = aim::active_weapon_key();
+    for (const RecoilSpec& r : kRecoil)
+        if (strcmp(key, r.weapon) == 0) spec = &r;
+    const uint32_t newShots = shots - g_rcShots;
+    g_rcShots = shots;
+    if (spec && newShots && newShots < 8 && g_recoilOn.load(std::memory_order_relaxed)) {
+        const float sc = g_recoilScale.load(std::memory_order_relaxed) * (held ? 0.55f : 1.0f);
+        for (uint32_t n = 0; n < newShots; ++n) {
+            const float side = (GetTickCount() ^ (n * 2654435761u)) & 1 ? 1.0f : -1.0f;
+            g_rcTarget[0] += spec->pitchDeg * sc;
+            g_rcTarget[1] += spec->yawDeg * sc * side;
+            g_rcTarget[2] += spec->backCm * sc;
+        }
+        if (g_rcTarget[0] > 28.0f) g_rcTarget[0] = 28.0f; // a sustained burst climbs, then holds
+        if (g_rcTarget[2] > 10.0f) g_rcTarget[2] = 10.0f;
+        bvr::vr::haptic_pulse(1, spec->hapticAmp, spec->hapticMs);
+        if (held) bvr::vr::haptic_pulse(0, spec->hapticAmp * 0.6f, spec->hapticMs);
+    }
+    // Spring: the target decays home, the pose chases it fast (a crisp rise).
+    const float ret = spec ? spec->returnMs / 1000.0f : 0.12f;
+    const float decay = expf(-dt / ret);
+    const float chase = 1.0f - expf(-dt / 0.012f);
+    bool any = false;
+    for (int i = 0; i < 3; ++i) {
+        g_rcTarget[i] *= decay;
+        g_rcCur[i] += (g_rcTarget[i] - g_rcCur[i]) * chase;
+        if (fabsf(g_rcCur[i]) > 0.01f) any = true;
+    }
+    if (!any) return false;
+
+    ue_rot_basis(gp.rot, k.f, k.r, k.u);
+    k.P[0] = gp.loc.x;
+    k.P[1] = gp.loc.y;
+    k.P[2] = gp.loc.z;
+    const float a = g_rcCur[0] / kRadToDeg, b = g_rcCur[1] / kRadToDeg;
+    float f1[3], u1[3];
+    for (int i = 0; i < 3; ++i) {
+        f1[i] = k.f[i] * cosf(a) + k.u[i] * sinf(a); // muzzle up
+        u1[i] = k.u[i] * cosf(a) - k.f[i] * sinf(a);
+    }
+    for (int i = 0; i < 3; ++i) {
+        k.f2[i] = f1[i] * cosf(b) + k.r[i] * sinf(b); // and a little sideways
+        k.r2[i] = k.r[i] * cosf(b) - f1[i] * sinf(b);
+        k.u2[i] = u1[i];
+    }
+    const float backUu = g_rcCur[2] * ctx.worldScale / 100.0f;
+    for (int i = 0; i < 3; ++i) k.back[i] = -k.f[i] * backUu;
+    return true;
+}
+
+// Always-visible off hand: the OTHER role's controller through the same chain
+// as the driven hand - XR pose (two-handed pose when gripped), the head-mirror
+// when mirroring, that hand's model trims and offsets, and in gun-plane mode
+// the same head-then-gun-plane reflections the driven rig got, because the
+// render reflects the whole rig about ONE plane.
+bool off_hand_pose(const FrameContext& ctx, int offHand, bool mirrorPose, bool gunPlane,
+                   const Kick* kick, GamePose& out) {
+    bvr::vr::HeadPose hp{};
+    if (!ctx.vrDriving ||
+        !bvr::vr::get_hand_pose(offHand, g_useAimPose.load(std::memory_order_relaxed), hp))
+        return false;
+    float pos[3] = {hp.px, hp.py, hp.pz};
+    float quat[4] = {hp.qx, hp.qy, hp.qz, hp.qw};
+    if (mirrorPose) {
+        bvr::vr::HeadPose head{};
+        if (!bvr::vr::peek_head_pose(head)) return false;
+        mirror_pose_about_head(head, pos, quat);
+    }
+    GamePose gp = model_pose_from_xr(ctx, pos, quat,
+                                     g_rotPitchDeg[offHand].load(std::memory_order_relaxed),
+                                     g_rotYawDeg[offHand].load(std::memory_order_relaxed),
+                                     g_rotRollDeg[offHand].load(std::memory_order_relaxed));
+    float fwd[3], right[3], up[3];
+    ue_rot_basis(gp.rot, fwd, right, up);
+    const float uuPerCm = ctx.worldScale / 100.0f;
+    const float of = g_posFwdCm[offHand].load(std::memory_order_relaxed) * uuPerCm;
+    const float orr = g_posRightCm[offHand].load(std::memory_order_relaxed) * uuPerCm;
+    const float ou = g_posUpCm[offHand].load(std::memory_order_relaxed) * uuPerCm;
+    gp.loc = {gp.loc.x + fwd[0] * of + right[0] * orr + up[0] * ou,
+              gp.loc.y + fwd[1] * of + right[1] * orr + up[1] * ou,
+              gp.loc.z + fwd[2] * of + right[2] * orr + up[2] * ou};
+    if (kick) apply_kick(*kick, gp); // held on the gun: ride its recoil
+    if (gunPlane) {
+        reflect_pose(gp, g_hdH, g_hdN);
+        reflect_pose(gp, g_eyePlaneQ, g_eyePlaneN);
+    }
+    out = gp;
     return true;
 }
 
@@ -1403,6 +1612,8 @@ void on_calcview(const FrameContext& ctx) {
         bones::release("hands gated for cinematic");
     }
 
+    // Two-handed grip first: while held it changes the poses read below.
+    twohand::tick(active_hand() == 1, gameplayView && ctx.vrDriving);
     if (!gameplayView) return;
 
     bool gunMode = g_mode.load(std::memory_order_relaxed) == 0;
@@ -1523,10 +1734,15 @@ void on_calcview(const FrameContext& ctx) {
                     gp.loc.z + fwd[2] * of + right[2] * orr + up[2] * ou};
 
     if (g_mode.load(std::memory_order_relaxed) == 2) {
+        bool gunPlaneLive = false;
         // BONES (M7-v2): the actor stays engine-placed (eye anchor, correct
         // culling, correct engine-side FX anchoring) and the hand CLUSTER
         // moves to the controller instead.
         gp.loc = {loc[0], loc[1], loc[2]};
+        ability_haptics(hand);
+        Kick kick{};
+        const bool kicked = hand == 1 && recoil_kick(ctx, gp, twohand::gripped(), kick);
+        if (kicked) apply_kick(kick, gp);
         if (mirrorPose) {
             const float trim = sync_weapon_trim(hand);
             float muzzle[3] = {0.0f, 0.0f, 0.0f};
@@ -1543,6 +1759,7 @@ void on_calcview(const FrameContext& ctx) {
             const bool gunPlane =
                 bvr::vm_mirror::plane_mode() == bvr::vm_mirror::PlaneMode::Gun &&
                 apply_gun_plane(headW, gp, shift);
+            gunPlaneLive = gunPlane;
             g_flipWeapon = gunPlane && hand == 1 ? weapon_actor() : nullptr;
             if (!g_flipWeapon) g_pgStampMs = 0;
             if (!gunPlane) {
@@ -1565,6 +1782,17 @@ void on_calcview(const FrameContext& ctx) {
         // The weapon-scale lane rides the same per-frame slot (session 61);
         // it no-ops at wscale 1.0 and drops itself on weapon switches.
         bones::wskel_drive();
+        // The other hand: tracked at its own controller (or collapsed as before).
+        {
+            GamePose offGp{};
+            const bool held = hand == 1 && twohand::gripped();
+            const bool track =
+                twohand::off_hand_enabled() &&
+                off_hand_pose(ctx, 1 - hand, mirrorPose, gunPlaneLive,
+                              held && kicked ? &kick : nullptr, offGp);
+            bones::set_off_target(track, track ? &offGp : nullptr);
+            bones::set_off_follow(held);
+        }
         bonewatch::mark_drive_begin();
         const bool drove = bones::drive(ctx, target, gp, hand);
         bonewatch::mark_drive_end();
@@ -1830,6 +2058,13 @@ void save_offsets() {
 
 void draw_debug_ui() {
     if (!ImGui::CollapsingHeader("Hands + weapon (M7)")) return;
+
+    bool rc = g_recoilOn.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Recoil + haptics (every weapon, wrench hits, plasmid casts)", &rc))
+        g_recoilOn.store(rc, std::memory_order_relaxed);
+    float rs = g_recoilScale.load(std::memory_order_relaxed);
+    if (ImGui::SliderFloat("recoil strength", &rs, 0.0f, 2.5f))
+        g_recoilScale.store(rs, std::memory_order_relaxed);
 
     bool on = g_enabled.load(std::memory_order_relaxed);
     if (ImGui::Checkbox("Viewmodel follows the controller", &on))

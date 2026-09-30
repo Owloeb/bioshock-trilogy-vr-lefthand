@@ -4378,6 +4378,9 @@ void draw_debug_ui() {
     bool hudOn = bvr::hud::enabled();
     if (ImGui::Checkbox("VR HUD (gameswf on a floating quad)", &hudOn))
         bvr::hud::set_enabled(hudOn);
+    bool pm = bvr::blit::premul_repair();
+    if (ImGui::Checkbox("Solid HUD bars (health/EVE opacity fix)", &pm))
+        bvr::blit::set_premul_repair(pm);
     float hd = g_hudDistM.load(std::memory_order_relaxed);
     if (ImGui::SliderFloat("HUD distance (m)", &hd, 0.5f, 3.0f))
         g_hudDistM.store(hd, std::memory_order_relaxed);
@@ -4422,6 +4425,22 @@ bool get_hand_pose(int hand, bool aimPose, HeadPose& out) {
     if (!input_get_hand_pose(hand, aimPose, p, q)) return false;
     out = {p[0], p[1], p[2], q[0], q[1], q[2], q[3]};
     return true;
+}
+
+bool get_raw_hand_pose(int hand, bool aimPose, HeadPose& out) {
+    float p[3], q[4];
+    if (!input_get_raw_hand_pose(hand, aimPose, p, q)) return false;
+    out = {p[0], p[1], p[2], q[0], q[1], q[2], q[3]};
+    return true;
+}
+
+void set_two_hand_grip(bool on, const float grabLocal[3], const float offRelQuat[4]) {
+    input_set_two_hand_grip(on, grabLocal, offRelQuat);
+}
+float hand_squeeze(int role) { return input_hand_squeeze(role); }
+void reserve_grip_bumper(int role, bool on) { input_reserve_grip_bumper(role, on); }
+void haptic_pulse(int role, float amplitude, int durationMs) {
+    input_haptic_pulse(role, amplitude, durationMs);
 }
 
 void set_sim_hand_pose(int hand, bool aimPose, bool valid, const float pos3[3],
@@ -5152,6 +5171,11 @@ void draw_debug_ui() {}
 bool get_head_pose(HeadPose&) { return false; }
 bool peek_head_pose(HeadPose&) { return false; }
 bool get_hand_pose(int, bool, HeadPose&) { return false; }
+bool get_raw_hand_pose(int, bool, HeadPose&) { return false; }
+void set_two_hand_grip(bool, const float[3], const float[4]) {}
+float hand_squeeze(int) { return 0.0f; }
+void reserve_grip_bumper(int, bool) {}
+void haptic_pulse(int, float, int) {}
 void set_sim_hand_pose(int, bool, bool, const float[3], const float[4]) {}
 void clear_sim_hand_poses() {}
 bool session_live() { return false; }

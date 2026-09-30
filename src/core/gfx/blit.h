@@ -27,6 +27,11 @@ bool alpha_premul(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* dst,
 // alpha-blended consumer (the window composite, the XR quad) can show it.
 bool process(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* dst,
              ID3D11ShaderResourceView* src, UINT dstW, UINT dstH);
+// Which alpha repair process() runs: true (default) = premultiplied-consistent
+// (alpha >= brightest channel - the health/EVE bar fills stay opaque), false =
+// the original luminance floor (lum*0.35), kept for A/B.
+void set_premul_repair(bool on);
+bool premul_repair();
 
 // Stretch a horizontal BAND of src ([topFrac .. topFrac + heightFrac] in v)
 // across the FULL destination, blending off.

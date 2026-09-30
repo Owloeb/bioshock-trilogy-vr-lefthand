@@ -19,6 +19,7 @@
 
 #include "core/gfx/frame_inspector.h"
 #include "core/gfx/hud_capture.h" // backbuffer_dims: the lens laws are aspect-parameterised
+#include "core/input/xinput_bridge.h"
 #include "core/util/log.h"
 #include "core/vr/openxr_runtime.h" // cine_drive/name for the vrbones status residue line
 #include "game/bioshock1r/camera.h"
@@ -76,7 +77,7 @@ struct CachedSleeve {
     float p[3];
     float s[3];
 };
-CachedSleeve g_cacheSleeve[8];
+CachedSleeve g_cacheSleeve[16]; // both hands' sleeves (off-hand tracking)
 int g_cacheSleeveCount = 0;
 
 // Session 20 idle-sway kill (default ON; `vrhands swaykill on|off`): freeze
@@ -121,6 +122,87 @@ int g_hiddenHand = -1; // whose cluster is collapsed right now (game thread)
 // release() exists to fix.
 bool g_wasCollapsed = false;
 int g_collapsedHand = -1; // whose sleeve g_wasCollapsed refers to
+
+// Off-hand tracking (always-visible off hand, BioVR port): where the cluster
+// the drive does NOT own this frame goes. Stored rather than passed so the
+// Route B re-drive (pose-writer hook) replays the same off-hand target.
+bool g_offTrack = false;
+GamePose g_offGp{};
+// Held on the gun (two-handed grip): the off hand also follows what the
+// ENGINE's own off hand is doing relative to the gun - pumping the shotgun,
+// cranking the chemical thrower - as a delta from that hand's settled pose.
+bool g_offFollow = false;
+// v2 (the first cut followed the sway-killed REFERENCE, which only tracks an
+// animation in bursts and freezes it mid-stroke): follow the engine's LIVE
+// pose, read every time the engine re-evaluates, against a REST pose that is
+// only accepted after the hand has held still for a moment.
+Qts g_live[2];       // [0] engine left wrist, [1] weapon attach, latest engine write
+bool g_liveValid = false;
+Qts g_followBase[2]; // the rest pose the delta is measured from
+bool g_followBaseValid = false;
+// v3: the whole engine left hand (live) and its shape at rest. The held hand
+// is drawn from the REST shape - a closed grip on the gun - and only moved by
+// the engine's wrist motion, so an animation that relaxes the engine's
+// fingers (or a sway-kill reference caught mid-stroke) cannot open the palm.
+Qts g_liveL[kMaxBones];
+Qts g_gripShape[kMaxBones];
+bool g_gripShapeValid = false;
+Qts g_restCand[2];   // candidate rest pose, and since when it has held
+uint64_t g_restCandMs = 0;
+constexpr float kRestHoldUu = 1.0f;     // idle sway is sub-UU (session 20)
+constexpr uint64_t kRestHoldMs = 300;   // shorter than any pump pause
+// The off hand's NEUTRAL pose (relaxed, open): the engine's own plasmid-hand
+// idle, captured whenever the plasmid hand is raised and settled, saved to
+// offhand_neutral.ini so it is there from the next launch. Used for the free
+// off hand in weapon mode instead of the engine's grip-the-fore-end shape;
+// the gripped hand keeps the grip shape.
+Qts g_neutral[kMaxBones];
+bool g_neutralValid = false;
+bool g_neutralLoaded = false;
+bool g_neutralSaved = false;
+uint64_t g_neutralSince = 0;
+bool g_neutralTaken = false; // this raise already captured
+
+void neutral_path(wchar_t* out, size_t n) {
+    swprintf_s(out, n, L"%s\\offhand_neutral.ini", bvr::log::data_dir());
+}
+
+void load_neutral() {
+    g_neutralLoaded = true;
+    wchar_t path[MAX_PATH];
+    neutral_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    char line[256];
+    int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        int idx = -1;
+        Qts b{};
+        if (sscanf_s(line, "%d %f %f %f %f %f %f %f %f %f %f", &idx, &b.p[0], &b.p[1], &b.p[2],
+                     &b.q[0], &b.q[1], &b.q[2], &b.q[3], &b.s[0], &b.s[1], &b.s[2]) == 11 &&
+            idx >= 0 && idx < kMaxBones) {
+            g_neutral[idx] = b;
+            ++n;
+        }
+    }
+    fclose(f);
+    g_neutralValid = n > 0;
+}
+
+void save_neutral(int first, int last) {
+    wchar_t path[MAX_PATH];
+    neutral_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "# off-hand neutral pose (engine plasmid-hand idle): bone p q s\n");
+    for (int i = first; i <= last; ++i) {
+        const Qts& b = g_neutral[i];
+        fprintf(f, "%d %.4f %.4f %.4f %.6f %.6f %.6f %.6f %.4f %.4f %.4f\n", i, b.p[0], b.p[1],
+                b.p[2], b.q[0], b.q[1], b.q[2], b.q[3], b.s[0], b.s[1], b.s[2]);
+    }
+    fclose(f);
+    BVR_LOG("[bones] off-hand neutral pose captured and saved");
+}
 
 void* g_cacheSkelInst = nullptr;
 uint64_t g_cacheMs = 0;
@@ -813,6 +895,7 @@ void init(const bvr::pattern_scan::ProcessImage& image) {
 }
 
 void on_world_change() {
+    g_offTrack = false;
     if (g_skelInst) BVR_LOG("[bones] world changed - skeleton cache cleared");
     g_skelInst = nullptr;
     g_bones = nullptr;
@@ -837,6 +920,7 @@ void on_world_change() {
 }
 
 void release(const char* why) {
+    g_offTrack = false;
     // NEVER write without a live skeleton. on_world_change() nulls these the
     // moment a level swap is seen, so this is the interlock that makes the
     // call safe from any site: without it, a release on the world-change frame
@@ -1041,6 +1125,186 @@ bool barrel_ref_axis(float d0[3]) {
     return true;
 }
 
+// One cluster, moved rigidly: rotate its reference pose by qtc about its
+// reference anchor point, then put the anchor point at ptc. Appends every write
+// to the reapply cache (the caller resets it once per drive).
+bool rigid_cluster(int hand, int first, int last, int anchor, const float ptc[3],
+                   const float qtc[4], const Qts* src = g_ref) {
+    // Rigid move: rotate the reference cluster by qtc about the reference
+    // anchor point, then put the anchor point at the target. Every write is
+    // also cached for reapply() - the stereo second pass must be able to
+    // restore this exact set after the engine re-evaluates over it.
+    const float* pa = src[anchor].p;
+    // Viewmodel scale (session 61, see the g_scale block comment): the
+    // anchor-relative translations shrink by s for every cluster bone - the
+    // cluster scales ABOUT THE ANCHOR, so the anchor write-loc is unchanged
+    // by s (the proof metric) - and the .s channel is written only for
+    // mode-selected bones, from the PINNED reference, never adopted back.
+    // On the off edge (s back to 1.0, mode change) the authored scale is
+    // written back explicitly - the engine cannot be relied on to
+    // re-evaluate while the drive keeps clearing the dirty flag (the sleeve
+    // collapse learned the same lesson).
+    const float s = g_scale[hand].load(std::memory_order_relaxed);
+    const bool scaling = s != 1.0f;
+    const int sMode = g_scaleMode.load(std::memory_order_relaxed);
+    for (int i = first; i <= last; ++i) {
+        float rel[3] = {(src[i].p[0] - pa[0]) * s, (src[i].p[1] - pa[1]) * s,
+                        (src[i].p[2] - pa[2]) * s};
+        float rot[3];
+        qts_rotate(qtc, rel, rot);
+        float p[3] = {ptc[0] + rot[0], ptc[1] + rot[1], ptc[2] + rot[2]};
+        float q[4];
+        quat_mul(qtc, src[i].q, q);
+        if (!write_n(g_bones[i].p, p, 12) || !write_n(g_bones[i].q, q, 16)) {
+            g_skelInst = nullptr; // faulted mid-write: revalidate next frame
+            g_cacheMs = 0;
+            return false;
+        }
+        bool wantS = scaling && scale_selects(sMode, hand, i, first);
+        float sv[3];
+        if (wantS) {
+            sv[0] = g_ref[i].s[0] * s;
+            sv[1] = g_ref[i].s[1] * s;
+            sv[2] = g_ref[i].s[2] * s;
+            if (write_n(g_bones[i].s, sv, 12)) {
+                memcpy(g_lastWrittenS[i], sv, 12);
+                g_scaleWrote[i] = true;
+            } else {
+                wantS = false;
+            }
+        } else if (g_scaleWrote[i]) {
+            write_n(g_bones[i].s, g_ref[i].s, 12); // off edge: authored back
+            g_scaleWrote[i] = false;
+        }
+        CachedBone& cb = g_cache[g_cacheCount++];
+        cb.idx = i;
+        memcpy(cb.p, p, 12);
+        memcpy(cb.q, q, 16);
+        cb.writeScale = wantS;
+        if (wantS) memcpy(cb.s, sv, 12);
+    }
+
+    return true;
+}
+
+// World target -> component space against the hands actor (same algebra as
+// drive(); see the frame note there).
+bool target_to_component(const GamePose& gp, const float qaInv[4], const float actorLoc[3],
+                         float ptc[3], float qtc[4]) {
+    float qt[4];
+    ue_rot_to_quat(gp.rot, qt);
+    quat_mul(qaInv, qt, qtc);
+    float dWorld[3] = {gp.loc.x - actorLoc[0], gp.loc.y - actorLoc[1], gp.loc.z - actorLoc[2]};
+    qts_rotate(qaInv, dWorld, ptc);
+    return ptc[0] * ptc[0] + ptc[1] * ptc[1] + ptc[2] * ptc[2] <= 500.0f * 500.0f;
+}
+
+// The OFF hand, tracked (BioVR's always-visible free hand): its cluster goes
+// to g_offGp with the same rigid move, its sleeve collapses like the driven
+// one. The WEAPON cluster as the off hand (plasmid raised) keeps the holstered
+// gun hidden: bone 43 parks far below by translation (never scale - see the
+// hide block in drive()) and 44 collapses, then the cluster counts as hidden
+// so the normal restore runs when that hand becomes the driven one again.
+bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool collapse,
+                    const float qtcMain[4]) {
+    int first = 0, last = 0, anchor = 0;
+    cluster_of(ih, &first, &last, &anchor);
+    if (first < 0 || last >= g_boneCount || anchor < first || anchor > last) return false;
+    float ptc[3], qtc[4];
+    if (!target_to_component(g_offGp, qaInv, actorLoc, ptc, qtc)) return false;
+    if (g_offFollow && ih == 0 && g_followBaseValid && g_liveValid) {
+        // v3: the engine hand's motion measured in the GUN's frame (bone 43,
+        // which the engine animates too - the gun tilts through a pump), then
+        // re-applied in the frame the gun is actually DRAWN in
+        // (G = qtcMain * ref43.q). The first cut measured in raw component
+        // space and applied the drawn frame on top, so any gun rotation in the
+        // animation was counted twice or not at all.
+        const Qts& w = g_live[0];
+        const Qts& a = g_live[1];
+        const Qts& w0 = g_followBase[0];
+        const Qts& a0 = g_followBase[1];
+        float ai[4], a0i[4];
+        quat_conj(a.q, ai);
+        quat_conj(a0.q, a0i);
+        const float rw[3] = {w.p[0] - a.p[0], w.p[1] - a.p[1], w.p[2] - a.p[2]};
+        const float rw0[3] = {w0.p[0] - a0.p[0], w0.p[1] - a0.p[1], w0.p[2] - a0.p[2]};
+        float l[3], l0[3];
+        qts_rotate(ai, rw, l);
+        qts_rotate(a0i, rw0, l0);
+        float d[3] = {l[0] - l0[0], l[1] - l0[1], l[2] - l0[2]};
+        const float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        constexpr float kMaxFollowUu = 40.0f; // a pump stroke, never an equip swing
+        if (len > kMaxFollowUu)
+            for (float& c : d) c *= kMaxFollowUu / len;
+        // The gun mesh is drawn at the weapon-scale lane's size, so its moving
+        // parts travel that much less than the authored hand does.
+        const float ws = g_wScale.load(std::memory_order_relaxed);
+        for (float& c : d) c *= ws;
+        float G[4];
+        quat_mul(qtcMain, g_ref[patterns::kBoneWeaponAttach].q, G);
+        float dc[3];
+        qts_rotate(G, d, dc);
+        ptc[0] += dc[0];
+        ptc[1] += dc[1];
+        ptc[2] += dc[2];
+        // Orientation: the wrist's rotation relative to the gun, now vs rest,
+        // carried into the drawn gun frame: D = G (r r0^-1) G^-1, r = a^-1 w.
+        float r[4], r0[4], r0i[4], dr[4], t1[4], Gi[4], D[4], q2[4];
+        quat_mul(ai, w.q, r);
+        quat_mul(a0i, w0.q, r0);
+        quat_conj(r0, r0i);
+        quat_mul(r, r0i, dr);
+        quat_mul(G, dr, t1);
+        quat_conj(G, Gi);
+        quat_mul(t1, Gi, D);
+        quat_mul(D, qtc, q2);
+        memcpy(qtc, q2, sizeof q2);
+    }
+    const bool relaxed = ih == 0 && !g_offFollow && g_neutralValid;
+    const bool gripShape = ih == 0 && g_offFollow && g_gripShapeValid;
+    if (!rigid_cluster(ih, first, last, anchor, ptc, qtc,
+                       relaxed ? g_neutral : gripShape ? g_gripShape : g_ref))
+        return false;
+    static const float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (collapse) {
+        const int* sleeve = ih == 1 ? patterns::kBoneRSleeve : patterns::kBoneLSleeve;
+        const size_t n = ih == 1 ? _countof(patterns::kBoneRSleeve) : _countof(patterns::kBoneLSleeve);
+        for (size_t k = 0; k < n; ++k) {
+            const int idx = sleeve[k];
+            if (idx >= g_boneCount) continue;
+            write_n(g_bones[idx].p, ptc, 12);
+            write_n(g_bones[idx].s, kZero, 12);
+            if (g_cacheSleeveCount < static_cast<int>(_countof(g_cacheSleeve))) {
+                CachedSleeve& cs = g_cacheSleeve[g_cacheSleeveCount++];
+                cs.idx = idx;
+                memcpy(cs.p, ptc, 12);
+                memcpy(cs.s, kZero, 12);
+            }
+        }
+    }
+    if (ih == 1) {
+        static const float kFarBelow[3] = {0.0f, 0.0f, -5000.0f};
+        const int att = patterns::kBoneWeaponAttach, tip = patterns::kBoneRClusterLast;
+        auto hide = [&](int idx, const float* p, bool scale) {
+            if (idx < 0 || idx >= g_boneCount) return;
+            write_n(g_bones[idx].p, p, 12);
+            if (scale) write_n(g_bones[idx].s, kZero, 12);
+            g_scaleWrote[idx] = false;
+            if (g_cacheHiddenCount < static_cast<int>(_countof(g_cacheHidden))) {
+                CachedHidden& ch = g_cacheHidden[g_cacheHiddenCount++];
+                ch.idx = idx;
+                memcpy(ch.p, p, 12);
+                memcpy(ch.s, kZero, 12);
+                ch.writeScale = scale;
+            }
+        };
+        hide(att, kFarBelow, false);
+        if (tip != att) hide(tip, ptc, true);
+        g_hiddenHand = 1;
+    }
+    return true;
+}
+
 bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int hand) {
     // Telemetry window: opened here (the once-per-frame pass-1 path) so every
     // module's lines for one sample land together in the log.
@@ -1084,6 +1348,15 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         Qts fresh[kMaxBones];
         if (!read_n(g_bones, fresh, sizeof(Qts) * static_cast<size_t>(g_boneCount)))
             return false;
+        if (patterns::kBoneLWrist < g_boneCount && patterns::kBoneWeaponAttach < g_boneCount) {
+            g_live[0] = fresh[patterns::kBoneLWrist];
+            g_live[1] = fresh[patterns::kBoneWeaponAttach];
+            g_liveValid = true;
+            int lf = 0, ll = 0, la = 0;
+            cluster_of(0, &lf, &ll, &la);
+            for (int i = lf; i <= ll && i < g_boneCount; ++i)
+                if (i >= 0) g_liveL[i] = fresh[i];
+        }
         bool adopt = true;
         if (g_refValid && g_swayKill.load(std::memory_order_relaxed)) {
             adopt = false;
@@ -1142,13 +1415,84 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         }
     }
 
+    // Follow rest pose: the live wrist-to-gun relation, accepted as REST once
+    // it has stayed within kRestHoldUu for kRestHoldMs. A pump or crank keeps
+    // moving, so the rest from before the stroke stays in force through it.
+    // Never while firing or just after: the chemical thrower's trigger lever
+    // stays DOWN for as long as you fire, and a shotgun pump follows the shot -
+    // both would otherwise be accepted as the new rest after 300 ms and the
+    // hand would spring back off them.
+    static uint64_t s_lastTriggerMs = 0;
+    {
+        uint8_t lt = 0, rt = 0;
+        bvr::input::last_composed_triggers(&lt, &rt);
+        if (rt >= 30) s_lastTriggerMs = GetTickCount64();
+    }
+    const bool firingWindow = GetTickCount64() - s_lastTriggerMs < 1000;
+    if (g_liveValid && firingWindow) g_restCandMs = 0; // restart the hold once it ends
+    if (g_liveValid && !firingWindow) {
+        const uint64_t nowR = GetTickCount64();
+        auto rel_dist = [](const Qts* a, const Qts* b) {
+            float d2 = 0.0f;
+            for (int k = 0; k < 3; ++k) {
+                const float d = (a[0].p[k] - a[1].p[k]) - (b[0].p[k] - b[1].p[k]);
+                d2 += d * d;
+            }
+            return sqrtf(d2);
+        };
+        if (!g_restCandMs || rel_dist(g_live, g_restCand) > kRestHoldUu) {
+            g_restCand[0] = g_live[0];
+            g_restCand[1] = g_live[1];
+            g_restCandMs = nowR;
+        } else if (nowR - g_restCandMs >= kRestHoldMs) {
+            g_followBase[0] = g_live[0];
+            g_followBase[1] = g_live[1];
+            g_followBaseValid = true;
+            // The grip shape is taken only while the weapon hand is raised:
+            // that is when the engine's left hand is the one on the gun.
+            if (hand == 1) {
+                int lf = 0, ll = 0, la = 0;
+                cluster_of(0, &lf, &ll, &la);
+                for (int i = lf; i <= ll && i < g_boneCount; ++i)
+                    if (i >= 0) g_gripShape[i] = g_liveL[i];
+                g_gripShapeValid = true;
+            }
+        }
+    }
+
+    // Neutral capture (v2: the first cut waited for the sway kill to report
+    // SETTLED, which a looping plasmid idle never does): once the plasmid hand
+    // has been up for 1.2 s and is not casting, take its pose. Re-taken on
+    // every raise; saved the first time each session.
+    if (!g_neutralLoaded) load_neutral();
+    if (hand == 0 && g_refValid) {
+        uint8_t lt = 0, rt = 0;
+        bvr::input::last_composed_triggers(&lt, &rt);
+        const uint64_t nowN = GetTickCount64();
+        if (!g_neutralSince) g_neutralSince = nowN;
+        if (lt >= 30) g_neutralSince = nowN; // casting: wait for the hand to settle again
+        if (!g_neutralTaken && nowN - g_neutralSince > 1200) {
+            g_neutralTaken = true;
+            for (int i = first; i <= last; ++i) g_neutral[i] = g_ref[i];
+            g_neutralValid = true;
+            if (!g_neutralSaved) {
+                g_neutralSaved = true;
+                save_neutral(first, last);
+            }
+        }
+    } else {
+        g_neutralSince = 0;
+        g_neutralTaken = false;
+    }
+
     // Hide-inactive bookkeeping, BEFORE the rigid write: if the hand about to
     // be driven is the one currently collapsed (hand switch), or the feature
     // just turned off, restore it from the reference first - the rigid write
     // below sets p/q but never touches .s, so a zero scale left behind would
     // keep the incoming hand invisible.
     bool hideInactive = g_hideInactive.load(std::memory_order_relaxed);
-    if (g_hiddenHand >= 0 && (!hideInactive || g_hiddenHand == hand)) {
+    const bool offTrack = hideInactive && g_offTrack;
+    if (g_hiddenHand >= 0 && (!hideInactive || g_hiddenHand == hand || offTrack)) {
         restore_hidden(g_hiddenHand);
         g_hiddenHand = -1;
     }
@@ -1231,61 +1575,9 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
                 g_lockSkips.load(std::memory_order_relaxed));
     }
 
-    // Rigid move: rotate the reference cluster by qtc about the reference
-    // anchor point, then put the anchor point at the target. Every write is
-    // also cached for reapply() - the stereo second pass must be able to
-    // restore this exact set after the engine re-evaluates over it.
     g_cacheCount = 0;
     g_cacheSleeveCount = 0;
-    const float* pa = g_ref[anchor].p;
-    // Viewmodel scale (session 61, see the g_scale block comment): the
-    // anchor-relative translations shrink by s for every cluster bone - the
-    // cluster scales ABOUT THE ANCHOR, so the anchor write-loc is unchanged
-    // by s (the proof metric) - and the .s channel is written only for
-    // mode-selected bones, from the PINNED reference, never adopted back.
-    // On the off edge (s back to 1.0, mode change) the authored scale is
-    // written back explicitly - the engine cannot be relied on to
-    // re-evaluate while the drive keeps clearing the dirty flag (the sleeve
-    // collapse learned the same lesson).
-    const float s = g_scale[hand].load(std::memory_order_relaxed);
-    const bool scaling = s != 1.0f;
-    const int sMode = g_scaleMode.load(std::memory_order_relaxed);
-    for (int i = first; i <= last; ++i) {
-        float rel[3] = {(g_ref[i].p[0] - pa[0]) * s, (g_ref[i].p[1] - pa[1]) * s,
-                        (g_ref[i].p[2] - pa[2]) * s};
-        float rot[3];
-        qts_rotate(qtc, rel, rot);
-        float p[3] = {ptc[0] + rot[0], ptc[1] + rot[1], ptc[2] + rot[2]};
-        float q[4];
-        quat_mul(qtc, g_ref[i].q, q);
-        if (!write_n(g_bones[i].p, p, 12) || !write_n(g_bones[i].q, q, 16)) {
-            g_skelInst = nullptr; // faulted mid-write: revalidate next frame
-            g_cacheMs = 0;
-            return false;
-        }
-        bool wantS = scaling && scale_selects(sMode, hand, i, first);
-        float sv[3];
-        if (wantS) {
-            sv[0] = g_ref[i].s[0] * s;
-            sv[1] = g_ref[i].s[1] * s;
-            sv[2] = g_ref[i].s[2] * s;
-            if (write_n(g_bones[i].s, sv, 12)) {
-                memcpy(g_lastWrittenS[i], sv, 12);
-                g_scaleWrote[i] = true;
-            } else {
-                wantS = false;
-            }
-        } else if (g_scaleWrote[i]) {
-            write_n(g_bones[i].s, g_ref[i].s, 12); // off edge: authored back
-            g_scaleWrote[i] = false;
-        }
-        CachedBone& cb = g_cache[g_cacheCount++];
-        cb.idx = i;
-        memcpy(cb.p, p, 12);
-        memcpy(cb.q, q, 16);
-        cb.writeScale = wantS;
-        if (wantS) memcpy(cb.s, sv, 12);
-    }
+    if (!rigid_cluster(hand, first, last, anchor, ptc, qtc)) return false;
 
     // Sleeve collapse: zero scale hides the geometry; pinning the position at
     // the target keeps any residual skin inside the fist instead of smeared
@@ -1330,7 +1622,9 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     // near-plane, and zero would be 1/0), so the equipped gun is parked far
     // below the actor in component space and frustum-culled instead.
     g_cacheHiddenCount = 0;
-    if (hideInactive) {
+    bool offDone = false;
+    if (offTrack) offDone = drive_off_hand(1 - hand, qaInv, actorLoc, collapse, qtc);
+    if (hideInactive && !offDone) {
         const int ih = 1 - hand;
         int hFirst = 0, hLast = 0, hAnchor = 0;
         cluster_of(ih, &hFirst, &hLast, &hAnchor);
@@ -1367,6 +1661,13 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     g_writes.fetch_add(1, std::memory_order_relaxed);
     g_lastHand.store(hand, std::memory_order_relaxed);
     return true;
+}
+
+void set_off_follow(bool on) { g_offFollow = on; }
+
+void set_off_target(bool track, const GamePose* gp) {
+    g_offTrack = track && gp;
+    if (gp) g_offGp = *gp;
 }
 
 void reapply() {
