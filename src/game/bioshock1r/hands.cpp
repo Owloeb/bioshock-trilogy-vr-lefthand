@@ -2069,6 +2069,7 @@ void on_calcview(const FrameContext& ctx) {
         // moves to the controller instead.
         gp.loc = {loc[0], loc[1], loc[2]};
         if (hand == 1) bones::set_active_weapon(aim::active_weapon_key());
+        bones::set_anim_log(bvr::overlay::dev_tools());
         to_anchor(ctx, hand, true, gp); // grip placement: palm on your palm
         const GamePose gpPreKick = gp;  // the barrel the bullets follow (no recoil)
         ability_haptics(hand);
@@ -2082,8 +2083,24 @@ void on_calcview(const FrameContext& ctx) {
             // where the engine really spawns the flash; else bone 44 (v6).
             auto learned = hand == 1 ? g_flashY.find(g_trimKey) : g_flashY.end();
             const bool haveFlash = learned != g_flashY.end();
+            bool havePalm = false;
+            if (hand == 0) {
+                // The plasmid hand's effects hang off the ENGINE hand, which
+                // is placed at the reflection of the hand you see about this
+                // plane: through the anchor bone it put them a hand's width to
+                // the side. Through the PALM (where the casts leave) the
+                // engine palm and the visible palm are the same point - the
+                // gun's muzzle rule, applied to the hand.
+                float rel[3];
+                const float depth = g_palmDepthCm.load(std::memory_order_relaxed) *
+                                    ctx.worldScale / 100.0f;
+                if (bones::palm_in_target(0, true, depth, rel)) {
+                    muzzle[1] = rel[1];
+                    havePalm = true;
+                }
+            }
             const bool haveMuzzle =
-                haveFlash || (hand == 1 && bones::muzzle_ref_offset(muzzle));
+                havePalm || haveFlash || (hand == 1 && bones::muzzle_ref_offset(muzzle));
             if (haveFlash) muzzle[1] = learned->second;
             float shift = (haveMuzzle ? muzzle[1] : 0.0f) + trim;
             if (shift > 20.0f) shift = 20.0f; // a sane plane; never throw the rig away
@@ -2105,7 +2122,10 @@ void on_calcview(const FrameContext& ctx) {
                 _snprintf_s(note, sizeof note, _TRUNCATE,
                             "Tuning: %s | muzzle offset (%s) %.2f UU + trim %.2f%s",
                             g_trimKey.c_str(),
-                            haveFlash ? "measured flash" : haveMuzzle ? "bone 44 guess" : "none",
+                            havePalm    ? "palm"
+                            : haveFlash ? "measured flash"
+                            : haveMuzzle ? "bone 44 guess"
+                                         : "none",
                             haveMuzzle ? muzzle[1] : 0.0f, trim,
                             gunPlane ? "" : " | gun plane unavailable - head plane used");
                 bvr::vm_mirror::set_ui_note(note);
