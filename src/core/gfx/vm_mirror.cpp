@@ -56,8 +56,6 @@ std::atomic<bool> g_skipUnmatched{true};
 std::atomic<int> g_scanBytes{6144};
 std::atomic<float> g_worldScale{100.0f};
 std::atomic<float> g_maxReachM{1.3f}; // gun + hands never sit further than this
-std::atomic<float> g_reachExcM{0.0f}, g_reachExcTolM{0.0f}; // see set_reach_exception
-std::atomic<uint64_t> g_reachExcUntilMs{0};
 
 // ---- per-buffer copy of the last game upload (render thread only) ----------
 struct Entry {
@@ -189,25 +187,9 @@ bool within_reach(const Entry& e, int row) {
     const float y = e.data[row + 7] * tanV;
     const float z = e.data[row + 15];
     const float d = sqrtf(x * x + y * y + z * z);
-    const float ws = g_worldScale.load(std::memory_order_relaxed);
-    const float maxUu = g_maxReachM.load(std::memory_order_relaxed) * ws;
-    if (d <= maxUu) return true;
-    const float exc = g_reachExcM.load(std::memory_order_relaxed);
-    const uint64_t now = GetTickCount64();
-    if (exc <= 0.0f || now >= g_reachExcUntilMs.load(std::memory_order_relaxed)) return false;
-    const bool take = fabsf(d - exc * ws) <= g_reachExcTolM.load(std::memory_order_relaxed) * ws;
-    // While an exception is live, say what the reach test decided past the
-    // limit - accepted or not, and how far from the expected distance - so a
-    // first-person object still filed as world shows up as data.
-    static uint64_t s_logMs = 0;
-    static int s_logs = 0;
-    if (now - s_logMs >= 1000 && s_logs < 40) {
-        s_logMs = now;
-        ++s_logs;
-        BVR_LOG("[mirror] reach exception: draw at %.2f m (limit %.2f, expected %.2f +- %.2f) %s", d / ws,
-                maxUu / ws, exc, g_reachExcTolM.load(std::memory_order_relaxed), take ? "TAKEN" : "left as world");
-    }
-    return take;
+    const float maxUu = g_maxReachM.load(std::memory_order_relaxed) *
+                        g_worldScale.load(std::memory_order_relaxed);
+    return d <= maxUu;
 }
 
 // Reflect a draw's component->clip rows (x, y, z, w; 4 floats each) about the
@@ -504,12 +486,6 @@ PlaneMode plane_mode() {
     return static_cast<PlaneMode>(g_planeMode.load(std::memory_order_relaxed));
 }
 float plane_shift_uu() { return g_shiftUu.load(std::memory_order_relaxed); }
-void set_reach_exception(float distM, float tolM, int ttlMs) {
-    g_reachExcM.store(distM > 0.0f ? distM : 0.0f, std::memory_order_relaxed);
-    g_reachExcTolM.store(tolM, std::memory_order_relaxed);
-    g_reachExcUntilMs.store(distM > 0.0f ? GetTickCount64() + static_cast<uint64_t>(ttlMs) : 0,
-                            std::memory_order_relaxed);
-}
 void set_world_scale(float s) {
     if (s > 1.0f) g_worldScale.store(s, std::memory_order_relaxed);
 }

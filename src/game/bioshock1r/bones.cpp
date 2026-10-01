@@ -938,7 +938,77 @@ bool wskel_compose(float ws) {
     return true;
 }
 
+// ---- Translate lane: any actor's mesh offset from its origin ---------------
+// One slot (the EVE syringe). Same protocol as the weapon-scale lane: adopt
+// what the engine wrote since our last write (so its own animation keeps
+// playing), write that plus the offset, clear the evaluate-if-dirty flag.
+struct ShiftLane {
+    void* actor = nullptr;
+    void* inst = nullptr;
+    Qts* bones = nullptr;
+    int count = 0;
+    Qts anim[kMaxBones];
+    Qts written[kMaxBones];
+    bool writtenValid = false;
+};
+ShiftLane g_sh;
+
+bool shift_intact() {
+    if (!g_sh.actor || !g_sh.inst) return false;
+    Skel sk{};
+    return resolve_skel(g_sh.actor, sk) && sk.inst == g_sh.inst && sk.bones == g_sh.bones &&
+           sk.count == g_sh.count;
+}
+
 } // namespace
+
+bool skel_shift(void* actor, const float compDelta[3]) {
+    if (!actor) return false;
+    if (actor != g_sh.actor || !shift_intact()) {
+        if (g_sh.actor && actor != g_sh.actor) skel_shift_release();
+        Skel sk{};
+        if (!resolve_skel(actor, sk)) {
+            g_sh = ShiftLane{};
+            return false;
+        }
+        g_sh.actor = actor;
+        g_sh.inst = sk.inst;
+        g_sh.bones = sk.bones;
+        g_sh.count = sk.count;
+        g_sh.writtenValid = false;
+    }
+    for (int i = 0; i < g_sh.count; ++i) {
+        Qts cur{};
+        if (!read_n(&g_sh.bones[i], &cur, sizeof cur)) {
+            g_sh = ShiftLane{};
+            return false;
+        }
+        const bool engineWrote = !g_sh.writtenValid || memcmp(cur.p, g_sh.written[i].p, 12) != 0 ||
+                                 memcmp(cur.q, g_sh.written[i].q, 16) != 0;
+        if (engineWrote) g_sh.anim[i] = cur;
+        const float pp[3] = {g_sh.anim[i].p[0] + compDelta[0], g_sh.anim[i].p[1] + compDelta[1],
+                             g_sh.anim[i].p[2] + compDelta[2]};
+        if (!write_n(g_sh.bones[i].p, pp, 12)) {
+            g_sh = ShiftLane{};
+            return false;
+        }
+        memcpy(g_sh.written[i].p, pp, 12);
+        memcpy(g_sh.written[i].q, g_sh.anim[i].q, 16);
+    }
+    g_sh.writtenValid = true;
+    const uint8_t clean = 0;
+    write_n(static_cast<uint8_t*>(g_sh.inst) + patterns::kSkelInstDirtyOffset, &clean, 1);
+    return true;
+}
+
+void skel_shift_release() {
+    if (shift_intact() && g_sh.writtenValid) {
+        for (int i = 0; i < g_sh.count; ++i) write_n(g_sh.bones[i].p, g_sh.anim[i].p, 12);
+        const uint8_t dirty = 1; // let the engine rebuild from its own pose
+        write_n(static_cast<uint8_t*>(g_sh.inst) + patterns::kSkelInstDirtyOffset, &dirty, 1);
+    }
+    g_sh = ShiftLane{};
+}
 
 void init(const bvr::pattern_scan::ProcessImage& image) {
     g_imageBase = image.base;
@@ -974,6 +1044,7 @@ void on_world_change() {
     // (wskel_intact re-resolves through the dead actor and fails, so
     // wskel_drop degrades to a pointer clear, which is exactly right here).
     wskel_drop("world change");
+    g_sh = ShiftLane{}; // its skeleton died with the world: forget, never write
 }
 
 void release(const char* why) {

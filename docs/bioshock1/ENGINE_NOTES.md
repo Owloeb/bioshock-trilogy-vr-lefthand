@@ -3557,12 +3557,15 @@ attached to the hands, and pointer/TArray censuses. Four headset runs.
   last engine-refreshed transform: on the hand only when a draw coincided with a refresh (the
   plasmid raise from a gun), left behind in the world when moving or with a plasmid already up.
   The learned bHidden bit (+0xCC/0x40 on this build) never read hidden during those failures.
-- Left-handed only: with the plasmid rig mirrored, the reflection plane runs through the plasmid
-  hand, so the syringe in the weapon hand sits on its far side in engine space - past the
-  viewmodel mirror's 1.3 m reach with the hands spread. The mirror then filed its draw as world
-  ("stack-hit draw rejected by DISTANCE") and drew it unreflected, away from the hand. The holster
-  now publishes the syringe's engine distance each held frame (vm_mirror::set_reach_exception,
-  +-25 cm, 200 ms TTL). AActor::Region learned at +0x118 on this build.
+- Left-handed only, the held syringe vanished from ONE eye (the left) until the hand moved back
+  across - per-eye frustum CULLING by the actor's origin. Its engine-space position is the mirror
+  image of the hand you see, so a hypo held on your left sat for the engine out to the right, past
+  the left eye's narrower inner edge. (A distance-rejection theory was tested and disproven: the
+  mirror's reach log showed the syringe at 0.27-0.82 m, inside the 1.3 m limit, every time.) Fix,
+  the hands rig's own trick: the actor is parked 0.45 m ahead of the engine camera, centred, and
+  its 3 bones are shifted in component space onto the socket (bones::skel_shift - adopt engine
+  writes, write ref + delta, clear SkeletonInstance dirty; released when the game attaches it for
+  the injection and when it is put away). AActor::Region learned at +0x118 on this build.
   Writing `AActor::Location`/`Rotation` places it (proven: parked in front of the eyes).
 - **AHands action state** `hands+0x494`: 5 at rest, 1 while an action (cast, injection) runs.
   `hands+0x454` holds the raised plasmid's ability object (0 with a gun up) - its class names

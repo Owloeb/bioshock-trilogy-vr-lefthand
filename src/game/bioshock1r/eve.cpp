@@ -1,6 +1,5 @@
 #include "game/bioshock1r/eve.h"
 
-#include "core/gfx/vm_mirror.h"
 #include "core/input/xinput_bridge.h"
 #include "core/ui/overlay.h"
 #include "core/util/log.h"
@@ -1117,42 +1116,14 @@ bool in_reach(const float o[3], float scale) {
 
 void buzz(int role, float a, int ms) { bvr::vr::haptic_pulse(role, a, ms); }
 
+void unshift();
 void put_away(const char* why) {
     if (g_hs == Hs::Idle) return;
     if (!hypo_attached()) hypo_show(false);
     g_xQueued = false;
     g_surgeStartMs = g_surgeLandMs = 0;
+    unshift();
     set_state(Hs::Idle, why);
-}
-
-// ---- The left-handed mirror must take the syringe ---------------------------
-// Left-handed, the viewmodel mirror reflects every first-person draw within
-// 1.3 m of the camera (the limit that keeps world meshes on the same skinning
-// path out). With the plasmid raised the reflection plane runs through the
-// plasmid hand, so the syringe in the other hand sits on the far side of it in
-// ENGINE space - usually inside 1.3 m, past it with the hands spread. Past it,
-// the mirror filed the syringe as world and drew it unreflected, away from the
-// hand: the rare left-handed-only vanish (right-handed has no mirror). Each
-// frame it is held, tell the mirror where to expect it - only a draw at that
-// distance (+-25 cm) gets past the limit, for 200 ms.
-int g_reachLogs = 0;
-void mirror_expect(uint64_t now) {
-    if (!g_tg.socketOk) return;
-    float eye[3];
-    int32_t er[3];
-    if (!camera::driven_eye_cam(0, eye, er)) return;
-    float d[3];
-    v3_sub(g_tg.socket, eye, d);
-    const float m = sqrtf(v3_dot(d, d)) / g_tg.worldScale;
-    bvr::vm_mirror::set_reach_exception(m, 0.25f, 200);
-    static uint64_t s_loggedDraw = 0; // once per draw, at most 20 per session
-    if (m > 1.25f && s_loggedDraw != g_heldSinceMs && g_reachLogs < 20) {
-        s_loggedDraw = g_heldSinceMs;
-        ++g_reachLogs;
-        BVR_LOG("[eve] held syringe is %.2f m from the engine camera (mirror reach 1.3 m) %llu ms into the "
-                "draw - the mirror is told to take it",
-                m, static_cast<unsigned long long>(now - g_heldSinceMs));
-    }
 }
 
 // ---- The syringe's ZONE, kept with the player's ----------------------------
@@ -1216,20 +1187,39 @@ void sync_zone(uint64_t now) {
 
 // Place the syringe on the weapon hand's gun socket - the same pose the game
 // gives it when it attaches it there for its own injection.
-void place_hypo() {
-    if (!g_tg.socketOk || !g_hypo || hypo_attached()) return;
-    int32_t rot[3];
-    basis_to_rot(g_tg.sockF, g_tg.sockU, rot);
-    uint8_t* a = static_cast<uint8_t*>(g_hypo);
-    write_block(a + patterns::kActorLocOffset, g_tg.socket, 12);
-    write_block(a + patterns::kActorRotOffset, rot, 12);
+//
+// The ACTOR is parked a little in front of the engine camera and its MESH is
+// shifted onto the socket through its bones (bones::skel_shift). The engine
+// culls by the actor's origin, per eye: left-handed, the socket in engine
+// space is the mirror image of where you see the hand, so a hypo held on your
+// left sat, for the engine, out to your right - past the left eye's narrower
+// inner edge - and the left eye dropped it until the hand moved back across
+// (the "gone in one eye" report; right-handed there is no mirror image to
+// lose). The hands rig survives the same thing by keeping its origin at the
+// eye. Without a skeleton to shift, the actor goes on the socket as before.
+bool g_shiftOk = false;              // the syringe's bones carry our offset right now
+bool g_shiftLogged[2] = {false, false}; // [0] no skeleton, [1] shifted - once each per session
+void park_point(float out[3]) {
+    float e0[3], e1[3];
+    int32_t r0[3], r1[3];
+    const bool ok0 = camera::driven_eye_cam(0, e0, r0), ok1 = camera::driven_eye_cam(1, e1, r1);
+    if (!ok0 && !ok1) {
+        memcpy(out, g_tg.socket, 12);
+        return;
+    }
+    float e[3];
+    const int32_t* r = ok0 ? r0 : r1;
+    for (int i = 0; i < 3; ++i) e[i] = ok0 && ok1 ? (e0[i] + e1[i]) * 0.5f : (ok0 ? e0[i] : e1[i]);
+    const float pitch = r[0] * (6.2831853f / 65536.0f), yaw = r[1] * (6.2831853f / 65536.0f);
+    const float f[3] = {cosf(pitch) * cosf(yaw), cosf(pitch) * sinf(yaw), sinf(pitch)};
+    const float d = 0.45f * g_tg.worldScale; // inside both eyes, short of the needle's reach
+    for (int i = 0; i < 3; ++i) out[i] = e[i] + f[i] * d;
+}
+void mark_moved(uint8_t* a) {
     // The engine renders an actor from a CACHED transform: a raw Location /
     // Rotation write is not drawn until the actor is marked changed - the
     // dirty protocol AActor::SetDrawScale uses (ENGINE_NOTES "DrawScale,
-    // finally"). Without it the syringe stayed wherever the last engine-side
-    // refresh left it: on the hand only when a draw happened to coincide with
-    // one (standing still, gun up, the plasmid raise refreshing it), back in
-    // the world when moving or drawn with a plasmid already up.
+    // finally").
     uint32_t flags = 0, rev = 0;
     if (read_block(a + patterns::kActorDirtyFlagsOffset, &flags, 4)) {
         flags |= 0x10;
@@ -1241,6 +1231,45 @@ void place_hypo() {
     }
     const uint8_t zero = 0;
     write_block(a + patterns::kActorDirtyByteOffset, &zero, 1);
+}
+void place_hypo() {
+    if (!g_tg.socketOk || !g_hypo || hypo_attached()) return;
+    uint8_t* a = static_cast<uint8_t*>(g_hypo);
+    int32_t rot[3];
+    basis_to_rot(g_tg.sockF, g_tg.sockU, rot);
+    float park[3];
+    park_point(park);
+    // Socket relative to the parked origin, in the actor's own axes (UE:
+    // X forward, Y right = up x forward, Z up), over its DrawScale.
+    const float* f = g_tg.sockF;
+    const float* u = g_tg.sockU;
+    const float r[3] = {u[1] * f[2] - u[2] * f[1], u[2] * f[0] - u[0] * f[2], u[0] * f[1] - u[1] * f[0]};
+    float w[3];
+    v3_sub(g_tg.socket, park, w);
+    float ds = 1.0f;
+    if (!read_block(a + patterns::kActorDrawScaleOffset, &ds, 4) || !(ds > 0.01f && ds < 100.0f)) ds = 1.0f;
+    const float comp[3] = {v3_dot(w, f) / ds, v3_dot(w, r) / ds, v3_dot(w, u) / ds};
+    const bool shifted = bones::skel_shift(g_hypo, comp);
+    g_shiftOk = shifted;
+    if (!g_shiftLogged[shifted ? 1 : 0]) {
+        g_shiftLogged[shifted ? 1 : 0] = true;
+        BVR_LOG("[eve] syringe mesh %s (DrawScale %.2f)",
+                shifted ? "shifted onto the hand from a parked origin - no per-eye culling"
+                        : "has no skeleton to shift - placed on the socket itself",
+                ds);
+    }
+    write_block(a + patterns::kActorLocOffset, shifted ? park : g_tg.socket, 12);
+    write_block(a + patterns::kActorRotOffset, rot, 12);
+    mark_moved(a);
+}
+
+// Hand the syringe's bones back - when the game takes it for its own
+// injection (it attaches the actor to the socket; a mesh still carrying our
+// offset would hang off to the side) and when it goes back in the holster.
+void unshift() {
+    if (!g_shiftOk) return;
+    bones::skel_shift_release();
+    g_shiftOk = false;
 }
 
 // The needle tip: down the syringe's axis from the grip (its mesh runs along
@@ -1501,7 +1530,6 @@ void holster_tick() {
         }
         keep_shown(now);
         sync_zone(now);
-        mirror_expect(now);
         place_hypo();
         const bool in = rigNow && needle_in_arm(g_hs == Hs::In ? 1.5f : 1.0f);
         if (in && g_hs == Hs::Held) {
@@ -1528,7 +1556,6 @@ void holster_tick() {
             keep_shown(now);
             sync_zone(now);
         }
-        mirror_expect(now);
         place_hypo();
         if (now - g_lastBuzzMs > 110 && now - g_stateMs < 450) { // the rush fading out
             g_lastBuzzMs = now;
@@ -1540,6 +1567,7 @@ void holster_tick() {
             g_shown = true;
             hypo_show(false);
             g_surgeStartMs = g_surgeLandMs = 0;
+            unshift();
             set_state(Hs::Idle, "put away");
         }
         break;
@@ -1547,7 +1575,6 @@ void holster_tick() {
     case Hs::Injecting: {
         bvr::vr::reserve_grip_bumper(1, true);
         supRt = true;
-        mirror_expect(now); // the game holds it on the same socket
         // X only reaches a game that can act on it: plasmid raised AND the
         // hands at rest. Pressed while the plasmid is still coming up (a draw
         // with a gun out, or mid-run) the game drops it - the log had one
@@ -1577,8 +1604,12 @@ void holster_tick() {
             BVR_LOG("[eve] injection: the hands never came to rest with the plasmid up (hand %d, action %d)",
                     hands::active_hand(), action);
         }
-        if (hypo_attached()) g_sawAttach = true;
-        else place_hypo(); // until the game takes it over
+        if (hypo_attached()) {
+            g_sawAttach = true;
+            unshift(); // the game drives it from the socket now
+        } else {
+            place_hypo(); // until the game takes it over
+        }
         if (now - g_lastBuzzMs > 120) { // a pulse that swells with the plunge
             g_lastBuzzMs = now;
             const float ramp = g_surgeStartMs ? fminf(1.0f, (now - g_surgeStartMs) / 1500.0f) : 0.0f;

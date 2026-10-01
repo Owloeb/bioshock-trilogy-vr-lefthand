@@ -192,6 +192,15 @@ float scale(int hand);
 void set_weapon_scale(float ws);
 float weapon_scale();
 void wskel_drive();
+
+// Translate lane (one slot, the EVE syringe): move an actor's whole mesh by
+// compDelta (COMPONENT space, UU) off its origin, every frame, while its own
+// animation keeps playing. The renderer culls an actor by its ORIGIN, not its
+// posed bones - the same fact that keeps the hands rig (origin at the eye)
+// visible - so an actor parked in view with its mesh shifted onto a hand is
+// never culled. skel_shift_release() hands the bones back.
+bool skel_shift(void* actor, const float compDelta[3]);
+void skel_shift_release();
 void wskel_release(const char* why);
 
 // Session 20: freeze the drive's reference against the idle animation's
