@@ -34,6 +34,15 @@ bool read_block(const void* src, void* out, size_t n) {
     }
 }
 
+bool write_block(void* dst, const void* in, size_t n) {
+    __try {
+        memcpy(dst, in, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 std::string class_of(const void* obj) {
     if (!obj) return "(none)";
     const wchar_t* w = patterns::object_class_name(obj);
@@ -59,15 +68,30 @@ struct Watch {
     bool havePrev = false;
     uint64_t boundMs = 0, windowMs = 0;
 };
-Watch g_watch[9] = {{"pawn", 0x1000 / 4}, {"pc", 0x1000 / 4}, {"hands", 0x800 / 4},
-                    {"holdable", 0x800 / 4}, {"hypo", 0x800 / 4}, {"linkA", 0x800 / 4},
-                    {"linkB", 0x800 / 4}, {"linkC", 0x800 / 4}, {"linkD", 0x800 / 4}};
+constexpr int kLinks = 8;
+Watch g_watch[5 + kLinks] = {{"pawn", 0x1000 / 4}, {"pc", 0x1000 / 4}, {"hands", 0x800 / 4},
+                             {"holdable", 0x800 / 4}, {"hypo", 0x800 / 4},
+                             {"item0", 0x400 / 4}, {"item1", 0x400 / 4}, {"item2", 0x400 / 4},
+                             {"item3", 0x400 / 4}, {"item4", 0x400 / 4}, {"item5", 0x400 / 4},
+                             {"item6", 0x400 / 4}, {"item7", 0x400 / 4}};
+// Research offsets on the syringe actor (from probe v2; they move into
+// patterns.h with ENGINE_NOTES once the feature uses them):
+//   +0x0B0 the actor it rides (PlayerHands while injecting, else 0)
+//   +0x0D0 flag word; bit 0x100000 is SET while it is put away
+//   +0x0F0 FName index of the bone it hangs from
+[[maybe_unused]] constexpr uint32_t kHypoBaseOff = 0x0B0;
+constexpr uint32_t kHypoFlagsOff = 0x0D0, kHypoBoneOff = 0x0F0;
+constexpr uint32_t kHypoHiddenBit = 0x100000;
+std::atomic<bool> g_showTest{false};
+bool g_showWas = false;
+uint32_t g_flagsSaved = 0;
+float g_locSaved[3] = {};
 // The syringe actor (BioAmmoHypoTool), learned from its attach.
 void* g_hypo = nullptr;
 bool g_hypoDumped = false;
 // Objects linked from the pawn / controller / syringe whose class reads like
 // inventory (ammo, hypo, EVE, bio, inventory) - the hypo COUNT lives in one.
-void* g_link[4] = {};
+void* g_link[kLinks] = {};
 int g_linkCount = 0;
 void* g_censused[8];
 int g_censusCount = 0;
@@ -97,9 +121,10 @@ void census(void* obj, const char* name, uint32_t bytes) {
         char b[96];
         _snprintf_s(b, sizeof b, _TRUNCATE, " +0x%03X=%s", i * 4, cls.c_str());
         if (line.size() < 1800) line += b;
-        const bool inv = lower_has(cls, "ammo") || lower_has(cls, "hypo") || lower_has(cls, "eve") ||
-                         lower_has(cls, "bio") || lower_has(cls, "invent");
-        if (inv && p != g_hypo && g_linkCount < 4) {
+        const bool inv = (lower_has(cls, "ammo") || lower_has(cls, "hypo") || lower_has(cls, "eve") ||
+                          lower_has(cls, "bio")) &&
+                         !lower_has(cls, "level") && !lower_has(cls, "subsystem") && !lower_has(cls, "tool");
+        if (inv && p != g_hypo && g_linkCount < kLinks) {
             bool dup = false;
             for (int k = 0; k < g_linkCount; ++k) dup |= g_link[k] == p;
             if (!dup) {
@@ -109,6 +134,76 @@ void census(void* obj, const char* name, uint32_t bytes) {
         }
     }
     BVR_LOG("[eve] %s links:%s", name, line.c_str());
+}
+
+// TArray<UObject*> fields {data, count, max} of `obj`: log every element's
+// class and adopt the ammo/hypo/EVE-looking ones as watches (the inventory
+// manager keeps its items in lists like these).
+void census_arrays(void* obj, const char* name, uint32_t bytes) {
+    if (!obj) return;
+    uint32_t w[0x800 / 4];
+    if (!read_block(obj, w, bytes)) return;
+    for (uint32_t i = 0; i + 2 < bytes / 4; ++i) {
+        const uint32_t data = w[i], n = w[i + 1], mx = w[i + 2];
+        if (data < 0x10000 || (data & 3) || n == 0 || n > 256 || mx < n || mx > 4096) continue;
+        uint32_t el[256];
+        if (!read_block(reinterpret_cast<void*>(static_cast<uintptr_t>(data)), el, n * 4)) continue;
+        int objs = 0;
+        std::string line;
+        for (uint32_t k = 0; k < n; ++k) {
+            void* p = reinterpret_cast<void*>(static_cast<uintptr_t>(el[k]));
+            if (el[k] < 0x10000 || !patterns::object_class_name(p)) continue;
+            ++objs;
+            const std::string cls = class_of(p);
+            char b[80];
+            _snprintf_s(b, sizeof b, _TRUNCATE, " [%u]%s", k, cls.c_str());
+            if (line.size() < 1500) line += b;
+            const bool inv = lower_has(cls, "ammo") || lower_has(cls, "hypo") || lower_has(cls, "eve") ||
+                             lower_has(cls, "bio") || lower_has(cls, "med");
+            if (inv && p != g_hypo && g_linkCount < kLinks) {
+                bool dup = false;
+                for (int j = 0; j < g_linkCount; ++j) dup |= g_link[j] == p;
+                if (!dup) {
+                    g_link[g_linkCount++] = p;
+                    BVR_LOG("[eve] watching item%d = %s (%s+0x%03X[%u])", g_linkCount - 1, cls.c_str(),
+                            name, i * 4, k);
+                }
+            }
+        }
+        if (objs) BVR_LOG("[eve] %s+0x%03X array of %u:%s", name, i * 4, n, line.c_str());
+    }
+}
+
+// Test: un-hide the syringe and park it 40 UU in front of the left eye, every
+// frame, to see whether the mod can show it on its own (the whole design
+// rests on this). Restores the flags and location when switched off.
+void show_test() {
+    const bool on = g_showTest.load() && g_hypo;
+    uint8_t* h = static_cast<uint8_t*>(g_hypo);
+    if (on && !g_showWas) {
+        read_block(h + kHypoFlagsOff, &g_flagsSaved, 4);
+        read_block(h + patterns::kActorLocOffset, g_locSaved, 12);
+        BVR_LOG("[eve] show test ON (flags 0x%X)", g_flagsSaved);
+    }
+    if (!on && g_showWas && h) {
+        write_block(h + kHypoFlagsOff, &g_flagsSaved, 4);
+        write_block(h + patterns::kActorLocOffset, g_locSaved, 12);
+        BVR_LOG("[eve] show test off - restored");
+    }
+    g_showWas = on;
+    if (!on) return;
+    float eye[3];
+    int32_t rot[3];
+    if (!camera::driven_eye_cam(0, eye, rot)) return;
+    const float yaw = rot[1] * (3.14159265f / 32768.0f), pitch = rot[0] * (3.14159265f / 32768.0f);
+    const float f[3] = {cosf(pitch) * cosf(yaw), cosf(pitch) * sinf(yaw), sinf(pitch)};
+    const float loc[3] = {eye[0] + f[0] * 40.0f, eye[1] + f[1] * 40.0f, eye[2] + f[2] * 40.0f - 8.0f};
+    uint32_t flags = 0;
+    if (read_block(h + kHypoFlagsOff, &flags, 4)) {
+        flags &= ~kHypoHiddenBit;
+        write_block(h + kHypoFlagsOff, &flags, 4);
+    }
+    write_block(h + patterns::kActorLocOffset, loc, 12);
 }
 
 // ---- episodes ----------------------------------------------------------------
@@ -298,9 +393,11 @@ void on_attach(void* parent, void* child) {
     if (g_seenCount < 64) g_seenChild[g_seenCount++] = child;
     const std::string cls = class_of(child);
     BVR_LOG("[eve] attached to %s: %s (%p)", who, cls.c_str(), child);
-    if (cls == "BioAmmoHypoTool" && child != g_hypo) {
-        g_hypo = child;
-        g_hypoDumped = false;
+    if (cls == "BioAmmoHypoTool") {
+        if (child != g_hypo) {
+            g_hypo = child;
+            g_hypoDumped = false;
+        }
     }
     ep_event(("attach " + cls).c_str());
 }
@@ -338,12 +435,32 @@ void tick() {
     census(pawn, "pawn", 0x1000);
     census(camera::player_controller(), "pc", 0x1000);
     hypo_track();
+    {
+        void* im = nullptr;
+        if (pawn) read_block(static_cast<uint8_t*>(pawn) + 0x948, &im, 4); // InventoryManager (probe v2)
+        static void* s_imDone = nullptr;
+        if (im && im != s_imDone) {
+            s_imDone = im;
+            BVR_LOG("[eve] InventoryManager %p (%s)", im, class_of(im).c_str());
+            census_arrays(im, "inv", 0x800);
+        }
+    }
+    if (g_hypo) {
+        static int32_t s_bone = -1;
+        int32_t bone = 0;
+        if (read_block(static_cast<uint8_t*>(g_hypo) + kHypoBoneOff, &bone, 4) && bone != s_bone) {
+            s_bone = bone;
+            const wchar_t* bn = bone ? patterns::fname_text(bone) : nullptr;
+            BVR_LOG("[eve] syringe hangs from bone %d = %S", bone, bn ? bn : L"(none)");
+        }
+    }
+    show_test();
     watch_tick(g_watch[0], pawn);
     watch_tick(g_watch[1], camera::player_controller());
     watch_tick(g_watch[2], handsA);
     watch_tick(g_watch[3], hold);
     watch_tick(g_watch[4], g_hypo);
-    for (int k = 0; k < 4; ++k) watch_tick(g_watch[5 + k], k < g_linkCount ? g_link[k] : nullptr);
+    for (int k = 0; k < kLinks; ++k) watch_tick(g_watch[5 + k], k < g_linkCount ? g_link[k] : nullptr);
 }
 
 void draw_debug_ui() {
@@ -360,6 +477,8 @@ void draw_debug_ui() {
     }
     ImGui::TextDisabled("Read-only. With it on: inject EVE with a plasmid raised (X), cast until");
     ImGui::TextDisabled("empty and cast again, pick up an EVE hypo, use a med hypo, reload a gun.");
+    bool st = g_showTest.load();
+    if (ImGui::Checkbox("TEST: show the syringe in front of me (inject once first)", &st)) g_showTest.store(st);
 }
 
 } // namespace bvr::b1r::eve
