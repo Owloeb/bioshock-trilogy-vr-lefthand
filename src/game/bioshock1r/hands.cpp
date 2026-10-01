@@ -34,6 +34,7 @@
 #include "game/bioshock1r/bones.h"
 #include "game/bioshock1r/bonewatch.h"
 #include "game/bioshock1r/camera.h"
+#include "game/bioshock1r/eve.h"
 #include "game/bioshock1r/patterns.h"
 
 #include <windows.h>
@@ -1846,6 +1847,7 @@ void reflect_point(float p[3]) {
 uint32_t __fastcall attach_update_detour(void* self, void* edx, void* parent, void* child,
                                          void* a3, void* a4) {
     const uint32_t r = g_attachOrig(self, edx, parent, child, a3, a4);
+    if (eve::probe_on()) eve::on_attach(parent, child);
     if (!child || !parent || parent != g_flipWeapon ||
         !g_effectsFlip.load(std::memory_order_relaxed) ||
         GetCurrentThreadId() != g_gameTid || GetTickCount64() - g_pgStampMs > 150)
@@ -1935,8 +1937,10 @@ void on_calcview(const FrameContext& ctx) {
     MirrorArm mirrorArm;
     g_gameTid = GetCurrentThreadId();
     if (!g_poseHookTried && g_effectsFollow.load(std::memory_order_relaxed)) install_pose_hook();
-    if (!g_attachHookTried && mirror_wanted() && g_effectsFlip.load(std::memory_order_relaxed))
+    if (!g_attachHookTried && ((mirror_wanted() && g_effectsFlip.load(std::memory_order_relaxed)) ||
+                               eve::probe_on()))
         install_attach_hook();
+    eve::tick();
     {
         int nb = 0;
         void* arr = bones::bone_array(&nb);

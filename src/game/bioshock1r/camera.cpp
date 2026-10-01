@@ -2190,4 +2190,6 @@ void draw_debug_ui() {
 
 float ipd_mm() { return g_ipdMm.load(std::memory_order_relaxed); }
 
+void* player_controller() { return g_playerController.load(std::memory_order_relaxed); }
+
 } // namespace bvr::b1r::camera

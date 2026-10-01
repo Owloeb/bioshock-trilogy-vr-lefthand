@@ -7,6 +7,7 @@
 #include "game/bioshock1r/camera.h"
 #include "game/bioshock1r/twohand.h"
 #include "game/bioshock1r/hands.h"
+#include "game/bioshock1r/eve.h"
 #include "game/bioshock1r/input_drive.h"
 #include "game/bioshock1r/patterns.h"
 #include "game/bioshock1r/scenedraw.h"
@@ -43,6 +44,7 @@ void Bioshock1RAdapter::drawDebugUi() {
     hands::draw_debug_ui();
     twohand::draw_debug_ui();
     hands::draw_arms_ui();
+    eve::draw_debug_ui();
     body::draw_debug_ui();
     input_drive::draw_debug_ui();
     scenedraw::draw_debug_ui();

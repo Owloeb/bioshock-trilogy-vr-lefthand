@@ -70,6 +70,10 @@ void set_active_weapon(const char* key);
 // Developer tools: log one summary per weapon animation (engine off hand, gun
 // tilt, the weapon's own moving bones) to bioshockvr.log.
 void set_anim_log(bool on);
+// The engine's latest own pose of the two wrists and the attach bone
+// (component space), and whether the reference is following an animation.
+bool live_wrists(float lw[3], float rw[3], float attach[3]);
+bool ref_animating_now();
 // Two-handed grip, follow v5: what the held hand rides for the weapon in hand.
 // "" = the weapon part nearest the grab point (default), "*body" = the gun body
 // only, "*hand" = the engine's own off hand (v4), or a weapon bone name. Game

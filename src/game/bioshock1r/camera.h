@@ -52,6 +52,8 @@ void restore_game_fov_if_stale(uint64_t staleMs);
 // Full ImGui section: hook status, telemetry, and all debug controls.
 // Called from the overlay through IGameAdapter::drawDebugUi().
 void draw_debug_ui();
+// The player controller CalcView last ran on (game thread readers only).
+void* player_controller();
 
 // The stereo IPD the eye offsets use (mm) - the viewmodel mirror needs it.
 float ipd_mm();

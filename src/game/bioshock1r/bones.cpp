@@ -153,6 +153,7 @@ Qts g_followBaseRef43; // the DRAWN gun's attach pose (reference) at rest
 // pose, read every time the engine re-evaluates, against a REST pose that is
 // only accepted after the hand has held still for a moment.
 Qts g_live[2];       // [0] engine left wrist, [1] weapon attach, latest engine write
+Qts g_liveR;         // engine right wrist, same write (EVE probe)
 bool g_liveValid = false;
 Qts g_followBase[2]; // the rest pose the delta is measured from
 bool g_followBaseValid = false;
@@ -2367,6 +2368,15 @@ void update_place_rest(int anchor) {
     }
 }
 
+bool live_wrists(float lw[3], float rw[3], float attach[3]) {
+    if (!g_liveValid) return false;
+    memcpy(lw, g_live[0].p, 12);
+    memcpy(rw, g_liveR.p, 12);
+    memcpy(attach, g_live[1].p, 12);
+    return true;
+}
+bool ref_animating_now() { return ref_animating(); }
+
 void set_anim_log(bool on) { g_animLog.store(on, std::memory_order_relaxed); }
 
 void set_ride_part(const char* want) {
@@ -2444,6 +2454,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         if (patterns::kBoneLWrist < g_boneCount && patterns::kBoneWeaponAttach < g_boneCount) {
             g_live[0] = fresh[patterns::kBoneLWrist];
             g_live[1] = fresh[patterns::kBoneWeaponAttach];
+            if (patterns::kBoneRClusterFirst < g_boneCount) g_liveR = fresh[patterns::kBoneRClusterFirst];
             g_liveValid = true;
             int lf = 0, ll = 0, la = 0;
             cluster_of(0, &lf, &ll, &la);

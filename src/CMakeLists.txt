@@ -62,6 +62,8 @@ add_library(bioshockvr SHARED
     game/bioshock1r/bones.cpp
     game/bioshock1r/bonewatch.cpp
     game/bioshock1r/twohand.cpp
+    game/bioshock1r/eve.cpp
+    game/bioshock1r/eve.h
     game/bioshock1r/bones.h
     game/bioshock1r/camera.cpp
     game/bioshock1r/camera.h
