@@ -74,6 +74,8 @@ void set_anim_log(bool on);
 // (component space), and whether the reference is following an animation.
 bool live_wrists(float lw[3], float rw[3], float attach[3]);
 bool ref_animating_now();
+// Log any actor's skeleton (bone names + reference pose) under [tag].
+void log_skeleton(void* actor, const char* tag);
 // Two-handed grip, follow v5: what the held hand rides for the weapon in hand.
 // "" = the weapon part nearest the grab point (default), "*body" = the gun body
 // only, "*hand" = the engine's own off hand (v4), or a weapon bone name. Game

@@ -2377,6 +2377,24 @@ bool live_wrists(float lw[3], float rw[3], float attach[3]) {
 }
 bool ref_animating_now() { return ref_animating(); }
 
+void log_skeleton(void* actor, const char* tag) {
+    Skel sk{};
+    if (!actor || !resolve_skel(actor, sk)) {
+        BVR_LOG("[%s] %p: no skeleton (rigid mesh or not resolvable)", tag, actor);
+        return;
+    }
+    const wchar_t* names[kMaxBones];
+    const int n = sk.count < kMaxBones ? sk.count : kMaxBones;
+    resolve_bone_names(sk, names, n);
+    BVR_LOG("[%s] %p skeleton: %d bones", tag, actor, sk.count);
+    for (int i = 0; i < n; ++i) {
+        Qts b{};
+        if (!read_n(&sk.bones[i], &b, sizeof b)) break;
+        BVR_LOG("[%s]   %2d %-24S pos(%7.2f %7.2f %7.2f) quat(%6.3f %6.3f %6.3f %6.3f)", tag, i,
+                names[i] ? names[i] : L"<unnamed>", b.p[0], b.p[1], b.p[2], b.q[0], b.q[1], b.q[2], b.q[3]);
+    }
+}
+
 void set_anim_log(bool on) { g_animLog.store(on, std::memory_order_relaxed); }
 
 void set_ride_part(const char* want) {
