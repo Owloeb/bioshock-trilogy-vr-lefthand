@@ -2652,9 +2652,21 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
                           g_jackFireCycle.load(std::memory_order_relaxed)))
             g_animIsReload = true;
         if (!animating) g_animIsReload = false;
+        const bool animStart = animating && !g_animWasOn;
         g_animWasOn = animating;
         g_jackWant = g_jackReloads.load(std::memory_order_relaxed) && g_offFollow &&
                      g_animIsReload && g_liveValid;
+        // One line per reload-class animation (never per shot): every input
+        // to "show Jack's hand", so an intermittent miss names its cause.
+        if (animStart && (g_animIsReload || nowJ - g_lastReloadBtnMs < 800)) {
+            BVR_LOG("[bones] %s reload anim: jack hand %s (setting %d, grip held %d, counted as reload %d "
+                    "[X %llums ago, firing window %d, mag empty %d, between-shots %d], live pose %d)",
+                    g_placeWeapon, g_jackWant ? "SHOWN" : "not shown",
+                    g_jackReloads.load(std::memory_order_relaxed) ? 1 : 0, g_offFollow ? 1 : 0,
+                    g_animIsReload ? 1 : 0, static_cast<unsigned long long>(nowJ - g_lastReloadBtnMs),
+                    firingWindow ? 1 : 0, g_clipEmpty.load(std::memory_order_relaxed) ? 1 : 0,
+                    g_jackFireCycle.load(std::memory_order_relaxed) ? 1 : 0, g_liveValid ? 1 : 0);
+        }
     } else {
         g_jackWant = false;
         g_animWasOn = g_animIsReload = false;

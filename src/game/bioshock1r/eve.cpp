@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cctype>
 #include <cstring>
+#include <cwchar>
 #include <functional>
 #include <string>
 
@@ -1057,6 +1058,65 @@ void put_away(const char* why) {
     set_state(Hs::Idle, why);
 }
 
+// ---- The syringe's ZONE, kept with the player's ----------------------------
+// The renderer skips actors whose zone (AActor::Region) is not visible, and
+// a raw Location write - all the holster does - never re-zones the actor. A
+// held syringe carried through a zone portal (a doorway) kept its old zone
+// and could be culled: rarely, and only visually (the injection does not
+// care). The offset is learned rather than assumed: the first field that
+// holds a ZoneInfo (or LevelInfo, the default zone) pointer, followed by a
+// plausible leaf index, in the hands, the pawn AND the syringe alike. From
+// then on the syringe gets the hands' region (Zone, iLeaf, ZoneNumber) each
+// frame it is held - the hands are engine-moved, so theirs is always right.
+int g_regionOff = -2; // -2 not tried this world, -1 none found
+int g_zoneSyncs = 0;
+bool is_zone_obj(const void* p) {
+    const wchar_t* n = p ? patterns::object_class_name(p) : nullptr;
+    return n && (wcsstr(n, L"ZoneInfo") || !wcscmp(n, L"LevelInfo"));
+}
+bool region_plausible(const uint8_t* a, int off) {
+    void* z = nullptr;
+    int32_t leaf = 0;
+    return read_block(a + off, &z, 4) && read_block(a + off + 4, &leaf, 4) && is_zone_obj(z) &&
+           leaf >= -1 && leaf < 1000000;
+}
+void learn_region() {
+    void* h = hands::hands_actor();
+    void* pawn = nullptr;
+    if (h) read_block(static_cast<uint8_t*>(h) + patterns::kActorBaseOffset, &pawn, 4);
+    if (!h || !pawn || !g_hypo) return;
+    g_regionOff = -1;
+    for (int off = 0x30; off < 0x600; off += 4) {
+        if (region_plausible(static_cast<uint8_t*>(h), off) && region_plausible(static_cast<uint8_t*>(pawn), off) &&
+            region_plausible(static_cast<uint8_t*>(g_hypo), off)) {
+            g_regionOff = off;
+            break;
+        }
+    }
+    BVR_LOG("[eve] syringe zone field: %s (+0x%X)", g_regionOff >= 0 ? "found" : "NOT found - zone sync off",
+            g_regionOff >= 0 ? g_regionOff : 0);
+}
+void sync_zone(uint64_t now) {
+    if (!g_hypo) return;
+    if (g_regionOff == -2) learn_region();
+    if (g_regionOff < 0) return;
+    void* h = hands::hands_actor();
+    uint8_t want[12], have[12];
+    if (!h || !read_block(static_cast<uint8_t*>(h) + g_regionOff, want, 12) ||
+        !read_block(static_cast<uint8_t*>(g_hypo) + g_regionOff, have, 12) || !memcmp(want, have, 9))
+        return;
+    void* zw = nullptr;
+    memcpy(&zw, want, 4);
+    if (!is_zone_obj(zw)) return; // never write anything but a real region
+    write_block(static_cast<uint8_t*>(g_hypo) + g_regionOff, want, 9); // Zone, iLeaf, ZoneNumber
+    if (++g_zoneSyncs <= 8) {
+        void* zh = nullptr;
+        memcpy(&zh, have, 4);
+        BVR_LOG("[eve] held syringe was in another zone (%p, hands in %p) %llu ms into the draw - moved over", zh,
+                zw, static_cast<unsigned long long>(now - g_heldSinceMs));
+    }
+}
+
 // Place the syringe on the weapon hand's gun socket - the same pose the game
 // gives it when it attaches it there for its own injection.
 void place_hypo() {
@@ -1181,6 +1241,7 @@ void holster_tick() {
             g_hypoSearchWorld = world;
             g_hypoSearches = 0;
             g_socket = -1;
+            g_regionOff = -2; // re-learn against this world's actors
             if (g_hypo && !hypo_valid()) g_hypo = nullptr;
         }
         if (!g_hypo && world && g_hypoSearches < 4 && now - g_hypoSearchMs > 3000) {
@@ -1328,6 +1389,7 @@ void holster_tick() {
             break;
         }
         keep_shown(now);
+        sync_zone(now);
         place_hypo();
         const bool in = rigNow && needle_in_arm(g_hs == Hs::In ? 1.5f : 1.0f);
         if (in && g_hs == Hs::Held) {
@@ -1350,7 +1412,10 @@ void holster_tick() {
     case Hs::Linger: {
         bvr::vr::reserve_grip_bumper(1, true);
         supRt = true;
-        if (!hypo_attached()) keep_shown(now);
+        if (!hypo_attached()) {
+            keep_shown(now);
+            sync_zone(now);
+        }
         place_hypo();
         if (now - g_lastBuzzMs > 110 && now - g_stateMs < 450) { // the rush fading out
             g_lastBuzzMs = now;
