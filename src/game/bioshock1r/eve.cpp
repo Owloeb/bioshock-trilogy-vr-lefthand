@@ -522,7 +522,7 @@ std::atomic<bool> g_blockAuto{true};
 std::atomic<float> g_hipDropM{0.62f};  // below the eyes
 std::atomic<float> g_hipSideM{0.20f};  // out to the weapon hand's side
 std::atomic<float> g_hipFwdM{0.02f};   // forward of the eyes
-std::atomic<float> g_zoneM{0.14f};     // grab radius
+std::atomic<float> g_zoneM{0.20f};     // grab radius
 std::atomic<float> g_needleUu{14.0f};  // needle tip below the grip (syringe axis)
 std::atomic<bool> g_cfgDirty{false};
 bool g_cfgLoaded = false;
@@ -624,30 +624,48 @@ void hypo_show(bool on) {
 }
 
 // Bounded breadth-first search for the syringe actor among objects linked
-// from the pawn / hands / plasmid manager (pointer fields + TArray elements).
+// from the hands, pawn and plasmid manager (pointer fields + TArray elements).
+// The seeds are read 4 KB deep - the hands actor's own fields run past
+// 0x5C0 - and engine plumbing (classes, packages, levels, assets, nav points)
+// is never expanded, so the budget goes on gameplay objects.
+bool plumbing(const std::string& c) {
+    static const char* kSkip[] = {"Class", "Package", "Level", "LevelInfo", "ZoneInfo", "Texture", "Shader",
+                                  "Material", "Model", "Font", "Sound", "StaticMesh", "SkeletalMesh", "Mesh",
+                                  "DefaultPhysicsVolume", "PhysicsVolume", "GameReplicationInfo",
+                                  "PlayerReplicationInfo", "FloorPoint", "PathNode", "PlayerPathNode",
+                                  "PlayerStart", "Script", "WindowsViewport", "WindowsClient", "Console",
+                                  "StaticMeshInstance", "SkeletalMeshInstance", "TriggerVolume", "Function",
+                                  "State", "Property"};
+    for (const char* k : kSkip)
+        if (c == k) return true;
+    return false;
+}
 void* search_hypo() {
     void* pawn = pawn_of();
-    void* seeds[3] = {pawn, hands::hands_actor(), nullptr};
+    void* seeds[4] = {hands::hands_actor(), pawn, nullptr, camera::player_controller()};
     if (pawn) read_block(static_cast<uint8_t*>(pawn) + patterns::kPawnPlasmidManagerOffset, &seeds[2], 4);
-    void* queue[160];
-    int depth[160];
+    constexpr int kQ = 320;
+    static void* queue[kQ];
+    static int depth[kQ];
     int qn = 0, qi = 0;
     for (void* sd : seeds)
-        if (sd && qn < 160) {
+        if (sd && qn < kQ) {
             queue[qn] = sd;
             depth[qn++] = 0;
         }
+    static uint32_t w[0x1000 / 4];
     while (qi < qn) {
         void* o = queue[qi];
         const int d = depth[qi++];
-        uint32_t w[0x600 / 4];
-        if (!read_block(o, w, sizeof w)) continue;
+        const uint32_t bytes = d == 0 ? 0x1000 : 0x800;
+        if (!read_block(o, w, bytes)) continue;
         auto visit = [&](uint32_t v) -> void* {
             if (v < 0x10000 || (v & 3)) return nullptr;
             void* p = reinterpret_cast<void*>(static_cast<uintptr_t>(v));
             if (!patterns::object_class_name(p)) return nullptr;
-            if (class_of(p) == "BioAmmoHypoTool") return p;
-            if (d < 2 && qn < 160) {
+            const std::string c = class_of(p);
+            if (c == "BioAmmoHypoTool") return p;
+            if (d < 2 && qn < kQ && !plumbing(c)) {
                 for (int k = 0; k < qn; ++k)
                     if (queue[k] == p) return nullptr;
                 queue[qn] = p;
@@ -655,12 +673,11 @@ void* search_hypo() {
             }
             return nullptr;
         };
-        for (uint32_t i = 0; i < 0x600 / 4; ++i) {
+        for (uint32_t i = 0; i < bytes / 4; ++i) {
             if (void* hit = visit(w[i])) return hit;
-            // TArray {data, count, max}
-            if (i + 2 < 0x600 / 4 && w[i] >= 0x10000 && !(w[i] & 3) && w[i + 1] && w[i + 1] <= 32 &&
+            if (i + 2 < bytes / 4 && w[i] >= 0x10000 && !(w[i] & 3) && w[i + 1] && w[i + 1] <= 64 &&
                 w[i + 2] >= w[i + 1] && w[i + 2] <= 4096) {
-                uint32_t el[32];
+                uint32_t el[64];
                 if (read_block(reinterpret_cast<void*>(static_cast<uintptr_t>(w[i])), el, w[i + 1] * 4))
                     for (uint32_t k = 0; k < w[i + 1]; ++k)
                         if (void* hit = visit(el[k])) return hit;
@@ -993,16 +1010,30 @@ void holster_tick() {
     case Hs::Idle: {
         const bool zone = at_hip();
         if (zone) bvr::vr::reserve_grip_bumper(1, true); // the hip squeeze never raises the gun
-        if (zone && !g_inZone) buzz(1, 0.25f, 30);
+        if (zone && now - g_lastBuzzMs >= 90) { // in reach: a steady light buzz, like the grab zone
+            g_lastBuzzMs = now;
+            buzz(1, 0.22f, 60);
+        }
         g_inZone = zone;
         if (zone && rising) {
             const int cnt = hypo_count();
-            if (!g_hypo || cnt == 0 || !g_tg.socketOk) {
-                buzz(1, 0.4f, 20);
-                buzz(1, 0.4f, 20);
-                BVR_LOG("[eve] holster empty (%s)", !g_hypo ? "syringe not found yet"
-                                                    : cnt == 0 ? "no hypos"
-                                                               : "weapon hand not drawn (off hand off?)");
+            if (cnt == 0 || !g_tg.socketOk) {
+                buzz(1, 0.7f, 140); // one long buzz: nothing to draw
+                BVR_LOG("[eve] holster empty (%s)", cnt == 0 ? "no hypos" : "weapon hand not drawn (off hand off?)");
+                break;
+            }
+            if (!g_hypo) {
+                // The syringe has not been seen yet this session (the game may
+                // only create it on first use): inject the classic way once -
+                // its attach hands us the actor, and the holster is physical
+                // from then on.
+                BVR_LOG("[eve] holster: syringe unknown - first draw injects directly to find it");
+                if (hands::active_hand() != 0) bvr::input::pulse_buttons(0x0100, 150);
+                g_eveAtInject = eve;
+                g_xQueued = true;
+                g_xQueuedMs = now;
+                buzz(1, 0.6f, 60);
+                set_state(Hs::Injecting, "first draw (finding the syringe)");
                 break;
             }
             if (hands::active_hand() != 0) bvr::input::pulse_buttons(0x0100, 150); // LB: raise the plasmid
@@ -1062,7 +1093,7 @@ void holster_tick() {
             g_shown = true; // the game owns it now; make sure it ends hidden
             hypo_show(false);
             set_state(Hs::Idle, "EVE in");
-        } else if (now - g_stateMs > 3500 || (now - g_stateMs > 900 && !hypo_attached())) {
+        } else if (now - g_stateMs > 3500 || (now - g_stateMs > 1600 && g_hypo && !hypo_attached())) {
             buzz(1, 0.4f, 20);
             BVR_LOG("[eve] injection refused (EVE full or no hypos?)");
             put_away("refused");
@@ -1241,7 +1272,7 @@ void draw_debug_ui() {
         const int cnt = g_countUi.load();
         ImGui::Text("%s | EVE %.0f | hypos %s", kState[st < 0 || st > 3 ? 0 : st], g_eveUi.load(),
                     cnt >= 0 ? std::to_string(cnt).c_str() : "(learned after two injections)");
-        if (!g_hypo) ImGui::TextDisabled("Syringe not found yet - one normal X injection finds it.");
+        if (!g_hypo) ImGui::TextDisabled("Syringe not found yet - your first draw injects straight away and finds it.");
         if (bvr::overlay::dev_tools()) {
             float n = g_needleUu.load();
             if (ImGui::SliderFloat("needle length (UU)", &n, 4.0f, 30.0f, "%.1f")) {
