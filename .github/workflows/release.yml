@@ -1,0 +1,42 @@
+# Builds the release zip on GitHub's Windows runners and publishes it.
+# Push a tag to release:   git tag v0.8.3-lh.1 ; git push fork v0.8.3-lh.1
+# Run it by hand (Actions tab -> release -> Run workflow) to get the zip as a
+# build artifact without publishing anything.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0 # git describe stamps the DLL with the tag
+
+      - name: Build and package
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "" }
+          ./tools/package.ps1 -Tag $tag
+
+      - name: Keep the zip as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bioshock-vr-lefthand
+          path: dist/*.zip
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          body_path: release/RELEASE-NOTES-lefthand.md
+          make_latest: true

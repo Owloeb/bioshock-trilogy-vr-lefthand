@@ -1,0 +1,19 @@
+BioShock VR - left-handed edition
+=================================
+
+1. Double-click Install.bat.
+   It finds BioShock Remastered in your Steam libraries, copies the mod in,
+   backs up anything it replaces, and asks whether you're left-handed.
+
+2. Start your VR runtime (Virtual Desktop with VDXR, Quest Link, or SteamVR),
+   then launch BioShock Remastered from Steam. VR starts by itself.
+
+3. First time only: press F10 in game -> "VR camera (M3/M4)" ->
+   "Render resolution", pick 2560 x 2560, press "Write to Bioshock.ini" and
+   restart the game. A square image is sharper and faster in a headset.
+
+README.txt explains every F10 setting a player needs.
+TROUBLESHOOTING.txt covers "no VR / flat screen" problems.
+Uninstall.bat removes the mod and puts back anything it replaced.
+
+Your settings and log live in %LOCALAPPDATA%\BioshockVR\

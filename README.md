@@ -19,51 +19,200 @@ physical feel that VR shooters need.
 - **Plasmid aim calibration** for your hand, plus an aim dot for plasmids.
 - **Solid HUD bars.** The health and EVE fills no longer show the world through them.
 
-Left-handed mode and the mirror are **off by default**. The BioShock 1 hand improvements
-(hands on your real hands, bullets from the barrel, arms) are on by default for everyone, and
-each one can be switched off in F10. Left-handed mode and its saved settings work in all three
-games; everything else is **BioShock 1 only** for now.
-
-> The full upstream README, covering install, runtimes, troubleshooting and controls, is kept
-> below this section. Read it first if you're new to the mod.
+Left-handed mode is **your choice at install**: the installer asks. The BioShock 1 hand
+improvements (hands on your real hands, bullets from the barrel, arms, two-handed grips, the
+EVE holster) are on for everyone, and each one can be switched off in F10. Left-handed mode
+works in all three games; everything else is **BioShock 1 only** for now.
 
 ---
 
-## Getting it running
+## Install
 
-There's no release zip for the fork, so build from source (the upstream "Build from source"
-section below covers the Visual Studio 2022 Build Tools prerequisite). In PowerShell, from the
-repo folder:
+You need **BioShock Remastered** (Steam) and a PC VR headset with a runtime the mod can use:
+Virtual Desktop (VDXR), Quest Link / Air Link, or SteamVR (Index, Vive, WMR, Steam Link).
 
-```powershell
-git clone https://github.com/Owloeb/bioshock-trilogy-vr-lefthand.git
-cd bioshock-trilogy-vr-lefthand
-Set-ExecutionPolicy -Scope Process Bypass
-.\tools\build.ps1 -Release
-.\tools\install.ps1 -Release -GamePath "C:\Program Files (x86)\Steam\steamapps\common\BioShock Remastered\Build\Final"
-```
+1. Download the latest `bioshock-vr-lefthand-....zip` from the
+   [Releases page](https://github.com/Owloeb/bioshock-trilogy-vr-lefthand/releases) and unzip
+   it anywhere.
+2. Double-click **`Install.bat`**. It:
+   - finds BioShock Remastered in your Steam libraries (or lets you pick the folder),
+   - copies the mod into the game folder,
+   - backs up any other mod's `xinput1_3.dll` it replaces (the head-tracking mod uses the same
+     file; the two can't run together),
+   - asks whether you're left-handed, and whether you want to walk with the right stick.
+3. Start your VR runtime, then launch BioShock Remastered from Steam. **VR starts by itself.**
+   With Virtual Desktop, set its OpenXR runtime to **VDXR** and launch the game from inside
+   Virtual Desktop.
+4. **First time only**, set a square resolution. Headset screens are close to square, so a
+   16:9 image wastes most of its pixels. Press **F10** → **VR camera (M3/M4)** → **Render
+   resolution**, pick **2560 x 2560**, press **Write to Bioshock.ini**, and restart the game.
 
-Pass `-GamePath` explicitly. The script's default path belongs to the upstream developer's
-machine.
+To remove the mod, run **`Uninstall.bat`** from the same folder. It deletes the mod's files,
+restores anything it backed up, and asks before touching your saved settings.
 
-### First run checklist
+If VR doesn't start, or you get a flat floating screen, see `TROUBLESHOOTING.txt` in the zip
+(or [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)).
 
-1. Press **F10** in game. Under the input section, tick **Left-handed**, and optionally
-   **Swap sticks** (move on the right stick, turn on the left).
-2. Tick **Mirror hands + weapon** to get a real left hand on the gun.
-3. Raise any plasmid (not Telekinesis) and hold it still for a moment. That teaches the mod a
-   relaxed off-hand pose.
-4. In **Decoupled aim**, set the **calibration distance** to the range you usually fight at
-   (12 m by default), press **Calibrate plasmid aim**, point at the dot, and squeeze your
-   plasmid-hand grip. Set the **aim dot distance** to the same range.
-5. For each gun you want to hold with two hands: open **Off hand + two-handed grip**, press
-   **Set grab point**, hold the gun, put your off hand where the grip belongs, and squeeze.
-6. Optional: open **Arms** and adjust where your shoulders sit if the arms look too long or
-   too short.
-7. Optional: open **EVE holster** and move the holster if it doesn't sit where your hand
-   naturally goes. It's on your stomach by default; you can switch it to your hip.
+### First time in the headset
 
-All of these save themselves. You do this once, not every launch.
+All of these save themselves. You do them once.
+
+1. **Teach the mod your relaxed off hand.** Raise any plasmid (not Telekinesis) and hold it
+   still for a second.
+2. **Calibrate plasmid aim.** F10 → **Decoupled aim (M6)** → **Calibrate plasmid aim**. Point
+   your plasmid hand at the dot the way you'd naturally cast, and squeeze that hand's grip.
+3. **Set two-handed grab points** for the guns you want to hold with both hands. F10 → **Off
+   hand + two-handed grip** → **Set grab point**, hold the gun, put your off hand where the
+   fore-end or pump is, and squeeze.
+4. *Optional:* if the arms look too long or short, adjust them in **Arms**. If the EVE holster
+   isn't where your hand naturally goes, move it in **EVE holster**.
+
+### Controls in a nutshell
+
+In left-handed mode the weapon and plasmid hands swap; the face buttons stay where they are.
+
+- **Weapon trigger** fires. **Weapon grip** switches weapon (hold it for the wheel).
+- **Plasmid trigger** casts. **Plasmid grip** switches plasmid (hold it for the wheel), or
+  grabs a gun's fore-end when your hand is on it.
+- **X** reloads (and hacks, and injects EVE the classic way). **A** uses, **B** jumps, **Y**
+  takes a first-aid kit, the **menu button** pauses (or **X + Y** together).
+- **Ammo type:** rest your thumb on the thumbrest of your move-stick hand and push the turn
+  stick.
+- **EVE:** reach your weapon hand to your stomach, squeeze the grip, push the needle into your
+  plasmid forearm, pull the trigger.
+- **Wrench:** swing it. **Recenter:** click both sticks.
+
+The upstream controls table, further down, has the full list.
+
+---
+
+## The F10 menu
+
+Press **F10** in game to open it (the mouse works on it). The sections below are in the order
+they appear. Most players only ever touch a handful of these. Every section not listed here
+(**VR PACING**, **Camera debug**, **Reentry probe**, the **Bones** lock options and the frame
+inspector) is diagnostics: leave it alone.
+
+**How settings save.** Everything in **Input**'s hand options, **Hands + weapon**, **Off hand +
+two-handed grip**, **Arms**, **EVE holster** and plasmid calibration saves **automatically**.
+Settings marked **(preset)** below are saved only when you press **Save preset values** in the
+PRESET block. A few marked **(this session)** reset every launch.
+
+### Top of the window
+
+- **Menu text size**: make the menu readable in the headset.
+- **Developer tools**: leave off. It shows probes and diagnostics.
+
+### VR and HUD (first block)
+
+- **VR HUD (gameswf on a floating quad)**: keep on. It puts health, EVE and ammo on a floating
+  panel you can read in VR.
+- **Solid HUD bars**: keep on. It makes the health and EVE fills opaque.
+- **HUD distance / HUD width / HUD height offset** *(preset)*: move and size the HUD panel.
+- **Hide cutscene black bars** *(preset)*: removes the letterbox bars in cutscenes.
+- **During cutscenes** *(preset)*: *authored* (the default) plays cutscenes with the game's
+  camera; *authored + head look* lets you look around inside them.
+- **Full-screen effects across the view** *(preset)*: leave off; on, water and damage flashes
+  fill the view instead of sitting on the HUD panel.
+
+### Input
+
+- **Smooth turn speed** *(preset)*, or **Snap turn** with **Snap angle** *(preset)*.
+- **Left-handed (weapon in left hand, plasmid in right)**: the installer set this; change it
+  here any time.
+  - **Mirror hands + weapon (real left hand)**: shows a left hand on the gun. Keep on if you're
+    left-handed.
+  - **Mirror about**: keep *the gun*.
+  - **Muzzle trim for this weapon**: only if a gun's muzzle flash sits off its barrel. Saved
+    per weapon.
+- **Swap sticks (move right, turn left)**: walk with the right stick.
+- **Ammo-select modifier** *(this session)*: what you hold while pushing the turn stick to pick
+  an ammo type. The default is the thumbrest on your move-stick hand.
+- **Swing the wrench to attack** *(preset)* and **Swing speed needed** *(preset)*: lower the
+  speed if swings don't register, raise it if the wrench fires by accident.
+- **Stick deadzone** *(this session)*.
+
+### PRESET
+
+- **VR PRESET 1 - everything on**: turns the whole VR setup back on. Press it if something got
+  switched off and you can't find it.
+- **Save preset values**: saves every *(preset)* setting.
+- **Auto-start VR at launch** *(preset)*: keep on.
+
+### VR camera (M3/M4)
+
+- **Render resolution**: see Install step 4.
+- **World scale (UU per m)** *(preset)*: if the world feels too big or small. 100 is standard.
+- **IPD (mm)** *(preset)*: your eye distance, for depth.
+- **Head offset up / fwd** *(preset)*: raise or move your viewpoint.
+- **Recenter**: also on **both stick clicks**.
+- **Flat-screen crosshair** *(preset)*: off in VR (you aim with your hand).
+- **Lock-on disabled** *(preset)*: keep on; the game's pad aim-assist fights hand aiming.
+
+### Decoupled aim (M6)
+
+- **Calibrate plasmid aim**: see "First time in the headset". **Reset** clears it.
+- **calibration distance (m)**: the range where your plasmid hits exactly where you point. Set
+  it to the range you usually fight at (12 m by default).
+- **Aim dot for plasmids**: a dot where your plasmid will land.
+- **Aim laser** *(preset)*: dots along the weapon's aim line.
+- **Aim dot** with **aim dot distance** / **size** *(preset)*: a single aim dot for weapons.
+- The **R / L aim trims** and **ray offsets** are per-weapon calibration. You don't need them:
+  bullets follow the barrel you see, and the plasmid calibration replaces the L trims.
+
+### Hands + weapon (M7)
+
+- **Hands match your real hands (grip pose)**: keep on. Jack's palm sits on your palm.
+  - **palm depth (cm into the fist)**: if the hand looks like it floats around the
+    controller, or sinks into it.
+  - **Bullets follow the gun barrel**: keep on. Shots fly where the gun you see points.
+    - **barrel left/right** and **barrel down/up**: only if one gun consistently shoots to one
+      side. Saved per weapon; **Default for this weapon** undoes it.
+- **Recoil + haptics** and **recoil strength** *(this session)*.
+- **model scale** / **WEAPON scale** *(preset)*: hand and gun size.
+- The **offset** and **trim** sliders and **Save offsets** are fine-tuning for the hand model.
+  Leave them at zero with hand matching on.
+
+### Off hand + two-handed grip
+
+- **Show the off hand**: your other hand follows its controller.
+- **Two-handed grip**: grab a gun's fore-end with your off hand's grip.
+- **Buzz the off hand in the grab zone**: a buzz when your hand is on the grab point.
+- **grab radius (cm)**: how close your hand has to be to grab (12 by default).
+- **slide-off distance (cm)**: how far your hand can slide along the gun before it lets go.
+- **Watch Jack reload while you hold the grip**: hold the fore-end through a reload and Jack's
+  hand does the reload.
+- **Set grab point** / **Clear grab point**: per weapon (see "First time in the headset").
+- **held hand rides** (per weapon): what your held hand follows. *Nearest part* rides the pump,
+  slide or crank you're holding; *Gun body only* stays put on the gun; *Jack's own hand* shows
+  Jack's hand instead of yours.
+- **Watch Jack between shots too** (per weapon): Jack's hand does the in-between-shots action,
+  like the crossbow's prime. On for the crossbow by default.
+
+### Arms
+
+- **Full arms (IK from the shoulders)**: arms from your shoulders to your hands.
+- **shoulders down / apart / back (cm)**: where your shoulders sit, from the centre of your
+  head. Adjust if the elbows bend oddly.
+- **elbows out**: how far the elbows flare.
+- **arm length (x Jack's)**: if the arms look too long or short.
+
+### EVE holster
+
+- **EVE holster**: on/off.
+- **No automatic EVE injection**: a plasmid cast you can't afford just clicks, instead of the
+  game injecting a hypo for you.
+- **Holster on your: stomach / hip**: the stomach is the default (the hips are where the main
+  mod's manual reloading keeps magazines). Each spot keeps its own position.
+- **down / sideways (or out to the side) / forward (cm)**: where the holster is, from your eyes.
+- **reach (cm)**: how close your hand has to be (stomach 16, hip 20).
+- **injection surge (hand shake)**: the tremor as the EVE goes in; 0 turns it off.
+
+### Body / locomotion (M7.5)
+
+- **Body follows head**: keep on. Pushing the stick forward walks where you look.
+- **Follow rate** / **Deadzone** *(preset)*: soften how the body follows your head.
+- **Instant move direction** *(preset)*: keep on.
 
 ---
 
@@ -305,6 +454,8 @@ that feature.
 | `eve.ini` | EVE holster on/off, automatic-injection guard, stomach or hip, each spot's position and reach, injection surge |
 | `offhand_neutral.ini` | the relaxed off-hand pose |
 | `overlay.ini` | F10 text size, Developer tools |
+| `vrpreset.ini` | everything marked *(preset)* in the F10 guide: HUD panel, turning, swing, camera scale, aim dot, laser (written by **Save preset values**) |
+| `weapons.ini` | per-weapon aim profiles (upstream; written by **Save preset values**) |
 
 ## Known limits
 
@@ -339,6 +490,32 @@ that feature.
 | `pr/left-handed` | left-handed mode only, proposed upstream |
 | `pr/mirror-viewmodel` | adds the mirrored viewmodel |
 | `pr/hands-haptics` | adds the off hand, grips, recoil and haptics, plasmid aim and HUD bars |
+
+## Building from source and making a release
+
+You only need this to change the code. Install Visual Studio 2022 Build Tools with the C++
+workload and the "C++ CMake tools" component, then in PowerShell:
+
+```powershell
+git clone --recursive https://github.com/Owloeb/bioshock-trilogy-vr-lefthand.git
+cd bioshock-trilogy-vr-lefthand
+Set-ExecutionPolicy -Scope Process Bypass
+.\tools\build.ps1 -Release
+.\tools\install.ps1 -Release
+```
+
+`install.ps1` finds the game in your Steam libraries; pass `-GamePath` to point it elsewhere.
+`.\tools\package.ps1` builds the same zip a release ships, into `dist\`.
+
+**Releases are built by GitHub.** Pushing a tag that starts with `v` runs
+`.github/workflows/release.yml` on GitHub's Windows machines: it builds the mod, packages the
+zip (installer included) and publishes it on the Releases page with
+`release/RELEASE-NOTES-lefthand.md` as the description. Update that file first, then:
+
+```powershell
+git tag v0.8.3-lh.2
+git push fork v0.8.3-lh.2
+```
 
 ## Credits
 

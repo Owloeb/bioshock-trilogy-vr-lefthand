@@ -22,7 +22,15 @@ if ($Game -eq "bs2") {
     if (-not $GamePath) { $GamePath = "D:\SteamLibrary\steamapps\common\BioShock Infinite\Binaries\Win32" }
 } else {
     $exeName = "BioshockHD.exe"
-    if (-not $GamePath) { $GamePath = "K:\SteamLibrary\steamapps\common\BioShock Remastered\Build\Final" }
+    if (-not $GamePath) {
+        # Found through your Steam libraries, so -GamePath is optional.
+        . (Join-Path $repo "release\installer\find-bioshock.ps1")
+        $GamePath = Find-BioshockFolder
+        if (-not $GamePath) { throw "BioShock Remastered not found in your Steam libraries - pass -GamePath." }
+        Write-Host "Game folder: $GamePath"
+    } elseif (Test-Path (Join-Path $GamePath "Build\Final\$exeName")) {
+        $GamePath = Join-Path $GamePath "Build\Final"
+    }
 }
 
 if (-not (Test-Path (Join-Path $GamePath $exeName))) {

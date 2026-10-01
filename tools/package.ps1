@@ -6,7 +6,10 @@
 # NOTE: keep this file pure ASCII (PowerShell 5.1 misreads BOM-less UTF-8).
 param(
     [string]$OutDir = "$PSScriptRoot\..\dist",
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    # Left-handed edition: the release tag (e.g. v0.8.3-lh.1) names the zip and
+    # VERSION.txt. Defaults to the tag on HEAD, else the CMake version.
+    [string]$Tag = ""
 )
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
@@ -18,6 +21,12 @@ if ($cml -notmatch 'project\(BioshockVR\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') {
 }
 $version = $Matches[1]
 "version: $version"
+if (-not $Tag) {
+    $t = (& git -C $repo describe --tags --exact-match 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $t) { $Tag = $t.Trim() }
+}
+$label = if ($Tag) { $Tag } else { "v$version" }
+"release label: $label"
 
 if (-not $SkipBuild) { & "$repo\tools\build.ps1" -Release }
 
@@ -43,7 +52,7 @@ if ($Matches[1] -ne $version) {
     throw "generated header says $($Matches[1]) but CMakeLists.txt says $version - rebuild"
 }
 
-$stage = "$OutDir\bioshock-vr-v$version"
+$stage = "$OutDir\bioshock-vr-lefthand-$label"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 # v0.7.0: one zip, two games - a preset folder per game (the BS2 one is
 # optional-by-design, its values are also baked into the DLL).
@@ -58,6 +67,12 @@ Copy-Item "$bin\xinput1_3.dll"  $stage
 Copy-Item "$bin\bvr_steamvr32.dll" $stage
 Copy-Item $ovrDll $stage
 Copy-Item "$repo\README.md" "$stage\README.txt"
+# Left-handed edition: the double-click installer and uninstaller.
+foreach ($n in @("Install.bat", "Install.ps1", "Uninstall.bat", "Uninstall.ps1", "find-bioshock.ps1",
+                 "START-HERE.txt")) {
+    Copy-Item "$repo\release\installer\$n" "$stage\$n"
+}
+Set-Content -Path "$stage\VERSION.txt" -Value $label -Encoding ASCII
 Copy-Item "$repo\docs\TROUBLESHOOTING.md" "$stage\TROUBLESHOOTING.txt"
 foreach ($n in @("vrpreset.ini", "hands.ini", "weapons.ini", "HOW-TO-USE.txt")) {
     Copy-Item "$repo\release\preset-bs1\$n" "$stage\preset-bs1\$n"
@@ -71,7 +86,7 @@ foreach ($n in @("vrpreset.ini", "HOW-TO-USE.txt")) {
     Copy-Item "$repo\release\preset-bsi\$n" "$stage\preset-bsi\$n"
 }
 
-$zip = "$OutDir\bioshock-vr-v$version.zip"
+$zip = "$OutDir\bioshock-vr-lefthand-$label.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 Compress-Archive -Path "$stage\*" -DestinationPath $zip
 Remove-Item $stage -Recurse -Force
