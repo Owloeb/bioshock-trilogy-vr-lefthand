@@ -1847,6 +1847,7 @@ bool g_animWasOn = false;
 bool g_animIsReload = false;
 uint64_t g_lastReloadBtnMs = 0;
 std::atomic<bool> g_jackReloads{true}; // F10 toggle
+std::atomic<bool> g_keepSocket{false};  // EVE injection: leave the off weapon hand's socket in place
 std::atomic<bool> g_clipEmpty{false};
 std::atomic<bool> g_jackFireCycle{false}; // this weapon: watch Jack between shots too   // the gun's magazine is empty (hands' learner)
 
@@ -2168,7 +2169,10 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
             }
         }
     }
-    if (ih == 1) {
+    // The EVE holster's injection hangs the syringe on this socket: while it
+    // runs, the socket stays where the hand is (parking it took the syringe
+    // with it - the hypo vanished the moment the game took it over).
+    if (ih == 1 && !g_keepSocket.load(std::memory_order_relaxed)) {
         static const float kFarBelow[3] = {0.0f, 0.0f, -5000.0f};
         const int att = patterns::kBoneWeaponAttach, tip = patterns::kBoneRClusterLast;
         auto hide = [&](int idx, const float* p, bool scale) {
@@ -2413,6 +2417,7 @@ int weapon_part_names(char (*out)[40], int cap) {
 
 int ride_part_auto() { return g_autoPart.load(std::memory_order_relaxed); }
 void set_jack_fire_cycle(bool on) { g_jackFireCycle.store(on, std::memory_order_relaxed); }
+void set_keep_weapon_socket(bool on) { g_keepSocket.store(on, std::memory_order_relaxed); }
 void set_clip_empty(bool empty) { g_clipEmpty.store(empty, std::memory_order_relaxed); }
 void set_jack_reloads(bool on) { g_jackReloads.store(on, std::memory_order_relaxed); }
 bool jack_reloads() { return g_jackReloads.load(std::memory_order_relaxed); }

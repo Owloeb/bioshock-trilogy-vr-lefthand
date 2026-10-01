@@ -527,7 +527,7 @@ std::atomic<float> g_needleUu{14.0f};  // needle tip below the grip (syringe axi
 std::atomic<bool> g_cfgDirty{false};
 bool g_cfgLoaded = false;
 
-enum class Hs { Idle, Held, In, Injecting };
+enum class Hs { Idle, Held, In, Injecting, Linger };
 Hs g_hs = Hs::Idle;
 std::atomic<int> g_hsUi{0};
 Targets g_tg;
@@ -538,6 +538,7 @@ bool g_zoneSqueeze = false; // this squeeze began in the holster: never reaches 
 bool g_trigPrev = false;
 bool g_shown = false;
 uint64_t g_stateMs = 0, g_lastBuzzMs = 0, g_xQueuedMs = 0;
+constexpr uint64_t kLingerMs = 700; // the empty syringe stays in the hand this long
 bool g_xQueued = false;
 float g_bodyFwd[2] = {0.0f, -1.0f}; // XR horizontal body forward (x, z)
 bool g_bodyInit = false;
@@ -821,8 +822,9 @@ void basis_to_rot(const float f[3], const float u[3], int32_t out[3]) {
 
 void set_state(Hs s, const char* why) {
     if (s == g_hs) return;
-    BVR_LOG("[eve] holster: %s -> %s (%s)", g_hs == Hs::Idle ? "idle" : g_hs == Hs::Held ? "held" : g_hs == Hs::In ? "needle in" : "injecting",
-            s == Hs::Idle ? "idle" : s == Hs::Held ? "held" : s == Hs::In ? "needle in" : "injecting", why);
+    static const char* kName[] = {"idle", "held", "needle in", "injecting", "lingering"};
+    BVR_LOG("[eve] holster: %s -> %s (%s)", kName[static_cast<int>(g_hs)], kName[static_cast<int>(s)], why);
+    bones::set_keep_weapon_socket(s == Hs::Injecting);
     g_hs = s;
     g_hsUi.store(static_cast<int>(s));
     g_stateMs = GetTickCount64();
@@ -1087,6 +1089,17 @@ void holster_tick() {
         }
         break;
     }
+    case Hs::Linger: {
+        bvr::vr::reserve_grip_bumper(1, true);
+        supRt = true;
+        place_hypo();
+        if (now - g_stateMs > kLingerMs || !g_squeeze) {
+            g_shown = true;
+            hypo_show(false);
+            set_state(Hs::Idle, "put away");
+        }
+        break;
+    }
     case Hs::Injecting: {
         bvr::vr::reserve_grip_bumper(1, true);
         supRt = true;
@@ -1108,9 +1121,12 @@ void holster_tick() {
         if (landed) {
             buzz(0, 0.8f, 90);
             buzz(1, 0.8f, 90);
-            g_shown = true; // the game owns it now; make sure it ends hidden
-            hypo_show(false);
-            set_state(Hs::Idle, "EVE in");
+            // The game lets go of the syringe as the EVE lands and hides it;
+            // keep the emptied hypo in the hand a moment longer.
+            g_shown = false;
+            hypo_show(true);
+            place_hypo();
+            set_state(Hs::Linger, "EVE in");
         } else if (now - g_stateMs > 3500 || (now - g_stateMs > 1600 && g_hypo && !hypo_attached())) {
             buzz(1, 0.4f, 20);
             BVR_LOG("[eve] injection refused (EVE full or no hypos?)");
@@ -1165,7 +1181,7 @@ void set_targets(const Targets& t) {
     g_tg = t;
     g_tgMs = GetTickCount64();
     // Right after the rig is drawn: the syringe lands on this frame's hand.
-    if (g_hs != Hs::Idle && g_shown) place_hypo();
+    if (g_hs != Hs::Idle && g_shown) place_hypo(); // (no-op while the game has it attached)
 }
 int socket_bone() { return g_socket; }
 
@@ -1285,10 +1301,11 @@ void draw_debug_ui() {
             g_zoneM.store(v / 100.0f);
             g_cfgDirty.store(true);
         }
-        static const char* kState[] = {"ready", "holding a hypo", "needle in - pull the trigger", "injecting"};
+        static const char* kState[] = {"ready", "holding a hypo", "needle in - pull the trigger", "injecting",
+                                       "done"};
         const int st = g_hsUi.load();
         const int cnt = g_countUi.load();
-        ImGui::Text("%s | EVE %.0f | hypos %s", kState[st < 0 || st > 3 ? 0 : st], g_eveUi.load(),
+        ImGui::Text("%s | EVE %.0f | hypos %s", kState[st < 0 || st > 4 ? 0 : st], g_eveUi.load(),
                     cnt >= 0 ? std::to_string(cnt).c_str() : "(learned after two injections)");
         if (!g_hypo) ImGui::TextDisabled("Syringe not found yet - your first draw injects straight away and finds it.");
         if (bvr::overlay::dev_tools()) {
