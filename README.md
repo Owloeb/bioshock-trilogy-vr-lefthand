@@ -13,6 +13,8 @@ physical feel that VR shooters need.
 - **Two-handed grips** on any weapon. Hold the shotgun's pump or the Tommy gun's foregrip with
   your real hand, and the gun aims along both hands. Your hand rides the gun's moving parts,
   and if you keep holding through a reload you watch Jack do it.
+- **A physical EVE hypo** (experimental). Draw it from your hip, put the needle in your arm,
+  pull the trigger.
 - **Recoil and haptics** on every weapon, wrench hits and plasmid casts.
 - **Plasmid aim calibration** for your hand, plus an aim dot for plasmids.
 - **Solid HUD bars.** The health and EVE fills no longer show the world through them.
@@ -58,6 +60,8 @@ machine.
    **Set grab point**, hold the gun, put your off hand where the grip belongs, and squeeze.
 6. Optional: open **Arms** and adjust where your shoulders sit if the arms look too long or
    too short.
+7. Optional: open **EVE holster** and move the holster if it doesn't sit where your hand
+   naturally goes.
 
 All of these save themselves. You do this once, not every launch.
 
@@ -174,7 +178,41 @@ plasmid" input, so reaching for the fore-end never switches you to plasmids.
 **Settings:** grab radius (12 cm), slide-off distance (35 cm), the buzz, and **Watch Jack
 reload while you hold the grip**. Guns without a grab point stay one-handed, deliberately.
 
-### 7. Recoil and haptics (BioShock 1)
+### 7. EVE holster (BioShock 1, experimental)
+
+**What you get:** a physical EVE hypo on the hip of your weapon hand (the left hip in
+left-handed mode).
+
+1. **Draw.** Reach your weapon hand to that hip; the controller buzzes steadily while you're in
+   reach. Squeeze the grip and Jack's real EVE syringe is in your hand. If a gun was out, the
+   plasmid comes up so your other arm is ready.
+2. **Needle in.** Push the needle into your plasmid forearm. Both controllers buzz when it goes
+   in.
+3. **Inject.** Pull the trigger. The game runs its own injection: the plunger goes down, the
+   EVE fills, a hypo is used. The empty syringe stays in your hand for a moment, then goes
+   back.
+
+Let go of the grip before pulling the trigger and the hypo goes back unused. The hip squeeze
+never reaches the game, so it can't open the weapon wheel.
+
+**No automatic injection:** the mod learns what each plasmid costs from your casts. A cast you
+can't afford never reaches the game, so the game can't inject on its own. You get an empty
+click on that hand instead. **No automatic EVE injection** in F10 switches this off.
+
+**How it works:** the syringe is the game's own `BioAmmoHypoTool` actor. The mod shows it with
+the engine's `set ... bHidden` console command and places it on the weapon hand's gun socket
+every frame. That's the same spot the game hangs it from during its own injection, so when you
+pull the trigger the mod presses X (the game's EVE button, with the plasmid raised) and the
+game takes over without a jump. The needle test is a capsule around the forearm, from wrist to
+elbow, using the arm solver.
+
+**Settings:** holster position (down, out to the side, forward) and reach, in F10 →
+**EVE holster**.
+
+**Still being tuned:** feedback on the hip position, the reach and how the needle registers is
+welcome.
+
+### 8. Recoil and haptics (BioShock 1)
 
 **What you get:**
 
@@ -195,7 +233,7 @@ hands on the gun, the kick is about half as strong and both hands move with it.
 only. The bullets still go where the gun points, so **recoil never costs accuracy**. There's
 one on/off switch and a strength slider in F10 ("Hands + weapon").
 
-### 8. Plasmid aim (BioShock 1)
+### 9. Plasmid aim (BioShock 1)
 
 **What you get:** a one-press calibration for your plasmid hand, and an aim dot that shows
 where a plasmid will go.
@@ -213,7 +251,7 @@ and set the aim dot distance to match.
 In mirror mode the sideways aim sliders show values as you see them, so dragging right always
 moves the shot right.
 
-### 9. Solid HUD bars (all games using the HUD panel)
+### 10. Solid HUD bars (all games using the HUD panel)
 
 **What you get:** the health and EVE bar fills render solid on the VR HUD panel instead of
 glowing and see-through.
@@ -223,11 +261,12 @@ before showing it. Upstream's rule could leave a bright red fill about 10% opaqu
 makes every coloured pixel at least as opaque as its brightest colour channel. There's an F10
 toggle to compare with the old behaviour.
 
-### 10. Developer tools
+### 11. Developer tools
 
 The investigation tooling (draw census, one-frame draw trace, hardware-watchpoint bone probe,
-effects probe, mirror internals, arm diagnostics, and an animation log that writes each weapon
-animation and the gun's moving bones to `bioshockvr.log`) is kept but hidden. Tick **Developer
+effects probe, mirror internals, arm diagnostics, an animation log that writes each weapon
+animation and the gun's moving bones to `bioshockvr.log`, and the EVE probe used to find the
+syringe, EVE level and injection) is kept but hidden. Tick **Developer
 tools** at the top of F10 to show it.
 
 ---
@@ -246,6 +285,7 @@ that feature.
 | `twohand.ini` | off-hand and grip settings, grab points, what the held hand rides, per weapon |
 | `mirror.ini` | per-weapon muzzle trims (mirror mode) |
 | `aim_plasmid.ini` | plasmid aim calibration, calibration distance, plasmid aim dot |
+| `eve.ini` | EVE holster on/off, automatic-injection guard, holster position and reach |
 | `offhand_neutral.ini` | the relaxed off-hand pose |
 | `overlay.ini` | F10 text size, Developer tools |
 
@@ -253,6 +293,14 @@ that feature.
 
 - **Plasmid effects sit slightly off the hand** in mirror mode. They hang off the game's own
   copy of the hand, which the mirror can only line up with the hand you see at one point.
+- **The EVE holster is experimental.**
+  - **Hypo count:** the mod learns where it's stored over your first two injections. Until
+    then it hands you a hypo even if you have none; the game then refuses the injection and
+    the syringe goes back.
+  - **First draw:** if the mod hasn't found the syringe yet, the first draw of a session
+    injects straight away, the same as pressing X. That finds it, and every draw after that
+    is the full physical version.
+  - **Mirror mode:** the syringe's label reads backwards.
 - **Telekinesis is aimed by your head.** It skips the aiming code the mod hooks for every other
   weapon and plasmid, so it can't be pointed with your hand yet.
 - **Grab points belong to a hand-placement mode.** Switching **Hands match your real hands** on
@@ -270,6 +318,7 @@ that feature.
 |---|---|
 | `lefthand` (default) | everything, plus this README |
 | `arms` | where the arms and hand-placement work was developed (merged into `lefthand`) |
+| `eve` | where the EVE holster was developed (merged into `lefthand`) |
 | `pr/left-handed` | left-handed mode only, proposed upstream |
 | `pr/mirror-viewmodel` | adds the mirrored viewmodel |
 | `pr/hands-haptics` | adds the off hand, grips, recoil and haptics, plasmid aim and HUD bars |
