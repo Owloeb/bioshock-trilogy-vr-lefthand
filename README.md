@@ -67,7 +67,7 @@ All of these save themselves. You do them once.
 4. *Optional:* if the arms look too long or short, adjust them in **Arms**. If the EVE holster
    isn't where your hand naturally goes, move it in **EVE holster**.
 
-### Controls in a nutshell
+### Controls
 
 In left-handed mode the weapon and plasmid hands swap; the face buttons stay where they are.
 
