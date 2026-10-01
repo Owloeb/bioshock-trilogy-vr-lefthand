@@ -85,6 +85,9 @@ int ride_part_active();
 void set_jack_reloads(bool on);
 // The gun in hand has an empty magazine (so the next animation is its reload).
 void set_clip_empty(bool empty);
+// This weapon's between-shot animation (the crossbow's priming pull) is a hand
+// action too: show Jack's hand for it while held. Game thread, every frame.
+void set_jack_fire_cycle(bool on);
 bool jack_reloads();
 // World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
 bool written_world(int idx, float out[3]);

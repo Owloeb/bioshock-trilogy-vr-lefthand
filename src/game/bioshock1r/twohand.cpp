@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <string>
@@ -49,6 +50,25 @@ std::map<std::string, GrabPoint> g_points;
 // part nearest the grab point, "*body" = gun body only, "*hand" = the engine's
 // own off hand (classic), else a weapon bone name.
 std::map<std::string, std::string> g_parts;
+// Per grab point: watch Jack's hand for the between-shot animation as well.
+std::map<std::string, bool> g_jackShots;
+
+// Shipped defaults, by weapon class. The chemical thrower's wrench is worked
+// by the engine's own hand (its rest pose hovers off the gun), so copying that
+// hand follows it best. The crossbow's prime is Jack pulling the handle.
+std::string weapon_of(const std::string& key) { return key.substr(0, key.find('@')); }
+std::string default_part(const std::string& key) {
+    return weapon_of(key) == "ChemicalThrower" ? "*hand" : "";
+}
+bool default_jack_shots(const std::string& key) { return weapon_of(key) == "Crossbow"; }
+std::string part_for(const std::string& key) { // caller holds g_mx
+    auto it = g_parts.find(key);
+    return it != g_parts.end() ? it->second : default_part(key);
+}
+bool jack_shots_for(const std::string& key) { // caller holds g_mx
+    auto it = g_jackShots.find(key);
+    return it != g_jackShots.end() ? it->second : default_jack_shots(key);
+}
 bool g_loaded = false;
 
 // Live state (game thread), mirrored to atomics for the UI.
@@ -97,8 +117,8 @@ void save() {
         fprintf(f, "%s = %.4f %.4f %.4f %.5f %.5f %.5f %.5f\n", k.c_str(), p.g[0], p.g[1],
                 p.g[2], p.rel[0], p.rel[1], p.rel[2], p.rel[3]);
     fprintf(f, "# what the held hand rides: <Weapon>@<setup>.part = <bone> | *body | *hand\n");
-    for (const auto& [k, v] : g_parts)
-        if (!v.empty()) fprintf(f, "%s.part = %s\n", k.c_str(), v.c_str());
+    for (const auto& [k, v] : g_parts) fprintf(f, "%s.part = %s\n", k.c_str(), v.empty() ? "*auto" : v.c_str());
+    for (const auto& [k, v] : g_jackShots) fprintf(f, "%s.jack = %d\n", k.c_str(), v ? 1 : 0);
     fclose(f);
 }
 
@@ -120,7 +140,13 @@ void load() {
             if (kl > 5 && strcmp(key + kl - 5, ".part") == 0) {
                 key[kl - 5] = 0;
                 std::lock_guard<std::mutex> lk(g_mx);
-                g_parts[key] = val;
+                g_parts[key] = strcmp(val, "*auto") == 0 ? "" : val;
+                continue;
+            }
+            if (kl > 5 && strcmp(key + kl - 5, ".jack") == 0) {
+                key[kl - 5] = 0;
+                std::lock_guard<std::mutex> lk(g_mx);
+                g_jackShots[key] = atoi(val) != 0;
                 continue;
             }
         }
@@ -190,12 +216,14 @@ void tick(bool weaponRaised, bool gameplay) {
     strncpy_s(g_keyUi, key.c_str(), _TRUNCATE);
     {
         std::string part;
+        bool jackShots = false;
         {
             std::lock_guard<std::mutex> lk(g_mx);
-            auto it = g_parts.find(key);
-            if (it != g_parts.end()) part = it->second;
+            part = part_for(key);
+            jackShots = jack_shots_for(key);
         }
         bones::set_ride_part(part.c_str());
+        bones::set_jack_fire_cycle(jackShots);
     }
 
     if (g_clearRequest.exchange(0) == 1) {
@@ -391,10 +419,11 @@ void draw_debug_ui() {
         const int n = bones::weapon_part_names(names, 128);
         const int autoIdx = bones::ride_part_auto();
         std::string cur;
+        bool jackShots = false;
         {
             std::lock_guard<std::mutex> lk(g_mx);
-            auto it = g_parts.find(key);
-            if (it != g_parts.end()) cur = it->second;
+            cur = part_for(key);
+            jackShots = jack_shots_for(key);
         }
         char autoLabel[96];
         _snprintf_s(autoLabel, sizeof autoLabel, _TRUNCATE, "Nearest part (%s)",
@@ -420,8 +449,14 @@ void draw_debug_ui() {
         if (picked && choice != cur) {
             {
                 std::lock_guard<std::mutex> lk(g_mx);
-                if (choice.empty()) g_parts.erase(key);
-                else g_parts[key] = choice;
+                g_parts[key] = choice; // stored even when auto: it overrides a default
+            }
+            g_saveRequest.store(true);
+        }
+        if (ImGui::Checkbox("Watch Jack between shots too (e.g. the crossbow prime)", &jackShots)) {
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                g_jackShots[key] = jackShots;
             }
             g_saveRequest.store(true);
         }

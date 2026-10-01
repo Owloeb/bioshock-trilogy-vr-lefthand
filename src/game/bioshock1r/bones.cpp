@@ -1846,7 +1846,8 @@ bool g_animWasOn = false;
 bool g_animIsReload = false;
 uint64_t g_lastReloadBtnMs = 0;
 std::atomic<bool> g_jackReloads{true}; // F10 toggle
-std::atomic<bool> g_clipEmpty{false};   // the gun's magazine is empty (hands' learner)
+std::atomic<bool> g_clipEmpty{false};
+std::atomic<bool> g_jackFireCycle{false}; // this weapon: watch Jack between shots too   // the gun's magazine is empty (hands' learner)
 
 // The weapon's parts are still: nothing moved more than a hair for 300 ms (or
 // a part has been moving for 4 s - an idle loop, not an animation).
@@ -2383,6 +2384,7 @@ int weapon_part_names(char (*out)[40], int cap) {
 }
 
 int ride_part_auto() { return g_autoPart.load(std::memory_order_relaxed); }
+void set_jack_fire_cycle(bool on) { g_jackFireCycle.store(on, std::memory_order_relaxed); }
 void set_clip_empty(bool empty) { g_clipEmpty.store(empty, std::memory_order_relaxed); }
 void set_jack_reloads(bool on) { g_jackReloads.store(on, std::memory_order_relaxed); }
 bool jack_reloads() { return g_jackReloads.load(std::memory_order_relaxed); }
@@ -2393,6 +2395,7 @@ void set_active_weapon(const char* key) {
     if (strncmp(key, g_placeWeapon, sizeof g_placeWeapon - 1) == 0) return;
     strncpy_s(g_placeWeapon, sizeof g_placeWeapon, key, _TRUNCATE);
     g_placeRestValid = false; // a new gun holds differently: live until it settles
+    g_followBaseValid = false;
 }
 
 bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int hand) {
@@ -2540,7 +2543,14 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         if (rt >= 30) s_lastTriggerMs = GetTickCount64();
     }
     const bool firingWindow = GetTickCount64() - s_lastTriggerMs < 1000;
-    if (hand != 1) g_placeRestValid = false; // plasmid up: the next raise re-settles
+    // Plasmid up: the next raise re-settles - placement AND the follow base.
+    // A base kept from an earlier raise made the held hand tilt by the
+    // difference between two raises' idle freezes whenever you swapped back
+    // before the gun settled (frequent plasmid/gun swaps).
+    if (hand != 1) {
+        g_placeRestValid = false;
+        g_followBaseValid = false;
+    }
     // Nor while the reference is following an animation: the grenade
     // launcher's reload twists the whole gun with the engine's left hand
     // holding still ON it, so the hand-to-gun relation alone looked like rest
@@ -2561,7 +2571,10 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             g_restCand[0] = g_live[0];
             g_restCand[1] = g_live[1];
             g_restCandMs = nowR;
-        } else if (nowR - g_restCandMs >= kRestHoldMs) {
+        } else if (nowR - g_restCandMs >= kRestHoldMs && hand == 1) {
+            // Weapon hand raised only: with the plasmid up the attach bone is
+            // the HOLSTERED gun, and a base taken there tilted the held hand by
+            // the difference on the next raise.
             g_followBase[0] = g_live[0];
             g_followBase[1] = g_live[1];
             g_followBaseValid = true;
@@ -2601,7 +2614,9 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             g_animIsReload = !firingWindow || nowJ - g_lastReloadBtnMs < 800;
         // An empty magazine makes any animation the reload - including the
         // automatic one that runs straight on from the last shot.
-        if (animating && g_clipEmpty.load(std::memory_order_relaxed)) g_animIsReload = true;
+        if (animating && (g_clipEmpty.load(std::memory_order_relaxed) ||
+                          g_jackFireCycle.load(std::memory_order_relaxed)))
+            g_animIsReload = true;
         if (!animating) g_animIsReload = false;
         g_animWasOn = animating;
         g_jackWant = g_jackReloads.load(std::memory_order_relaxed) && g_offFollow &&
