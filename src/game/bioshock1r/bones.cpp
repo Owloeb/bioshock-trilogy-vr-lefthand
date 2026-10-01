@@ -99,6 +99,10 @@ constexpr float kSwayAngThreshDeg = 12.0f;
 // After a real animation, keep tracking this long past the LAST threshold
 // crossing so the freeze lands on the SETTLED pose, not the last big frame.
 constexpr uint64_t kSwaySettleMs = 600;
+// A shot is an animation by definition: the weapon's fire animation tracks
+// for this long after each one whatever its size (see note_weapon_shot).
+constexpr uint64_t kShotTrackMs = 450;
+std::atomic<uint64_t> g_lastShotMs{0};
 uint64_t g_lastBigDeltaMs = 0;
 // Telemetry (1 Hz while frozen): the probe deltas the threshold judges, so
 // the thresholds are set from measured idle amplitude, not guesses.
@@ -2419,6 +2423,7 @@ int ride_part_auto() { return g_autoPart.load(std::memory_order_relaxed); }
 void set_jack_fire_cycle(bool on) { g_jackFireCycle.store(on, std::memory_order_relaxed); }
 void set_keep_weapon_socket(bool on) { g_keepSocket.store(on, std::memory_order_relaxed); }
 void set_clip_empty(bool empty) { g_clipEmpty.store(empty, std::memory_order_relaxed); }
+void note_weapon_shot() { g_lastShotMs.store(GetTickCount64(), std::memory_order_relaxed); }
 void set_jack_reloads(bool on) { g_jackReloads.store(on, std::memory_order_relaxed); }
 bool jack_reloads() { return g_jackReloads.load(std::memory_order_relaxed); }
 int ride_part_active() { return g_ridePartUi.load(std::memory_order_relaxed); }
@@ -2505,6 +2510,13 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
                 if (angDeg > maxAng) maxAng = angDeg;
             }
             if (maxPos > kSwayPosThreshUu || maxAng > kSwayAngThreshDeg)
+                g_lastBigDeltaMs = nowMs;
+            // The pistol's fire kick sits near the 6 UU / 12 deg gate, so
+            // against some frozen references it never cleared it: no fire
+            // animation at all (only our simulated recoil), and a reference
+            // frozen off its settled pose tilted the barrel aim until a hand
+            // swap recaptured it. A real shot always tracks.
+            if (nowMs - g_lastShotMs.load(std::memory_order_relaxed) < kShotTrackMs)
                 g_lastBigDeltaMs = nowMs;
             // Track through the animation AND a settle window past its last
             // big frame, so the eventual freeze holds the SETTLED pose.
@@ -2644,21 +2656,37 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         uint16_t btn = 0;
         bvr::input::last_composed_buttons(&btn);
         if (btn & 0x4000) g_lastReloadBtnMs = nowJ; // XINPUT_GAMEPAD_X: reload
+        // A reload outlives the 4 s cap ref_animating() puts on any one run of
+        // motion (that cap is for idle loops): a shotgun's shell-by-shell load
+        // and the crossbow's reload-and-slam both run past it, and Jack's hand
+        // used to vanish for the rest (shells flying in on their own). Once a
+        // run is a reload it stays one while the engine keeps animating
+        // (g_refTracking, uncapped) and across the short pauses between its
+        // strokes, up to 15 s.
+        static uint64_t s_reloadStartMs = 0, s_reloadLastMoveMs = 0;
+        if (g_animIsReload) {
+            if (g_refTracking) s_reloadLastMoveMs = nowJ;
+            if (nowJ - s_reloadLastMoveMs > 350 || nowJ - s_reloadStartMs > 15000) g_animIsReload = false;
+        }
+        const bool wasReload = g_animIsReload;
         if (animating && !g_animWasOn)
-            g_animIsReload = !firingWindow || nowJ - g_lastReloadBtnMs < 800;
+            g_animIsReload = g_animIsReload || !firingWindow || nowJ - g_lastReloadBtnMs < 800;
         // An empty magazine makes any animation the reload - including the
         // automatic one that runs straight on from the last shot.
         if (animating && (g_clipEmpty.load(std::memory_order_relaxed) ||
                           g_jackFireCycle.load(std::memory_order_relaxed)))
             g_animIsReload = true;
-        if (!animating) g_animIsReload = false;
+        if (g_animIsReload && !wasReload) {
+            s_reloadStartMs = nowJ;
+            s_reloadLastMoveMs = nowJ;
+        }
         const bool animStart = animating && !g_animWasOn;
         g_animWasOn = animating;
         g_jackWant = g_jackReloads.load(std::memory_order_relaxed) && g_offFollow &&
                      g_animIsReload && g_liveValid;
         // One line per reload-class animation (never per shot): every input
         // to "show Jack's hand", so an intermittent miss names its cause.
-        if (animStart && (g_animIsReload || nowJ - g_lastReloadBtnMs < 800)) {
+        if (animStart && !wasReload && (g_animIsReload || nowJ - g_lastReloadBtnMs < 800)) {
             BVR_LOG("[bones] %s reload anim: jack hand %s (setting %d, grip held %d, counted as reload %d "
                     "[X %llums ago, firing window %d, mag empty %d, between-shots %d], live pose %d)",
                     g_placeWeapon, g_jackWant ? "SHOWN" : "not shown",

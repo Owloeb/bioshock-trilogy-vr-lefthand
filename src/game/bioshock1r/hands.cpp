@@ -980,6 +980,7 @@ bool recoil_kick(const FrameContext& ctx, const GamePose& gp, bool held, Kick& k
         if (strcmp(key, r.weapon) == 0) spec = &r;
     const uint32_t newShots = shots - g_rcShots;
     g_rcShots = shots;
+    if (newShots && newShots < 8) bones::note_weapon_shot(); // the fire animation must show
     if (spec && newShots && newShots < 8 && g_recoilOn.load(std::memory_order_relaxed)) {
         const float sc = g_recoilScale.load(std::memory_order_relaxed) * (held ? 0.55f : 1.0f);
         for (uint32_t n = 0; n < newShots; ++n) {

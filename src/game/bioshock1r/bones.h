@@ -74,6 +74,9 @@ void set_anim_log(bool on);
 // (component space), and whether the reference is following an animation.
 bool live_wrists(float lw[3], float rw[3], float attach[3]);
 bool ref_animating_now();
+// The weapon hand just fired (hands, from the shot counter): its fire animation
+// is adopted whatever its size for the next ~450 ms.
+void note_weapon_shot();
 // Log any actor's skeleton (bone names + reference pose) under [tag].
 void log_skeleton(void* actor, const char* tag);
 // Two-handed grip, follow v5: what the held hand rides for the weapon in hand.
