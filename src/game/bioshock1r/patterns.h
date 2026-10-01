@@ -645,6 +645,33 @@ inline constexpr uint32_t kFgSceneNodeBytes = 0x400;
 // first headset run.
 inline constexpr uint32_t kHandsCurrentHoldableOffset = 0x45C;
 
+// ---- EVE hypo (2026-09-30, EVE probe v1-v4, headset runs) --------------------
+// Derived with the read-only `[eve]` probe (eve.cpp): a frame-to-frame dword
+// watch of the pawn/controller/hands/syringe with noisy words masked, plus the
+// attach-update hook naming every actor attached to the hands. ENGINE_NOTES
+// "EVE hypo: the syringe actor, the EVE level, the injection".
+//   - AShockPlayer EVE level: float at pawn+0xAF8. Electro Bolt cast 49 -> 33.7
+//     -> 18.4 -> 3.1 -> 0 (and 49 -> 32 -> 15 at another upgrade level); an
+//     injection lands as one jump to the cap (18.4 -> 49, 0 -> 49) ~1.85 s
+//     after the press.
+//   - The pawn's PlasmidManager at pawn+0x944 (InventoryManager at +0x948 holds
+//     ammo CLASSES - no EVE hypo entry, no counts that change on injection).
+//   - AHands action state at hands+0x494: 5 at rest, 1 while an action (cast,
+//     injection) runs.
+//   - The syringe is a persistent BioAmmoHypoTool actor (3 bones: R_Grip,
+//     kBone_Plunger, kBone_PlungerNUB). On X with a plasmid raised the game
+//     sets its Base (+0x0B0) to the PlayerHands and its attach bone FName
+//     (+0x0F0) to "Pistol" - the hands' weapon socket - and clears both again
+//     the moment the EVE lands. While put away it is hidden; the console's
+//     `set BioAmmoHypoTool bHidden False/True` (UGameEngine::Exec) shows/hides
+//     it, and writing AActor::Location/Rotation places it (proven in-headset).
+inline constexpr uint32_t kPawnEveOffset = 0xAF8;            // float, current EVE
+inline constexpr uint32_t kPawnPlasmidManagerOffset = 0x944; // UPlasmidManager*
+inline constexpr uint32_t kHandsActionStateOffset = 0x494;   // int, 5 = idle
+inline constexpr uint32_t kHandsCurrentAbilityOffset = 0x454; // raised plasmid (0 with a gun up)
+inline constexpr uint32_t kHypoToolBaseOffset = 0x0B0;       // AActor::Base
+inline constexpr uint32_t kHypoToolAttachBoneOffset = 0x0F0; // FName index
+
 // ---- UObject identity (session 21) ------------------------------------------
 // Derived live via the seam: the equipped weapon actor's +0x28 dword read
 // 18009 -> 'Shotgun' through fname_text (+0x2C = the instance number), and

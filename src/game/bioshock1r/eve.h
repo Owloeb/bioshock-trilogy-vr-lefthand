@@ -22,6 +22,23 @@ void tick();
 void on_attach(void* parent, void* child);
 // The probe is running (the attach hook installs itself while it is).
 bool probe_on();
+
+// What the holster needs from the drawn rig, in WORLD space as you SEE it
+// (already reflected back through the viewmodel mirror when it is on).
+struct Targets {
+    bool socketOk = false;      // the weapon hand's gun socket ("Pistol")
+    float socket[3];
+    float sockF[3], sockU[3];   // its forward / up
+    bool wristOk = false;       // the plasmid hand's wrist
+    float wrist[3];
+    bool elbowOk = false;       // the plasmid elbow (arms on)
+    float elbow[3];
+    float worldScale = 50.0f;   // UU per metre
+};
+// Game thread, once per frame from hands after the rig is drawn.
+void set_targets(const Targets& t);
+// The hands-bone index of the syringe's socket, once found (-1 before).
+int socket_bone();
 // F10 section (render thread).
 void draw_debug_ui();
 

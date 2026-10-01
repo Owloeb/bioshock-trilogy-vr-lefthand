@@ -97,6 +97,14 @@ void set_jack_fire_cycle(bool on);
 bool jack_reloads();
 // World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
 bool written_world(int idx, float out[3]);
+// World pose (location + quaternion, engine space) of a bone the last drive
+// wrote - cluster bones and, with arms on, the arm bones.
+bool written_world_pose(int idx, float loc[3], float q[4]);
+// Engine-space world pose of a weapon-hand socket bone (e.g. "Pistol") as
+// drawn, derived from the drawn wrist so it holds while a plasmid is raised.
+bool weapon_socket_world(int socket, float loc[3], float q[4]);
+// Index of a hands-rig bone by name, -1 if absent (reads game memory).
+int hands_bone_index(const wchar_t* name);
 // The gun's barrel direction in the drive target's frame: its idle forward,
 // learned at rest in the attach bone's frame and carried through animations.
 // Falls back to 43->44 before the first rest.

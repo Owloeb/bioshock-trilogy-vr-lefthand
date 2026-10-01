@@ -3518,3 +3518,35 @@ fg path (route B - unnecessary, the cluster lever passed first) and the fovA
 consumer hunt (route A - stays parked with its in-headset world-coupling
 negative). `kActorDrawScaleOffset`/dirty-protocol constants remain declared,
 still unreferenced.
+
+## 2026-09-30 - EVE hypo: the syringe actor, the EVE level, the injection
+
+Found with the read-only `[eve]` probe (`src/game/bioshock1r/eve.cpp`, F10 -> Developer tools
+-> EVE probe): a frame-to-frame dword watch of the pawn, controller, hands and syringe with
+noisy words masked (more than 6 changes in 10 s), the attach-update hook naming every actor
+attached to the hands, and pointer/TArray censuses. Four headset runs.
+
+- **EVE level** = float at `AShockPlayer+0xAF8` (`kPawnEveOffset`). Electro Bolt casts drop it
+  in equal steps (15.3 at one upgrade level, 17 at another); an injection lands as ONE jump to
+  the cap (18.4 -> 49, 0 -> 49) ~1.85 s after the press. No regeneration.
+- **The injection**: X with a plasmid raised (the pad's reload/hack/EVE button). The game
+  attaches a persistent `BioAmmoHypoTool` actor to the PlayerHands - Base (`+0x0B0`) = hands,
+  attach-bone FName (`+0x0F0`) = `Pistol`, the hands' weapon socket - and clears both the
+  moment the EVE lands. The same actor is reused every time. The automatic injection (cast
+  with too little EVE) runs the same path ~1.6 s after the cast press.
+- **The syringe** has three bones: `R_Grip` (origin, identity - it hangs from the socket like
+  a weapon), `kBone_Plunger`, `kBone_PlungerNUB` (the plunger runs down local -Z).
+- **Showing it outside the game's own injection**: the console's
+  `set BioAmmoHypoTool bHidden False/True` (through UGameEngine::Exec, console_exec) shows and
+  hides it - the bit flips its render-state fields (`+0x13C..+0x154`, `+0x3A8..+0x3B0`) rather
+  than anything visible in the flag word at `+0x0D0`, whose `0x100000` bit only pulses for a
+  frame around attach/detach (a first guess that it was bHidden was disproven in-headset).
+  Writing `AActor::Location`/`Rotation` places it (proven: parked in front of the eyes).
+- **AHands action state** `hands+0x494`: 5 at rest, 1 while an action (cast, injection) runs.
+  `hands+0x454` holds the raised plasmid's ability object (0 with a gun up) - its class names
+  the plasmid.
+- **Inventory**: `pawn+0x948` InventoryManager keeps ammo CLASSES (`Shotgun_00Buck`,
+  `Crossbow_Bolt`, ...) and no EVE hypo entry; neither it nor its lists change on an injection
+  or a pickup. The hypo COUNT is not located yet; `pawn+0x944` PlasmidManager is the
+  candidate, and the holster learns it at runtime (the int that drops by exactly one across
+  two injections).

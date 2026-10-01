@@ -2948,6 +2948,61 @@ bool barrel_dir_target(float yawDeg, float pitchDeg, float out[3]) {
     return true;
 }
 
+// World pose of a bone the last drive wrote (cluster or arm), else false.
+bool written_world_pose(int idx, float loc[3], float q[4]) {
+    if (!g_lastActorValid) return false;
+    const float* p = nullptr;
+    const float* r = nullptr;
+    for (int k = 0; k < g_cacheCount && !p; ++k)
+        if (g_cache[k].idx == idx) {
+            p = g_cache[k].p;
+            r = g_cache[k].q;
+        }
+    for (int k = 0; k < g_cacheSleeveCount && !p; ++k)
+        if (g_cacheSleeve[k].idx == idx && g_cacheSleeve[k].writeQ) {
+            p = g_cacheSleeve[k].p;
+            r = g_cacheSleeve[k].q;
+        }
+    if (!p) return false;
+    float rp[3];
+    qts_rotate(g_lastQa, p, rp);
+    for (int i = 0; i < 3; ++i) loc[i] = g_lastActorLoc[i] + rp[i];
+    quat_mul(g_lastQa, r, q);
+    return true;
+}
+
+int hands_bone_index(const wchar_t* name) {
+    if (!g_skelInst || !g_bones || g_boneCount <= 0 || !name) return -1;
+    Skel sk{g_skelInst, g_bones, g_boneCount};
+    const wchar_t* names[kMaxBones];
+    const int n = g_boneCount < kMaxBones ? g_boneCount : kMaxBones;
+    resolve_bone_names(sk, names, n);
+    for (int i = 0; i < n; ++i)
+        if (names[i] && wcscmp(names[i], name) == 0) return i;
+    return -1;
+}
+
+bool weapon_socket_world(int socket, float loc[3], float q[4]) {
+    // From the drawn weapon WRIST, not the socket bone itself: while a plasmid
+    // is raised the drive parks the socket (43) far below to hide the
+    // holstered gun. The wrist->socket relation is the reference's.
+    const int w = patterns::kBoneRClusterFirst, a = socket;
+    if (!g_refValid || a < 0 || a >= g_boneCount) return false;
+    float wl[3], wq[4];
+    if (!written_world_pose(w, wl, wq)) return false;
+    float wi[4], rel[3], relW[3], qr[4];
+    quat_conj(g_ref[w].q, wi);
+    const float s = g_scale[1].load(std::memory_order_relaxed);
+    const float d[3] = {(g_ref[a].p[0] - g_ref[w].p[0]) * s, (g_ref[a].p[1] - g_ref[w].p[1]) * s,
+                        (g_ref[a].p[2] - g_ref[w].p[2]) * s};
+    qts_rotate(wi, d, rel);
+    qts_rotate(wq, rel, relW);
+    for (int i = 0; i < 3; ++i) loc[i] = wl[i] + relW[i];
+    quat_mul(wi, g_ref[a].q, qr);
+    quat_mul(wq, qr, q);
+    return true;
+}
+
 bool written_world(int idx, float out[3]) {
     for (int k = 0; k < g_cacheCount; ++k) {
         if (g_cache[k].idx != idx) continue;

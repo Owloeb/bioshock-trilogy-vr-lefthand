@@ -102,6 +102,15 @@ void last_composed_bumpers(bool* lb, bool* rb);
 // read-only; session 42 consumer is BS2's menukey lane (pad-A -> Enter).
 void last_composed_buttons(uint16_t* buttons);
 
+// BS1 EVE holster (additive - nothing changes unless a game calls these):
+// press `buttons` for `ms` on top of everything composed (the game sees a
+// normal pad press), and hold `buttons` and/or a trigger back from the game
+// for `ms` (call every frame to keep it held back). last_unsuppressed_triggers
+// is what the player is actually pulling, before the hold-back.
+void pulse_buttons(uint16_t buttons, uint32_t ms);
+void suppress_input(uint16_t buttons, bool lt, bool rt, uint32_t ms);
+void last_unsuppressed_triggers(uint8_t* lt, uint8_t* rt);
+
 // s50 (Infinite): the FLOURISH CHORD - left thumbrest touched + A pressed.
 // arm_flourish_chord(true) makes the XR composer consume A while the left
 // thumbrest is touched and count rising A edges; flourish_chord_edges() is

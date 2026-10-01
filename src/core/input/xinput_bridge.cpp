@@ -186,6 +186,11 @@ struct TimedTrig  { uint8_t v = 0;        uint64_t deadline = 0; };
 TimedStick g_testStickL, g_testStickR;
 TimedTrig  g_testTrigL, g_testTrigR;
 uint64_t g_testBtnDeadline[16] = {}; // per XINPUT button bit index
+// EVE holster hold-back (suppress_input) and the triggers before it.
+std::atomic<uint32_t> g_supButtons{0};
+std::atomic<uint32_t> g_supTrig{0}; // bit 0 = LT, bit 1 = RT
+std::atomic<uint64_t> g_supDeadline{0};
+std::atomic<uint16_t> g_preSupTriggers{0};
 
 Gamepad g_lastComposed{};
 // Last composed triggers (lt low byte, rt high byte) for the M6 aim path -
@@ -417,6 +422,16 @@ void compose_over(DWORD userIndex, XINPUT_STATE* xs, DWORD* result) {
                                                                : lroundf(yr));
             }
         }
+    }
+    // EVE holster hold-back: the game never sees these while it is armed.
+    g_preSupTriggers.store(static_cast<uint16_t>(out.lt) |
+                               static_cast<uint16_t>(static_cast<uint16_t>(out.rt) << 8),
+                           std::memory_order_relaxed);
+    if (now < g_supDeadline.load(std::memory_order_relaxed)) {
+        out.buttons &= static_cast<uint16_t>(~g_supButtons.load(std::memory_order_relaxed));
+        const uint32_t t = g_supTrig.load(std::memory_order_relaxed);
+        if (t & 1u) out.lt = 0;
+        if (t & 2u) out.rt = 0;
     }
     if (g_packetBump || memcmp(&out, &g_lastComposed, sizeof out) != 0) {
         ++g_packet;
@@ -787,6 +802,25 @@ void last_composed_buttons(uint16_t* buttons) {
     // composed (VR) path and the disabled/real-pad path, so a consumer reading
     // edges here covers a physical pad too. Session 42: BS2's menukey lane.
     if (buttons) *buttons = g_lastButtons.load(std::memory_order_relaxed);
+}
+
+void pulse_buttons(uint16_t buttons, uint32_t ms) {
+    const uint64_t deadline = GetTickCount64() + ms;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (int i = 0; i < 16; ++i)
+        if (buttons & (1u << i)) g_testBtnDeadline[i] = deadline;
+}
+
+void suppress_input(uint16_t buttons, bool lt, bool rt, uint32_t ms) {
+    g_supButtons.store(buttons, std::memory_order_relaxed);
+    g_supTrig.store((lt ? 1u : 0u) | (rt ? 2u : 0u), std::memory_order_relaxed);
+    g_supDeadline.store(GetTickCount64() + ms, std::memory_order_relaxed);
+}
+
+void last_unsuppressed_triggers(uint8_t* lt, uint8_t* rt) {
+    const uint16_t t = g_preSupTriggers.load(std::memory_order_relaxed);
+    if (lt) *lt = static_cast<uint8_t>(t & 0xFF);
+    if (rt) *rt = static_cast<uint8_t>(t >> 8);
 }
 
 void last_composed_sticks(int16_t* lx, int16_t* ly, int16_t* rx, int16_t* ry) {

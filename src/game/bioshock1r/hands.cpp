@@ -1060,6 +1060,59 @@ void reflect_point(float p[3], const float P[3], const float n[3]) {
     for (int i = 0; i < 3; ++i) p[i] -= k * n[i];
 }
 
+// EVE holster targets: the weapon hand's gun socket and the plasmid forearm,
+// in world space AS SEEN - the engine rig is the mirror image of what is shown
+// whenever the viewmodel mirror is on, so reflect back through the same plane
+// the render uses (the gun/eye plane, or the head plane in head-plane mode).
+void publish_eve_targets(const FrameContext& ctx, bool mirrorPose, bool gunPlane,
+                         const GamePose& headW) {
+    eve::Targets t;
+    t.worldScale = ctx.worldScale;
+    float planeP[3] = {}, planeN[3] = {};
+    bool reflect = false;
+    if (mirrorPose && gunPlane) {
+        memcpy(planeP, g_eyePlaneQ, 12);
+        memcpy(planeN, g_eyePlaneN, 12);
+        reflect = true;
+    } else if (mirrorPose) {
+        float hf[3], hu[3];
+        ue_rot_basis(headW.rot, hf, planeN, hu);
+        planeP[0] = headW.loc.x;
+        planeP[1] = headW.loc.y;
+        planeP[2] = headW.loc.z;
+        reflect = true;
+    }
+    auto seen_point = [&](float p[3]) {
+        if (reflect) reflect_point(p, planeP, planeN);
+    };
+    auto seen_vec = [&](float v[3]) {
+        if (!reflect) return;
+        float o[3];
+        reflect_vec(v, planeN, o);
+        memcpy(v, o, 12);
+    };
+    const int sock = eve::socket_bone();
+    float q[4];
+    if (sock >= 0 && bones::weapon_socket_world(sock, t.socket, q)) {
+        static const float kX[3] = {1, 0, 0}, kZ[3] = {0, 0, 1};
+        quat_rotate(q[0], q[1], q[2], q[3], kX, t.sockF);
+        quat_rotate(q[0], q[1], q[2], q[3], kZ, t.sockU);
+        seen_point(t.socket);
+        seen_vec(t.sockF);
+        seen_vec(t.sockU);
+        t.socketOk = true;
+    }
+    if (bones::written_world_pose(patterns::kBoneLWrist, t.wrist, q)) {
+        seen_point(t.wrist);
+        t.wristOk = true;
+    }
+    if (bones::written_world_pose(patterns::kBoneLSleeve[2], t.elbow, q)) {
+        seen_point(t.elbow);
+        t.elbowOk = true;
+    }
+    eve::set_targets(t);
+}
+
 // Publish both clusters' shoulder + elbow-pole targets for this frame.
 void publish_arm_targets(const FrameContext& ctx, bool mirrorPose, bool gunPlane) {
     if (!g_armsLoaded) arms_load();
@@ -1847,7 +1900,7 @@ void reflect_point(float p[3]) {
 uint32_t __fastcall attach_update_detour(void* self, void* edx, void* parent, void* child,
                                          void* a3, void* a4) {
     const uint32_t r = g_attachOrig(self, edx, parent, child, a3, a4);
-    if (eve::probe_on()) eve::on_attach(parent, child);
+    eve::on_attach(parent, child); // the EVE holster learns its syringe from the hands' attaches
     if (!child || !parent || parent != g_flipWeapon ||
         !g_effectsFlip.load(std::memory_order_relaxed) ||
         GetCurrentThreadId() != g_gameTid || GetTickCount64() - g_pgStampMs > 150)
@@ -1937,9 +1990,9 @@ void on_calcview(const FrameContext& ctx) {
     MirrorArm mirrorArm;
     g_gameTid = GetCurrentThreadId();
     if (!g_poseHookTried && g_effectsFollow.load(std::memory_order_relaxed)) install_pose_hook();
-    if (!g_attachHookTried && ((mirror_wanted() && g_effectsFlip.load(std::memory_order_relaxed)) ||
-                               eve::probe_on()))
-        install_attach_hook();
+    // Also for the EVE holster (it finds the syringe through this hook); the
+    // effects flip inside stays gated on the mirror as before.
+    if (!g_attachHookTried) install_attach_hook();
     eve::tick();
     {
         int nb = 0;
@@ -2214,6 +2267,7 @@ void on_calcview(const FrameContext& ctx) {
         bonewatch::mark_drive_begin();
         const bool drove = bones::drive(ctx, target, gp, hand);
         bonewatch::mark_drive_end();
+        if (drove) publish_eve_targets(ctx, mirrorPose, gunPlaneLive, headW);
         if (!drove) {
             mirrorArm.arm = false; // rig not driven: never reflect an unplaced rig
             g_postTarget = nullptr;

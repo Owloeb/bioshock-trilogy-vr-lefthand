@@ -3,6 +3,8 @@
 #include "core/input/xinput_bridge.h"
 #include "core/ui/overlay.h"
 #include "core/util/log.h"
+#include "core/util/xr_math.h"
+#include "core/vr/openxr_runtime.h"
 #include "game/bioshock1r/bones.h"
 #include "game/bioshock1r/camera.h"
 #include "game/bioshock1r/console_exec.h"
@@ -504,12 +506,591 @@ void input_edges() {
     edge(rb, g_rbPrev, "RB (raise weapon)");
 }
 
+
+// =============================================================================
+// THE HOLSTER (feature). Weapon hand at the hip + grip = Jack's EVE syringe in
+// that hand (the game's own BioAmmoHypoTool, un-hidden and placed on the hand's
+// gun socket every frame). Needle tip inside the plasmid forearm = it sticks,
+// both hands buzz; weapon trigger = the game's REAL injection (X with the
+// plasmid raised): it attaches the same syringe to the same socket, runs the
+// plunger, and the EVE lands ~1.85 s later. Let go of the grip first and the
+// syringe goes back. Casts the EVE cannot pay for are held back, so the game
+// never injects on its own.
+// =============================================================================
+std::atomic<bool> g_holsterOn{true};
+std::atomic<bool> g_blockAuto{true};
+std::atomic<float> g_hipDropM{0.62f};  // below the eyes
+std::atomic<float> g_hipSideM{0.20f};  // out to the weapon hand's side
+std::atomic<float> g_hipFwdM{0.02f};   // forward of the eyes
+std::atomic<float> g_zoneM{0.14f};     // grab radius
+std::atomic<float> g_needleUu{14.0f};  // needle tip below the grip (syringe axis)
+std::atomic<bool> g_cfgDirty{false};
+bool g_cfgLoaded = false;
+
+enum class Hs { Idle, Held, In, Injecting };
+Hs g_hs = Hs::Idle;
+std::atomic<int> g_hsUi{0};
+Targets g_tg;
+uint64_t g_tgMs = 0;
+bool g_squeeze = false;
+bool g_inZone = false;
+bool g_trigPrev = false;
+bool g_shown = false;
+uint64_t g_stateMs = 0, g_lastBuzzMs = 0, g_xQueuedMs = 0;
+bool g_xQueued = false;
+float g_bodyFwd[2] = {0.0f, -1.0f}; // XR horizontal body forward (x, z)
+bool g_bodyInit = false;
+float g_eveAtInject = 0.0f;
+int g_socket = -1;
+void* g_socketSkel = nullptr;
+
+// Syringe discovery: from its attach (the first injection) or, before that, a
+// bounded search of objects linked from the pawn, hands and plasmid manager.
+void* g_hypoChecked[64];
+int g_hypoCheckedAt = 0;
+uint64_t g_hypoSearchMs = 0;
+int g_hypoSearches = 0;
+void* g_hypoSearchWorld = nullptr;
+
+// EVE costs per plasmid class (learned from the drop at each cast).
+struct Cost {
+    char cls[48];
+    float cost;
+};
+Cost g_costs[16];
+int g_costCount = 0;
+float g_evePrev = -1.0f;
+uint64_t g_lastLtMs = 0;
+std::atomic<float> g_eveUi{-1.0f}, g_costUi{-1.0f};
+std::atomic<int> g_countUi{-1};
+
+std::string g_curPlasmid;
+
+void cfg_path(wchar_t* out, size_t n) { swprintf_s(out, n, L"%s\\eve.ini", bvr::log::data_dir()); }
+void cfg_save() {
+    wchar_t path[MAX_PATH];
+    cfg_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
+    fprintf(f, "# BioShock VR - EVE holster\n");
+    fprintf(f, "holster=%d\nblockAutoInject=%d\nhipDropM=%.3f\nhipSideM=%.3f\nhipFwdM=%.3f\nzoneM=%.3f\nneedleUu=%.1f\n",
+            g_holsterOn.load() ? 1 : 0, g_blockAuto.load() ? 1 : 0, g_hipDropM.load(), g_hipSideM.load(),
+            g_hipFwdM.load(), g_zoneM.load(), g_needleUu.load());
+    fclose(f);
+}
+void cfg_load() {
+    g_cfgLoaded = true;
+    wchar_t path[MAX_PATH];
+    cfg_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        char key[48] = {};
+        float v = 0.0f;
+        if (line[0] == '#' || sscanf_s(line, "%47[^=]=%f", key, static_cast<unsigned>(sizeof key), &v) != 2) continue;
+        if (!strcmp(key, "holster")) g_holsterOn.store(v != 0.0f);
+        else if (!strcmp(key, "blockAutoInject")) g_blockAuto.store(v != 0.0f);
+        else if (!strcmp(key, "hipDropM")) g_hipDropM.store(v);
+        else if (!strcmp(key, "hipSideM")) g_hipSideM.store(v);
+        else if (!strcmp(key, "hipFwdM")) g_hipFwdM.store(v);
+        else if (!strcmp(key, "zoneM")) g_zoneM.store(v);
+        else if (!strcmp(key, "needleUu")) g_needleUu.store(v);
+    }
+    fclose(f);
+}
+
+void* pawn_of() {
+    void* h = hands::hands_actor();
+    void* pawn = nullptr;
+    if (h) read_block(static_cast<uint8_t*>(h) + patterns::kActorBaseOffset, &pawn, 4);
+    return pawn;
+}
+float eve_level() {
+    void* pawn = pawn_of();
+    float v = -1.0f;
+    if (!pawn || !read_block(static_cast<uint8_t*>(pawn) + patterns::kPawnEveOffset, &v, 4)) return -1.0f;
+    return (v >= 0.0f && v < 10000.0f) ? v : -1.0f;
+}
+bool hypo_valid() { return g_hypo && class_of(g_hypo) == "BioAmmoHypoTool"; }
+bool hypo_attached() {
+    void* base = nullptr;
+    return g_hypo && read_block(static_cast<uint8_t*>(g_hypo) + patterns::kHypoToolBaseOffset, &base, 4) && base;
+}
+void hypo_show(bool on) {
+    if (on == g_shown) return;
+    g_shown = on;
+    console_exec::run_engine(on ? "set BioAmmoHypoTool bHidden False" : "set BioAmmoHypoTool bHidden True");
+}
+
+// Bounded breadth-first search for the syringe actor among objects linked
+// from the pawn / hands / plasmid manager (pointer fields + TArray elements).
+void* search_hypo() {
+    void* pawn = pawn_of();
+    void* seeds[3] = {pawn, hands::hands_actor(), nullptr};
+    if (pawn) read_block(static_cast<uint8_t*>(pawn) + patterns::kPawnPlasmidManagerOffset, &seeds[2], 4);
+    void* queue[160];
+    int depth[160];
+    int qn = 0, qi = 0;
+    for (void* sd : seeds)
+        if (sd && qn < 160) {
+            queue[qn] = sd;
+            depth[qn++] = 0;
+        }
+    while (qi < qn) {
+        void* o = queue[qi];
+        const int d = depth[qi++];
+        uint32_t w[0x600 / 4];
+        if (!read_block(o, w, sizeof w)) continue;
+        auto visit = [&](uint32_t v) -> void* {
+            if (v < 0x10000 || (v & 3)) return nullptr;
+            void* p = reinterpret_cast<void*>(static_cast<uintptr_t>(v));
+            if (!patterns::object_class_name(p)) return nullptr;
+            if (class_of(p) == "BioAmmoHypoTool") return p;
+            if (d < 2 && qn < 160) {
+                for (int k = 0; k < qn; ++k)
+                    if (queue[k] == p) return nullptr;
+                queue[qn] = p;
+                depth[qn++] = d + 1;
+            }
+            return nullptr;
+        };
+        for (uint32_t i = 0; i < 0x600 / 4; ++i) {
+            if (void* hit = visit(w[i])) return hit;
+            // TArray {data, count, max}
+            if (i + 2 < 0x600 / 4 && w[i] >= 0x10000 && !(w[i] & 3) && w[i + 1] && w[i + 1] <= 32 &&
+                w[i + 2] >= w[i + 1] && w[i + 2] <= 4096) {
+                uint32_t el[32];
+                if (read_block(reinterpret_cast<void*>(static_cast<uintptr_t>(w[i])), el, w[i + 1] * 4))
+                    for (uint32_t k = 0; k < w[i + 1]; ++k)
+                        if (void* hit = visit(el[k])) return hit;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// ---- hypo count (learned): the int in the plasmid manager (or its lists)
+// that drops by exactly one across an injection and only then.
+constexpr int kCountWords = 0x800 / 4;
+struct CountSnap {
+    uint32_t obj[kCountWords];
+    uint32_t arr[6][32];
+    uint32_t arrOff[6], arrN[6];
+    uintptr_t arrData[6];
+    int arrs = 0;
+    bool ok = false;
+};
+CountSnap g_cs[6]; // rolling, every 500 ms
+int g_csAt = 0;
+uint64_t g_csMs = 0;
+uint8_t g_cntScore[kCountWords + 6 * 32];
+int g_cntLearned = -1; // index into the combined space
+void* g_cntPm = nullptr;
+
+void count_snap(CountSnap& c) {
+    void* pawn = pawn_of();
+    void* pm = nullptr;
+    c.ok = false;
+    if (!pawn || !read_block(static_cast<uint8_t*>(pawn) + patterns::kPawnPlasmidManagerOffset, &pm, 4) || !pm) return;
+    if (pm != g_cntPm) {
+        g_cntPm = pm;
+        g_cntLearned = -1;
+        memset(g_cntScore, 0, sizeof g_cntScore);
+    }
+    if (!read_block(pm, c.obj, sizeof c.obj)) return;
+    c.arrs = 0;
+    for (uint32_t i = 0; i + 2 < kCountWords && c.arrs < 6; ++i) {
+        const uint32_t data = c.obj[i], n = c.obj[i + 1], mx = c.obj[i + 2];
+        if (data < 0x10000 || (data & 3) || n == 0 || n > 32 || mx < n || mx > 4096) continue;
+        if (!read_block(reinterpret_cast<void*>(static_cast<uintptr_t>(data)), c.arr[c.arrs], n * 4)) continue;
+        c.arrOff[c.arrs] = i * 4;
+        c.arrN[c.arrs] = n;
+        c.arrData[c.arrs] = data;
+        ++c.arrs;
+        i += 2;
+    }
+    c.ok = true;
+}
+int count_value(const CountSnap& c, int idx) {
+    if (idx < kCountWords) return static_cast<int32_t>(c.obj[idx]);
+    const int a = (idx - kCountWords) / 32, k = (idx - kCountWords) % 32;
+    if (a >= c.arrs || static_cast<uint32_t>(k) >= c.arrN[a]) return -1;
+    return static_cast<int32_t>(c.arr[a][k]);
+}
+// An injection just landed: compare with the snapshot from ~3 s before.
+void count_learn() {
+    CountSnap now;
+    count_snap(now);
+    const CountSnap& old = g_cs[g_csAt]; // oldest in the ring
+    if (!now.ok || !old.ok || now.arrs != old.arrs) return;
+    int best = -1, bestScore = 0, cands = 0;
+    for (int idx = 0; idx < kCountWords + 6 * 32; ++idx) {
+        const int a = count_value(old, idx), b = count_value(now, idx);
+        if (a >= 1 && a < 100 && b == a - 1) {
+            if (g_cntScore[idx] < 255) ++g_cntScore[idx];
+            ++cands;
+        } else if (a != b) {
+            g_cntScore[idx] = 0;
+        }
+        if (g_cntScore[idx] > bestScore) {
+            bestScore = g_cntScore[idx];
+            best = idx;
+        }
+    }
+    if (bestScore >= 2 && best != g_cntLearned) {
+        g_cntLearned = best;
+        BVR_LOG("[eve] hypo count learned: plasmid manager %s 0x%X = %d", best < kCountWords ? "field" : "list",
+                best < kCountWords ? best * 4 : best, count_value(now, best));
+    }
+    (void)cands;
+}
+int hypo_count() {
+    if (g_cntLearned < 0) return -1;
+    CountSnap c;
+    count_snap(c);
+    return c.ok ? count_value(c, g_cntLearned) : -1;
+}
+
+float cost_of(const std::string& cls) {
+    for (int i = 0; i < g_costCount; ++i)
+        if (cls == g_costs[i].cls) return g_costs[i].cost;
+    return -1.0f;
+}
+void cost_learn(const std::string& cls, float drop) {
+    if (cls.empty() || drop <= 0.5f) return;
+    for (int i = 0; i < g_costCount; ++i)
+        if (cls == g_costs[i].cls) {
+            if (drop > g_costs[i].cost) g_costs[i].cost = drop;
+            return;
+        }
+    if (g_costCount < 16) {
+        strncpy_s(g_costs[g_costCount].cls, sizeof g_costs[g_costCount].cls, cls.c_str(), _TRUNCATE);
+        g_costs[g_costCount++].cost = drop;
+        BVR_LOG("[eve] %s costs %.1f EVE", cls.c_str(), drop);
+    }
+}
+
+void v3_sub(const float a[3], const float b[3], float o[3]) {
+    for (int i = 0; i < 3; ++i) o[i] = a[i] - b[i];
+}
+float v3_dot(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+float seg_dist(const float p[3], const float a[3], const float b[3]) {
+    float ab[3], ap[3];
+    v3_sub(b, a, ab);
+    v3_sub(p, a, ap);
+    const float l2 = v3_dot(ab, ab);
+    float t = l2 > 1e-6f ? v3_dot(ap, ab) / l2 : 0.0f;
+    t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
+    float c[3];
+    for (int i = 0; i < 3; ++i) c[i] = a[i] + ab[i] * t - p[i];
+    return sqrtf(v3_dot(c, c));
+}
+
+// FRotator from forward + up (UE basis; right implied - a proper frame).
+void basis_to_rot(const float f[3], const float u[3], int32_t out[3]) {
+    constexpr float k = 32768.0f / 3.14159265f;
+    const float len2d = sqrtf(f[0] * f[0] + f[1] * f[1]);
+    out[1] = static_cast<int32_t>(atan2f(f[1], f[0]) * k);
+    out[0] = static_cast<int32_t>(atan2f(f[2], len2d) * k);
+    out[2] = 0;
+    if (len2d > 0.001f) {
+        const float rn[3] = {-f[1] / len2d, f[0] / len2d, 0.0f};
+        const float un[3] = {-f[2] * rn[1], f[2] * rn[0], f[0] * rn[1] - f[1] * rn[0]};
+        out[2] = static_cast<int32_t>(atan2f(u[0] * rn[0] + u[1] * rn[1], u[0] * un[0] + u[1] * un[1] + u[2] * un[2]) * k);
+    }
+}
+
+void set_state(Hs s, const char* why) {
+    if (s == g_hs) return;
+    BVR_LOG("[eve] holster: %s -> %s (%s)", g_hs == Hs::Idle ? "idle" : g_hs == Hs::Held ? "held" : g_hs == Hs::In ? "needle in" : "injecting",
+            s == Hs::Idle ? "idle" : s == Hs::Held ? "held" : s == Hs::In ? "needle in" : "injecting", why);
+    g_hs = s;
+    g_hsUi.store(static_cast<int>(s));
+    g_stateMs = GetTickCount64();
+}
+
+// The weapon controller is at the hip (XR space, body-relative).
+bool at_hip() {
+    bvr::vr::HeadPose head{}, hand{};
+    if (!bvr::vr::peek_head_pose(head) || !bvr::vr::get_raw_hand_pose(1, false, hand)) return false;
+    const float fz[3] = {0.0f, 0.0f, -1.0f};
+    float f[3];
+    bvr::xrmath::quat_rotate(head.qx, head.qy, head.qz, head.qw, fz, f);
+    float hl = sqrtf(f[0] * f[0] + f[2] * f[2]);
+    if (hl > 0.2f) {
+        const float hx = f[0] / hl, hz = f[2] / hl;
+        if (!g_bodyInit) {
+            g_bodyFwd[0] = hx;
+            g_bodyFwd[1] = hz;
+            g_bodyInit = true;
+        }
+        // The body follows the head only past 35 deg (glancing down at the hip
+        // or looking around must not swing the holster).
+        const float c = g_bodyFwd[0] * hx + g_bodyFwd[1] * hz;
+        if (c < 0.819f) {
+            g_bodyFwd[0] += (hx - g_bodyFwd[0]) * 0.08f;
+            g_bodyFwd[1] += (hz - g_bodyFwd[1]) * 0.08f;
+            const float n = sqrtf(g_bodyFwd[0] * g_bodyFwd[0] + g_bodyFwd[1] * g_bodyFwd[1]);
+            g_bodyFwd[0] /= n;
+            g_bodyFwd[1] /= n;
+        }
+    }
+    const float side = bvr::input::left_handed() ? -1.0f : 1.0f; // weapon hand's side
+    const float rx = -g_bodyFwd[1], rz = g_bodyFwd[0];               // body right (XR)
+    const float hip[3] = {head.px + rx * side * g_hipSideM.load() + g_bodyFwd[0] * g_hipFwdM.load(),
+                          head.py - g_hipDropM.load(),
+                          head.pz + rz * side * g_hipSideM.load() + g_bodyFwd[1] * g_hipFwdM.load()};
+    const float d[3] = {hand.px - hip[0], hand.py - hip[1], hand.pz - hip[2]};
+    return sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) < g_zoneM.load();
+}
+
+void buzz(int role, float a, int ms) { bvr::vr::haptic_pulse(role, a, ms); }
+
+void put_away(const char* why) {
+    if (g_hs == Hs::Idle) return;
+    if (!hypo_attached()) hypo_show(false);
+    g_xQueued = false;
+    set_state(Hs::Idle, why);
+}
+
+// Place the syringe on the weapon hand's gun socket - the same pose the game
+// gives it when it attaches it there for its own injection.
+void place_hypo() {
+    if (!g_tg.socketOk || !g_hypo || hypo_attached()) return;
+    int32_t rot[3];
+    basis_to_rot(g_tg.sockF, g_tg.sockU, rot);
+    write_block(static_cast<uint8_t*>(g_hypo) + patterns::kActorLocOffset, g_tg.socket, 12);
+    write_block(static_cast<uint8_t*>(g_hypo) + patterns::kActorRotOffset, rot, 12);
+}
+
+// The needle tip: down the syringe's axis from the grip (its mesh runs along
+// local -Z, plunger on top), as you see it.
+void needle_tip(float out[3]) {
+    float r[3]; // right = up x forward (UE, left-handed)
+    const float* f = g_tg.sockF;
+    const float* u = g_tg.sockU;
+    r[0] = u[1] * f[2] - u[2] * f[1];
+    r[1] = u[2] * f[0] - u[0] * f[2];
+    r[2] = u[0] * f[1] - u[1] * f[0];
+    const float lx = 5.3f, ly = -3.3f, lz = -g_needleUu.load(); // syringe-local (authored UU)
+    for (int i = 0; i < 3; ++i) out[i] = g_tg.socket[i] + f[i] * lx + r[i] * ly + u[i] * lz;
+}
+
+// The plasmid forearm as a capsule: wrist -> elbow (arms on), else toward a
+// point below the eyes, ~26 cm.
+bool needle_in_arm(float slack) {
+    if (!g_tg.socketOk || !g_tg.wristOk) return false;
+    const float ws = g_tg.worldScale;
+    float elbow[3];
+    if (g_tg.elbowOk) {
+        memcpy(elbow, g_tg.elbow, 12);
+    } else {
+        float eye[3];
+        int32_t er[3];
+        if (!camera::driven_eye_cam(0, eye, er)) return false;
+        eye[2] -= 0.35f * ws;
+        float d[3];
+        v3_sub(eye, g_tg.wrist, d);
+        const float l = sqrtf(v3_dot(d, d));
+        if (l < 1e-3f) return false;
+        for (int i = 0; i < 3; ++i) elbow[i] = g_tg.wrist[i] + d[i] / l * 0.26f * ws;
+    }
+    float tip[3];
+    needle_tip(tip);
+    return seg_dist(tip, g_tg.wrist, elbow) < 0.06f * ws * slack;
+}
+
+void holster_tick() {
+    const uint64_t now = GetTickCount64();
+    if (!g_cfgLoaded) cfg_load();
+    if (g_cfgDirty.exchange(false)) cfg_save();
+
+    // EVE bookkeeping (costs, auto-inject guard, count learning) runs always.
+    const float eve = eve_level();
+    g_eveUi.store(eve);
+    {
+        void* h = hands::hands_actor();
+        void* ab = nullptr;
+        if (h) read_block(static_cast<uint8_t*>(h) + patterns::kHandsCurrentAbilityOffset, &ab, 4);
+        g_curPlasmid = ab ? class_of(ab) : std::string();
+    }
+    uint8_t ltRaw = 0, rtRaw = 0;
+    bvr::input::last_unsuppressed_triggers(&ltRaw, &rtRaw);
+    if (ltRaw >= 30) g_lastLtMs = now;
+    if (now - g_csMs >= 500) {
+        g_csMs = now;
+        count_snap(g_cs[g_csAt]);
+        g_csAt = (g_csAt + 1) % 6;
+    }
+    if (g_evePrev >= 0.0f && eve >= 0.0f) {
+        if (eve < g_evePrev - 0.5f && now - g_lastLtMs < 1500) cost_learn(g_curPlasmid, g_evePrev - eve);
+        if (eve > g_evePrev + 1.0f) count_learn(); // an injection (ours, X, or the game's) landed
+    }
+    g_evePrev = eve;
+    g_countUi.store(hypo_count());
+    const float cost = cost_of(g_curPlasmid);
+    g_costUi.store(cost);
+    bool supLt = false, supRt = false;
+    struct Apply { // one hold-back slot: set it once, on every exit path
+        bool& lt;
+        bool& rt;
+        ~Apply() {
+            if (lt || rt) bvr::input::suppress_input(0, lt, rt, 150);
+        }
+    } apply{supLt, supRt};
+    if (g_blockAuto.load() && hands::active_hand() == 0 && cost > 0.0f && eve >= 0.0f && eve + 0.01f < cost) {
+        // Not enough EVE for this plasmid: the cast never reaches the game, so
+        // it cannot inject on its own. An empty click instead.
+        supLt = true;
+        static bool s_ltPrev = false;
+        const bool lt = ltRaw >= 30;
+        if (lt && !s_ltPrev) {
+            buzz(0, 0.5f, 25);
+            buzz(0, 0.3f, 15);
+        }
+        s_ltPrev = lt;
+    }
+
+    // Find the syringe (once per world).
+    {
+        void* world = hands::hands_actor();
+        if (world != g_hypoSearchWorld) {
+            g_hypoSearchWorld = world;
+            g_hypoSearches = 0;
+            g_socket = -1;
+            if (g_hypo && !hypo_valid()) g_hypo = nullptr;
+        }
+        if (!g_hypo && world && g_hypoSearches < 4 && now - g_hypoSearchMs > 3000) {
+            g_hypoSearchMs = now;
+            ++g_hypoSearches;
+            g_hypo = search_hypo();
+            BVR_LOG("[eve] syringe search %d: %p", g_hypoSearches, g_hypo);
+        }
+        void* sk = bones::skeleton_instance();
+        if (g_socket < 0 || sk != g_socketSkel) {
+            g_socketSkel = sk;
+            g_socket = bones::hands_bone_index(L"Pistol");
+            if (g_socket >= 0) BVR_LOG("[eve] syringe socket: hands bone %d (Pistol)", g_socket);
+        }
+    }
+
+    const bool fresh = now - g_tgMs < 200;
+    if (!g_holsterOn.load() || !fresh) {
+        put_away(!fresh ? "no rig" : "holster off");
+        return;
+    }
+
+    const float sq = bvr::vr::hand_squeeze(1);
+    const bool was = g_squeeze;
+    g_squeeze = g_squeeze ? sq >= 0.55f : sq >= 0.70f;
+    const bool rising = g_squeeze && !was;
+    const bool trig = rtRaw >= 150;
+    const bool trigRise = trig && !g_trigPrev;
+    g_trigPrev = trig;
+
+    switch (g_hs) {
+    case Hs::Idle: {
+        const bool zone = at_hip();
+        if (zone) bvr::vr::reserve_grip_bumper(1, true); // the hip squeeze never raises the gun
+        if (zone && !g_inZone) buzz(1, 0.25f, 30);
+        g_inZone = zone;
+        if (zone && rising) {
+            const int cnt = hypo_count();
+            if (!g_hypo || cnt == 0 || !g_tg.socketOk) {
+                buzz(1, 0.4f, 20);
+                buzz(1, 0.4f, 20);
+                BVR_LOG("[eve] holster empty (%s)", !g_hypo ? "syringe not found yet"
+                                                    : cnt == 0 ? "no hypos"
+                                                               : "weapon hand not drawn (off hand off?)");
+                break;
+            }
+            if (hands::active_hand() != 0) bvr::input::pulse_buttons(0x0100, 150); // LB: raise the plasmid
+            hypo_show(true);
+            place_hypo();
+            buzz(1, 0.6f, 60);
+            set_state(Hs::Held, "drawn from the hip");
+        }
+        break;
+    }
+    case Hs::Held:
+    case Hs::In: {
+        bvr::vr::reserve_grip_bumper(1, true);
+        supRt = true; // the trigger is the plunger now
+        if (!g_squeeze) {
+            put_away("let go");
+            break;
+        }
+        place_hypo();
+        const bool in = needle_in_arm(g_hs == Hs::In ? 1.5f : 1.0f);
+        if (in && g_hs == Hs::Held) {
+            buzz(0, 0.5f, 50);
+            buzz(1, 0.5f, 50);
+            set_state(Hs::In, "needle in the arm");
+        } else if (!in && g_hs == Hs::In) {
+            set_state(Hs::Held, "needle out");
+        }
+        if (g_hs == Hs::In && trigRise) {
+            g_eveAtInject = eve;
+            g_xQueued = true;
+            g_xQueuedMs = now;
+            set_state(Hs::Injecting, "trigger");
+        }
+        break;
+    }
+    case Hs::Injecting: {
+        bvr::vr::reserve_grip_bumper(1, true);
+        supRt = true;
+        if (g_xQueued && hands::active_hand() == 0) {
+            bvr::input::pulse_buttons(0x4000, 150); // X with the plasmid raised: the game injects
+            g_xQueued = false;
+        }
+        if (g_xQueued && now - g_xQueuedMs > 1500) {
+            g_xQueued = false;
+            BVR_LOG("[eve] injection: the plasmid never came up");
+        }
+        if (!hypo_attached()) place_hypo(); // until the game takes it over
+        if (now - g_lastBuzzMs > 120) {
+            g_lastBuzzMs = now;
+            buzz(0, 0.25f, 40);
+            buzz(1, 0.25f, 40);
+        }
+        const bool landed = eve >= 0.0f && eve > g_eveAtInject + 1.0f;
+        if (landed) {
+            buzz(0, 0.8f, 90);
+            buzz(1, 0.8f, 90);
+            g_shown = true; // the game owns it now; make sure it ends hidden
+            hypo_show(false);
+            set_state(Hs::Idle, "EVE in");
+        } else if (now - g_stateMs > 3500 || (now - g_stateMs > 900 && !hypo_attached())) {
+            buzz(1, 0.4f, 20);
+            BVR_LOG("[eve] injection refused (EVE full or no hypos?)");
+            put_away("refused");
+        }
+        break;
+    }
+    }
+}
+
 } // namespace
 
 bool probe_on() { return g_probe.load(std::memory_order_relaxed); }
 
 void on_attach(void* parent, void* child) {
-    if (!probe_on() || !child || GetCurrentThreadId() != g_gameTid) return;
+    if (!child || GetCurrentThreadId() != g_gameTid) return;
+    if (parent == hands::hands_actor() && child != g_hypo) {
+        bool seen = false;
+        for (void* c : g_hypoChecked) seen |= c == child;
+        if (!seen) {
+            g_hypoChecked[g_hypoCheckedAt] = child;
+            g_hypoCheckedAt = (g_hypoCheckedAt + 1) % 64;
+            if (class_of(child) == "BioAmmoHypoTool") {
+                g_hypo = child;
+                BVR_LOG("[eve] syringe found on attach: %p", child);
+            }
+        }
+    }
+    if (!probe_on()) return;
     void* hold = nullptr;
     hands::current_holdable(&hold);
     void* handsA = hands::hands_actor();
@@ -531,8 +1112,17 @@ void on_attach(void* parent, void* child) {
     ep_event(("attach " + cls).c_str());
 }
 
+void set_targets(const Targets& t) {
+    g_tg = t;
+    g_tgMs = GetTickCount64();
+    // Right after the rig is drawn: the syringe lands on this frame's hand.
+    if (g_hs != Hs::Idle && g_shown) place_hypo();
+}
+int socket_bone() { return g_socket; }
+
 void tick() {
     g_gameTid = GetCurrentThreadId();
+    holster_tick();
     if (!probe_on()) {
         g_ep.on = false;
         return;
@@ -614,6 +1204,54 @@ void tick() {
 }
 
 void draw_debug_ui() {
+    if (ImGui::CollapsingHeader("EVE holster")) {
+        bool b = g_holsterOn.load();
+        if (ImGui::Checkbox("EVE holster at the hip (grip to draw, needle in your arm, trigger)", &b)) {
+            g_holsterOn.store(b);
+            g_cfgDirty.store(true);
+        }
+        b = g_blockAuto.load();
+        if (ImGui::Checkbox("No automatic EVE injection (a cast you can't afford just clicks)", &b)) {
+            g_blockAuto.store(b);
+            g_cfgDirty.store(true);
+        }
+        ImGui::TextDisabled("Holster position, from your eyes (on your weapon hand's side):");
+        float v = g_hipDropM.load() * 100.0f;
+        if (ImGui::SliderFloat("down (cm)", &v, 30.0f, 90.0f, "%.0f")) {
+            g_hipDropM.store(v / 100.0f);
+            g_cfgDirty.store(true);
+        }
+        v = g_hipSideM.load() * 100.0f;
+        if (ImGui::SliderFloat("out to the side (cm)", &v, 0.0f, 40.0f, "%.0f")) {
+            g_hipSideM.store(v / 100.0f);
+            g_cfgDirty.store(true);
+        }
+        v = g_hipFwdM.load() * 100.0f;
+        if (ImGui::SliderFloat("forward (cm)", &v, -25.0f, 25.0f, "%.0f")) {
+            g_hipFwdM.store(v / 100.0f);
+            g_cfgDirty.store(true);
+        }
+        v = g_zoneM.load() * 100.0f;
+        if (ImGui::SliderFloat("reach (cm)", &v, 6.0f, 30.0f, "%.0f")) {
+            g_zoneM.store(v / 100.0f);
+            g_cfgDirty.store(true);
+        }
+        static const char* kState[] = {"ready", "holding a hypo", "needle in - pull the trigger", "injecting"};
+        const int st = g_hsUi.load();
+        const int cnt = g_countUi.load();
+        ImGui::Text("%s | EVE %.0f | hypos %s", kState[st < 0 || st > 3 ? 0 : st], g_eveUi.load(),
+                    cnt >= 0 ? std::to_string(cnt).c_str() : "(learned after two injections)");
+        if (!g_hypo) ImGui::TextDisabled("Syringe not found yet - one normal X injection finds it.");
+        if (bvr::overlay::dev_tools()) {
+            float n = g_needleUu.load();
+            if (ImGui::SliderFloat("needle length (UU)", &n, 4.0f, 30.0f, "%.1f")) {
+                g_needleUu.store(n);
+                g_cfgDirty.store(true);
+            }
+            ImGui::Text("socket bone %d | syringe %p | plasmid %s costs %.1f", g_socket, g_hypo,
+                        g_curPlasmid.empty() ? "-" : g_curPlasmid.c_str(), g_costUi.load());
+        }
+    }
     if (!bvr::overlay::dev_tools()) return;
     if (!ImGui::CollapsingHeader("EVE probe")) return;
     bool on = g_probe.load();
