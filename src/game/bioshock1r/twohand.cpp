@@ -5,6 +5,8 @@
 #include "core/util/xr_math.h"
 #include "core/vr/openxr_runtime.h"
 #include "game/bioshock1r/aim.h"
+#include "game/bioshock1r/bones.h"
+#include "game/bioshock1r/hands.h"
 
 #include <windows.h>
 
@@ -14,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <string>
@@ -43,6 +46,29 @@ struct GrabPoint {
 // Keyed "<WeaponClass>@<setup>". Game thread writes; the UI reads under the lock.
 std::mutex g_mx;
 std::map<std::string, GrabPoint> g_points;
+// What the held hand rides, per grab point (same key): "" / absent = the weapon
+// part nearest the grab point, "*body" = gun body only, "*hand" = the engine's
+// own off hand (classic), else a weapon bone name.
+std::map<std::string, std::string> g_parts;
+// Per grab point: watch Jack's hand for the between-shot animation as well.
+std::map<std::string, bool> g_jackShots;
+
+// Shipped defaults, by weapon class. The chemical thrower's wrench is worked
+// by the engine's own hand (its rest pose hovers off the gun), so copying that
+// hand follows it best. The crossbow's prime is Jack pulling the handle.
+std::string weapon_of(const std::string& key) { return key.substr(0, key.find('@')); }
+std::string default_part(const std::string& key) {
+    return weapon_of(key) == "ChemicalThrower" ? "*hand" : "";
+}
+bool default_jack_shots(const std::string& key) { return weapon_of(key) == "Crossbow"; }
+std::string part_for(const std::string& key) { // caller holds g_mx
+    auto it = g_parts.find(key);
+    return it != g_parts.end() ? it->second : default_part(key);
+}
+bool jack_shots_for(const std::string& key) { // caller holds g_mx
+    auto it = g_jackShots.find(key);
+    return it != g_jackShots.end() ? it->second : default_jack_shots(key);
+}
 bool g_loaded = false;
 
 // Live state (game thread), mirrored to atomics for the UI.
@@ -58,9 +84,14 @@ uint64_t g_lastBuzzMs = 0;
 char g_keyUi[96] = "";
 std::atomic<bool> g_saveRequest{false};
 
+// Grab points are recorded against what you SEE, so each hand-placement mode
+// keeps its own set: the grip-pose placement ("G") moves both drawn hands, and
+// switching back must find the old points exactly where they were.
 const char* setup_tag() {
-    if (!bvr::input::left_handed()) return "R";
-    return bvr::input::mirror_viewmodel() ? "LM" : "L";
+    const bool g = hands::grip_placement();
+    if (!bvr::input::left_handed()) return g ? "RG" : "R";
+    if (bvr::input::mirror_viewmodel()) return g ? "LMG" : "LM";
+    return g ? "LG" : "L";
 }
 
 void ini_path(wchar_t* out, size_t n) {
@@ -79,11 +110,15 @@ void save() {
     fprintf(f, "offHand=%d\ntwoHand=%d\nbuzz=%d\ngrabCm=%.1f\nslideOffCm=%.1f\nbuzzAmp=%.2f\n",
             g_offHand.load() ? 1 : 0, g_twoHand.load() ? 1 : 0, g_buzz.load() ? 1 : 0,
             g_grabCm.load(), g_releaseCm.load(), g_buzzAmp.load());
+    fprintf(f, "jackReloads=%d\n", bones::jack_reloads() ? 1 : 0);
     fprintf(f, "# grab points: <Weapon>@<R|L|LM> = x y z (m, weapon grip frame) qx qy qz qw\n");
     std::lock_guard<std::mutex> lk(g_mx);
     for (const auto& [k, p] : g_points)
         fprintf(f, "%s = %.4f %.4f %.4f %.5f %.5f %.5f %.5f\n", k.c_str(), p.g[0], p.g[1],
                 p.g[2], p.rel[0], p.rel[1], p.rel[2], p.rel[3]);
+    fprintf(f, "# what the held hand rides: <Weapon>@<setup>.part = <bone> | *body | *hand\n");
+    for (const auto& [k, v] : g_parts) fprintf(f, "%s.part = %s\n", k.c_str(), v.empty() ? "*auto" : v.c_str());
+    for (const auto& [k, v] : g_jackShots) fprintf(f, "%s.jack = %d\n", k.c_str(), v ? 1 : 0);
     fclose(f);
 }
 
@@ -98,6 +133,23 @@ void load() {
     while (fgets(line, sizeof line, f)) {
         if (line[0] == '#') continue;
         char key[96] = {};
+        char val[40] = {};
+        if (sscanf_s(line, "%95[^= ] = %39s", key, static_cast<unsigned>(sizeof key), val,
+                     static_cast<unsigned>(sizeof val)) == 2) {
+            const size_t kl = strlen(key);
+            if (kl > 5 && strcmp(key + kl - 5, ".part") == 0) {
+                key[kl - 5] = 0;
+                std::lock_guard<std::mutex> lk(g_mx);
+                g_parts[key] = strcmp(val, "*auto") == 0 ? "" : val;
+                continue;
+            }
+            if (kl > 5 && strcmp(key + kl - 5, ".jack") == 0) {
+                key[kl - 5] = 0;
+                std::lock_guard<std::mutex> lk(g_mx);
+                g_jackShots[key] = atoi(val) != 0;
+                continue;
+            }
+        }
         GrabPoint p{};
         if (sscanf_s(line, "%95[^= ] = %f %f %f %f %f %f %f", key,
                      static_cast<unsigned>(sizeof key), &p.g[0], &p.g[1], &p.g[2], &p.rel[0],
@@ -118,6 +170,7 @@ void load() {
         else if (strcmp(key, "slideOffCm") == 0) g_releaseCm.store(v); // v2 key: the old
         // 20 cm "releaseCm" is deliberately ignored - the grip got stickier
         else if (strcmp(key, "buzzAmp") == 0) g_buzzAmp.store(v);
+        else if (strcmp(key, "jackReloads") == 0) bones::set_jack_reloads(v != 0.0f);
     }
     fclose(f);
     BVR_LOG("[twohand] loaded %d grab point(s)", points);
@@ -161,6 +214,17 @@ void tick(bool weaponRaised, bool gameplay) {
     key += "@";
     key += setup_tag();
     strncpy_s(g_keyUi, key.c_str(), _TRUNCATE);
+    {
+        std::string part;
+        bool jackShots = false;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            part = part_for(key);
+            jackShots = jack_shots_for(key);
+        }
+        bones::set_ride_part(part.c_str());
+        bones::set_jack_fire_cycle(jackShots);
+    }
 
     if (g_clearRequest.exchange(0) == 1) {
         {
@@ -315,6 +379,12 @@ void draw_debug_ui() {
         g_releaseCm.store(f);
         g_saveRequest.store(true);
     }
+    b = bones::jack_reloads();
+    if (ImGui::Checkbox("Watch Jack reload while you hold the grip", &b)) {
+        bones::set_jack_reloads(b);
+        g_saveRequest.store(true);
+    }
+    ImGui::TextDisabled("Let go of the grip during a reload to do it yourself.");
 
     ImGui::Separator();
     char key[96];
@@ -342,6 +412,56 @@ void draw_debug_ui() {
         }
     }
     ImGui::TextDisabled("One press per weapon: the next off-hand squeeze records the spot.");
+
+    // What the held hand rides when the gun animates.
+    if (key[0]) {
+        static char names[128][40];
+        const int n = bones::weapon_part_names(names, 128);
+        const int autoIdx = bones::ride_part_auto();
+        std::string cur;
+        bool jackShots = false;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            cur = part_for(key);
+            jackShots = jack_shots_for(key);
+        }
+        char autoLabel[96];
+        _snprintf_s(autoLabel, sizeof autoLabel, _TRUNCATE, "Nearest part (%s)",
+                    autoIdx >= 0 && autoIdx < n ? names[autoIdx] : "reach for the grip to see");
+        const char* preview = cur.empty()         ? autoLabel
+                              : cur == "*body"    ? "Gun body only"
+                              : cur == "*hand"    ? "Jack's own hand (classic)"
+                                                  : cur.c_str();
+        std::string choice = cur;
+        bool picked = false;
+        if (ImGui::BeginCombo("held hand rides", preview)) {
+            if (ImGui::Selectable(autoLabel, cur.empty())) choice = "", picked = true;
+            if (ImGui::Selectable("Gun body only", cur == "*body")) choice = "*body", picked = true;
+            if (ImGui::Selectable("Jack's own hand (classic)", cur == "*hand"))
+                choice = "*hand", picked = true;
+            for (int i = 0; i < n; ++i) {
+                ImGui::PushID(i);
+                if (ImGui::Selectable(names[i], cur == names[i])) choice = names[i], picked = true;
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        if (picked && choice != cur) {
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                g_parts[key] = choice; // stored even when auto: it overrides a default
+            }
+            g_saveRequest.store(true);
+        }
+        if (ImGui::Checkbox("Watch Jack between shots too (e.g. the crossbow prime)", &jackShots)) {
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                g_jackShots[key] = jackShots;
+            }
+            g_saveRequest.store(true);
+        }
+        ImGui::TextDisabled("The part your hand follows when the gun animates (pump, lever, drum).");
+    }
     const float d = g_distCm.load();
     if (d >= 0.0f)
         ImGui::Text("off hand %.1f cm from the grab point  %s%s", d,

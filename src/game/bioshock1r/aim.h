@@ -84,6 +84,11 @@ const char* active_weapon_key();
 // Player weapon shots so far (the fire seam, 40 ms debounce - one per shotgun
 // blast, one per Tommy gun round). Monotonic; hands.cpp diffs it for recoil.
 uint32_t player_shot_count();
+// Barrel aim: the rendered muzzle (game space) and barrel direction, plus the
+// same as an offset from the weapon GRIP pose (XR, for the laser; may be null).
+// valid=false clears it. Game thread, once per frame from hands.cpp.
+void set_barrel(bool valid, const float origin[3], const float dir[3], const float laserOrigin[3],
+                const float laserDir[3]);
 // Player ability fires (plasmid casts AND wrench swings - both use the
 // ability fire seam), same debounce. For haptics.
 uint32_t player_ability_count();

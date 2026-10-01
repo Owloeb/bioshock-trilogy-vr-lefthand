@@ -456,6 +456,11 @@ struct LaserConfig {
     float modelPitchTrimDeg = 0.0f;
     float modelYawTrimDeg = 0.0f;
     float modelRollTrimDeg = 0.0f;
+    // Barrel aim (grip placement): the beam leaves gripOrigin along gripDir,
+    // both fixed in the hand's GRIP pose frame (XR metres / unit), no trims.
+    bool gripLocal = false;
+    float gripOrigin[3] = {0.0f, 0.0f, 0.0f};
+    float gripDir[3] = {0.0f, 0.0f, -1.0f};
 };
 
 // Publish the laser state (game thread, once per frame). The render thread

@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 namespace bvr::b1r::bones {
 namespace {
@@ -76,6 +77,8 @@ struct CachedSleeve {
     int idx;
     float p[3];
     float s[3];
+    float q[4];     // arms: the IK rotation
+    bool writeQ;    // false for the collapse (position + zero scale only)
 };
 CachedSleeve g_cacheSleeve[16]; // both hands' sleeves (off-hand tracking)
 int g_cacheSleeveCount = 0;
@@ -127,6 +130,17 @@ int g_collapsedHand = -1; // whose sleeve g_wasCollapsed refers to
 // the drive does NOT own this frame goes. Stored rather than passed so the
 // Route B re-drive (pose-writer hook) replays the same off-hand target.
 bool g_offTrack = false;
+struct PalmLocal {
+    bool valid = false;
+    float p[3];    // palm centroid, wrist-local (reference units)
+    float q[4];    // palm frame (fwd = tube, right = grip +X, up), wrist-local
+    float face[3]; // toward the palm surface, wrist-local unit vector
+};
+PalmLocal g_palm[2];
+bool g_palmLogged[2] = {false, false};
+float g_lastQa[4] = {0, 0, 0, 1};
+float g_lastActorLoc[3] = {};
+bool g_lastActorValid = false;
 GamePose g_offGp{};
 // Held on the gun (two-handed grip): the off hand also follows what the
 // ENGINE's own off hand is doing relative to the gun - pumping the shotgun,
@@ -146,9 +160,41 @@ bool g_followBaseValid = false;
 // is drawn from the REST shape - a closed grip on the gun - and only moved by
 // the engine's wrist motion, so an animation that relaxes the engine's
 // fingers (or a sway-kill reference caught mid-stroke) cannot open the palm.
+// The gun's barrel in the attach bone's (43) own frame: the game authors every
+// weapon's idle pose pointing straight down the view (component +X), so at rest
+// conj(q43) * X is the barrel - unlike 43->44, which runs from the grip (below
+// the barrel) up to the tip and tilts every shot upward.
+float g_barrelLocal[3] = {1, 0, 0};
+float g_barrelRightLocal[3] = {0, 1, 0}; // the gun's right and up at rest, same frame:
+float g_barrelUpLocal[3] = {0, 0, 1};    // a per-weapon barrel trim turns about these
+bool g_barrelLocalValid = false;
 Qts g_liveL[kMaxBones];
 Qts g_gripShape[kMaxBones];
 bool g_gripShapeValid = false;
+// Grip placement, weapon hand: the palm-to-gun relation the controller is
+// matched against, taken from the gun AT REST ([0] weapon wrist, [1] attach).
+// Solving against the live reference instead pinned the palm and cancelled
+// every authored gun motion that moves hand and gun together (the shotgun
+// rocking through its pump, the grenade launcher's twist, the crossbow
+// prime) - while the support-hand follow still applied that motion, so the
+// held hand slid off the gun. With the rest relation the gun is rigid to the
+// controller exactly as in aim-pose mode and animations play on top of it;
+// at rest the reference IS the rest pose, so the palm still sits exactly on
+// your palm. Dropped on a weapon or hand change (an equip keeps the palm
+// pinned, then the new rest blends in); refreshed every frame at rest.
+Qts g_placeRest[2];
+bool g_placeRestValid = false;
+uint64_t g_placeRestMs = 0;
+char g_placeWeapon[64] = {};
+bool g_refTracking = false; // the sway-killed reference is following an animation
+uint64_t g_refTrackingSince = 0;
+// Tracking an animation right now? A weapon whose idle alone exceeds the sway
+// thresholds keeps the reference tracking forever; after 4 s (longer than any
+// reload - the crossbow's runs 2.5 s) that is its
+// idle, not an animation, and must not block rest acceptance.
+bool ref_animating() {
+    return g_refTracking && GetTickCount64() - g_refTrackingSince < 4000;
+}
 Qts g_restCand[2];   // candidate rest pose, and since when it has held
 uint64_t g_restCandMs = 0;
 constexpr float kRestHoldUu = 1.0f;     // idle sway is sub-UU (session 20)
@@ -898,6 +944,10 @@ void init(const bvr::pattern_scan::ProcessImage& image) {
 
 void on_world_change() {
     g_offTrack = false;
+    g_palm[0].valid = g_palm[1].valid = false;
+    g_lastActorValid = false;
+    g_barrelLocalValid = false;
+    g_placeRestValid = false;
     if (g_skelInst) BVR_LOG("[bones] world changed - skeleton cache cleared");
     g_skelInst = nullptr;
     g_bones = nullptr;
@@ -1127,11 +1177,542 @@ bool barrel_ref_axis(float d0[3]) {
     return true;
 }
 
+// ---- Arms (two-bone IK) -------------------------------------------------------
+// The AHands mesh carries BOTH complete arms: per side a clavicle, upper arm,
+// elbow and two forearm-twist helpers (patterns kBone*Sleeve, in that order).
+// The drive used to collapse them because they moved rigidly with the gun.
+// With arms on, each visible hand's sleeve is posed instead: the shoulder at a
+// point the game side derives from the head and a lagging torso yaw (already
+// mirrored into engine space when the viewmodel mirror is on), the wrist where
+// the hand cluster was just written, the elbow from the fixed bone lengths of
+// the engine's own reference pose, bent toward a pole (down and out). Bone
+// orientations are the reference orientations carried by the rotation that
+// maps each segment's reference frame (direction + bend-plane normal) onto the
+// solved one - so no bone-axis convention has to be known.
+std::atomic<bool> g_armsOn{false};
+std::atomic<bool> g_armScaleS{true}; // scale the arm skin like the hands (.s)
+std::atomic<float> g_armLength{1.0f}; // bone-length multiplier (reach vs Jack's arm)
+bool g_armTargetValid[2] = {false, false};
+float g_armShoulderW[2][3] = {};
+float g_armPoleW[2][3] = {};
+float g_armOutW[2][3] = {}; // the arm's outward side: the elbow never points past the body line
+std::atomic<uint32_t> g_armSolves{0}, g_armStretched{0};
+constexpr float kPi = 3.14159265f;
+float g_armTwist[2] = {0.0f, 0.0f};  // forearm roll, followed continuously (rad)
+float g_armPrevPole[2][3] = {};       // last frame's elbow direction (unit)
+uint64_t g_armTwistMs[2] = {0, 0};
+std::atomic<float> g_armTwistDeg[2] = {0.0f, 0.0f}; // readout
+
+void v_sub(const float a[3], const float b[3], float o[3]) {
+    for (int i = 0; i < 3; ++i) o[i] = a[i] - b[i];
+}
+float v_len(const float a[3]) { return sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]); }
+void v_cross(const float a[3], const float b[3], float o[3]) {
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+float v_dot(const float a[3], const float b[3]) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+bool v_norm(float a[3]) {
+    const float l = v_len(a);
+    if (l < 1e-5f) return false;
+    for (int i = 0; i < 3; ++i) a[i] /= l;
+    return true;
+}
+
+// Rotation (quaternion, xyzw) from a 3x3 whose COLUMNS are the target axes
+// expressed in the source axes' coordinates.
+void mat_to_quat(const float m[3][3], float q[4]) {
+    const float tr = m[0][0] + m[1][1] + m[2][2];
+    if (tr > 0.0f) {
+        const float s = sqrtf(tr + 1.0f) * 2.0f;
+        q[3] = 0.25f * s;
+        q[0] = (m[2][1] - m[1][2]) / s;
+        q[1] = (m[0][2] - m[2][0]) / s;
+        q[2] = (m[1][0] - m[0][1]) / s;
+    } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+        const float s = sqrtf(1.0f + m[0][0] - m[1][1] - m[2][2]) * 2.0f;
+        q[3] = (m[2][1] - m[1][2]) / s;
+        q[0] = 0.25f * s;
+        q[1] = (m[0][1] + m[1][0]) / s;
+        q[2] = (m[0][2] + m[2][0]) / s;
+    } else if (m[1][1] > m[2][2]) {
+        const float s = sqrtf(1.0f + m[1][1] - m[0][0] - m[2][2]) * 2.0f;
+        q[3] = (m[0][2] - m[2][0]) / s;
+        q[0] = (m[0][1] + m[1][0]) / s;
+        q[1] = 0.25f * s;
+        q[2] = (m[1][2] + m[2][1]) / s;
+    } else {
+        const float s = sqrtf(1.0f + m[2][2] - m[0][0] - m[1][1]) * 2.0f;
+        q[3] = (m[1][0] - m[0][1]) / s;
+        q[0] = (m[0][2] + m[2][0]) / s;
+        q[1] = (m[1][2] + m[2][1]) / s;
+        q[2] = 0.25f * s;
+    }
+    const float n = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    for (int i = 0; i < 4; ++i) q[i] /= n;
+}
+
+// The rotation that takes frame (x0, n0) onto frame (x1, n1): x = segment
+// direction, n = bend-plane normal (both unit, orthogonalised here).
+bool frame_rotation(const float x0in[3], const float n0in[3], const float x1in[3],
+                    const float n1in[3], float q[4]) {
+    float x0[3] = {x0in[0], x0in[1], x0in[2]}, x1[3] = {x1in[0], x1in[1], x1in[2]};
+    if (!v_norm(x0) || !v_norm(x1)) return false;
+    float n0[3], n1[3], t[3];
+    const float d0 = v_dot(n0in, x0), d1 = v_dot(n1in, x1);
+    for (int i = 0; i < 3; ++i) {
+        n0[i] = n0in[i] - d0 * x0[i];
+        n1[i] = n1in[i] - d1 * x1[i];
+    }
+    if (!v_norm(n0) || !v_norm(n1)) return false;
+    float y0[3], y1[3];
+    v_cross(n0, x0, y0);
+    v_cross(n1, x1, y1);
+    // R = B1 * B0^T, B = [x y n] as columns.
+    const float* a0[3] = {x0, y0, n0};
+    const float* a1[3] = {x1, y1, n1};
+    float m[3][3];
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c) {
+            float sum = 0.0f;
+            for (int k = 0; k < 3; ++k) sum += a1[k][r] * a0[k][c];
+            m[r][c] = sum;
+        }
+    (void)t;
+    mat_to_quat(m, q);
+    return true;
+}
+
+// Swing-twist: the part of q that turns about unit axis `ax`.
+void twist_about(const float q[4], const float ax[3], float out[4]) {
+    const float d = q[0] * ax[0] + q[1] * ax[1] + q[2] * ax[2];
+    float t[4] = {ax[0] * d, ax[1] * d, ax[2] * d, q[3]};
+    const float n = sqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2] + t[3] * t[3]);
+    if (n < 1e-6f) {
+        out[0] = out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        return;
+    }
+    for (int i = 0; i < 4; ++i) out[i] = t[i] / n;
+}
+void quat_scale_angle(const float q[4], float f, float out[4]) {
+    float w = q[3] < -1.0f ? -1.0f : q[3] > 1.0f ? 1.0f : q[3];
+    const float ang = 2.0f * acosf(w);
+    const float sn = sqrtf(1.0f - w * w);
+    if (sn < 1e-5f) {
+        out[0] = out[1] = out[2] = 0.0f;
+        out[3] = 1.0f;
+        return;
+    }
+    const float h = 0.5f * ang * f;
+    for (int i = 0; i < 3; ++i) out[i] = q[i] / sn * sinf(h);
+    out[3] = cosf(h);
+}
+
+void write_arm_bone(int idx, const float p[3], const float q[4], float sScale) {
+    if (idx < 0 || idx >= g_boneCount) return;
+    write_n(g_bones[idx].p, p, 12);
+    write_n(g_bones[idx].q, q, 16);
+    float sv[3] = {g_ref[idx].s[0] * sScale, g_ref[idx].s[1] * sScale, g_ref[idx].s[2] * sScale};
+    write_n(g_bones[idx].s, sv, 12);
+    if (g_cacheSleeveCount < static_cast<int>(_countof(g_cacheSleeve))) {
+        CachedSleeve& cs = g_cacheSleeve[g_cacheSleeveCount++];
+        cs.idx = idx;
+        memcpy(cs.p, p, 12);
+        memcpy(cs.s, sv, 12);
+        memcpy(cs.q, q, 16);
+        cs.writeQ = true;
+    }
+}
+
+// Pose `hand`'s sleeve so it runs from its shoulder to the wrist just written
+// at Wt. False = no target / degenerate (caller collapses the sleeve instead).
+bool arm_ik(int hand, const float Wt[3], const float qaInv[4], const float actorLoc[3]) {
+    if (!g_armsOn.load(std::memory_order_relaxed) || !g_armTargetValid[hand] || !g_refValid)
+        return false;
+    const int* sl = hand == 1 ? patterns::kBoneRSleeve : patterns::kBoneLSleeve;
+    const int cla = sl[0], upa = sl[1], elb = sl[2], tw1 = sl[3], tw2 = sl[4];
+    const int wri = hand == 1 ? patterns::kBoneRClusterFirst : patterns::kBoneLWrist;
+    for (int b : {cla, upa, elb, tw1, tw2, wri})
+        if (b < 0 || b >= g_boneCount) return false;
+
+    // Targets into component space.
+    float S[3], P[3];
+    {
+        const float dW[3] = {g_armShoulderW[hand][0] - actorLoc[0],
+                             g_armShoulderW[hand][1] - actorLoc[1],
+                             g_armShoulderW[hand][2] - actorLoc[2]};
+        qts_rotate(qaInv, dW, S);
+        qts_rotate(qaInv, g_armPoleW[hand], P);
+    }
+    float O[3];
+    qts_rotate(qaInv, g_armOutW[hand], O);
+    const float sc = g_scale[hand].load(std::memory_order_relaxed);
+    const float* U0 = g_ref[upa].p;
+    const float* E0 = g_ref[elb].p;
+    const float* W0 = g_ref[wri].p;
+    float ue0[3], ew0[3], uw0[3];
+    v_sub(E0, U0, ue0);
+    v_sub(W0, E0, ew0);
+    v_sub(W0, U0, uw0);
+    const float len = g_armLength.load(std::memory_order_relaxed);
+    const float a = v_len(ue0) * sc * len, b = v_len(ew0) * sc * len;
+    if (a < 1.0f || b < 1.0f) return false;
+
+    // Reach: out of range, the SHOULDER gives (slides toward / away from the
+    // hand) rather than the hand leaving the controller.
+    float sw[3];
+    v_sub(Wt, S, sw);
+    float d = v_len(sw);
+    if (d < 1e-3f) return false;
+    float n[3] = {sw[0] / d, sw[1] / d, sw[2] / d};
+    // A hand pulled right in (a stock at the shoulder) must not fold the arm
+    // flat: below 40% of full reach the shoulder gives instead.
+    const float maxR = (a + b) * 0.995f;
+    const float minR = fmaxf(fabsf(a - b) * 1.05f + 0.5f, (a + b) * 0.40f);
+    if (d > maxR || d < minR) {
+        const float dd = d > maxR ? maxR : minR;
+        for (int i = 0; i < 3; ++i) S[i] = Wt[i] - n[i] * dd;
+        d = dd;
+        g_armStretched.fetch_add(1, std::memory_order_relaxed);
+    }
+    // Elbow: law of cosines, bent toward the pole.
+    const float cosA = (a * a + d * d - b * b) / (2.0f * a * d);
+    const float sinA = sqrtf(fmaxf(0.0f, 1.0f - cosA * cosA));
+    const uint64_t nowMs = GetTickCount64();
+    const bool fresh = nowMs - g_armTwistMs[hand] < 250;
+    // The pole's part across the shoulder->wrist line. With the hand straight
+    // along the pole (arm hanging toward it) that part shrinks to nothing and
+    // its direction turns to noise - the elbow flipped sides, the forearm roll
+    // jumped half a turn and the arm contorted. Last frame's elbow direction
+    // is mixed in at a fixed weight: negligible while the pole is clear (the
+    // result settles on the pole within a few frames), decisive only as it
+    // degenerates.
+    float pp0[3];
+    const float pd = v_dot(P, n);
+    for (int i = 0; i < 3; ++i) pp0[i] = P[i] - pd * n[i];
+    if (fresh) {
+        const float* pv = g_armPrevPole[hand];
+        const float vd = v_dot(pv, n);
+        const float k = 0.3f * v_len(P);
+        for (int i = 0; i < 3; ++i) pp0[i] += k * (pv[i] - vd * n[i]);
+    }
+    if (!v_norm(pp0)) return false;
+    // The arm's outward side, in the plane the elbow swings in.
+    float op[3];
+    bool haveOut = false;
+    {
+        const float od = v_dot(O, n);
+        for (int i = 0; i < 3; ++i) op[i] = O[i] - od * n[i];
+        haveOut = v_norm(op);
+    }
+
+    float nRef[3];
+    v_cross(ue0, ew0, nRef);
+    if (v_len(nRef) < 1e-4f) {
+        // The reference arm is straight: take its bend plane from the pole.
+        float ref_dir[3] = {uw0[0], uw0[1], uw0[2]};
+        v_norm(ref_dir);
+        float down[3] = {0.0f, 0.0f, -1.0f};
+        v_cross(ref_dir, down, nRef);
+    }
+    float wq[4];
+    if (!read_n(g_bones[wri].q, wq, 16)) return false; // the wrist as the drive wrote it
+
+    // One elbow solve for a given swivel of the pole about the shoulder->wrist
+    // line; returns the wrist's remaining roll about the forearm (radians,
+    // in (-pi, pi]) and everything needed to write the arm.
+    float E[3], ew[3], qUp[4], qFore[4], ax[3];
+    auto solve = [&](float swivel) -> float {
+        float pp[3];
+        {
+            const float h = 0.5f * swivel;
+            const float qs[4] = {n[0] * sinf(h), n[1] * sinf(h), n[2] * sinf(h), cosf(h)};
+            qts_rotate(qs, pp0, pp);
+        }
+        // Never let the elbow point inside the arm's own side. The inward part
+        // is replaced by a small outward lean rather than removed: removing it
+        // left almost nothing when the pole pointed straight inward (a hand
+        // turned or crossed hard), and that remainder's direction was noise -
+        // the elbow spun and the arm twisted through itself.
+        if (haveOut) {
+            const float o = v_dot(pp, op);
+            constexpr float kMinOut = 0.25f;
+            if (o < kMinOut)
+                for (int i = 0; i < 3; ++i) pp[i] += (kMinOut - o) * op[i];
+            v_norm(pp);
+        }
+        for (int i = 0; i < 3; ++i) E[i] = S[i] + n[i] * a * cosA + pp[i] * a * sinA;
+        float se[3], nNew[3];
+        v_sub(E, S, se);
+        v_sub(Wt, E, ew);
+        // The solved bend plane's normal from the POLE, not from the two
+        // segments: cross(se, ew) vanishes as the arm straightens and its sign
+        // then flips on noise. pp x n never degenerates.
+        v_cross(pp, n, nNew);
+        if (!frame_rotation(ue0, nRef, se, nNew, qUp)) return NAN;
+        if (!frame_rotation(ew0, nRef, ew, nNew, qFore)) return NAN;
+        memcpy(ax, ew, sizeof ax);
+        if (!v_norm(ax)) return NAN;
+        float implied[4], wqInv[4], delta[4], tw[4];
+        quat_mul(qFore, g_ref[wri].q, implied);
+        quat_conj(implied, wqInv);
+        quat_mul(wq, wqInv, delta);
+        twist_about(delta, ax, tw);
+        const float sn = tw[0] * ax[0] + tw[1] * ax[1] + tw[2] * ax[2];
+        float ang = 2.0f * atan2f(sn, tw[3]);
+        if (ang > kPi) ang -= 2.0f * kPi;
+        if (ang <= -kPi) ang += 2.0f * kPi;
+        return ang;
+    };
+    auto unwrap = [](float raw, float near_) {
+        float dlt = raw - near_;
+        while (dlt > kPi) dlt -= 2.0f * kPi;
+        while (dlt <= -kPi) dlt += 2.0f * kPi;
+        return near_ + dlt;
+    };
+
+    // Forearm roll, followed continuously: the shortest-way-round reading
+    // flips sign at 180 deg, which spun the helpers a full turn in one frame.
+    // But continuity must never STICK: a real wrist cannot roll 250 deg, so
+    // whenever the direct reading is well inside the normal range it is the
+    // truth - a tracked value a full turn away (one bad frame) snaps back
+    // instead of holding the arm wrung until the next weapon animation.
+    float twist = solve(0.0f);
+    if (twist != twist) return false;
+    constexpr float kTrustDirect = 110.0f / 57.29578f;
+    if (fresh && fabsf(twist) > kTrustDirect) twist = unwrap(twist, g_armTwist[hand]);
+    // Past a comfortable roll, the elbow lifts out to carry the excess - the
+    // way a real arm turns the whole forearm from the shoulder once the wrist
+    // runs out of range - instead of the forearm wringing itself.
+    constexpr float kComfort = 80.0f / 57.29578f, kMaxSwivel = 70.0f / 57.29578f;
+    // The tracked value is the roll BEFORE the elbow lift (what the wrist
+    // itself is doing), so tracking and the lift never feed each other.
+    constexpr float kTrack = 250.0f / 57.29578f;
+    if (twist > kTrack) twist = kTrack;
+    if (twist < -kTrack) twist = -kTrack;
+    g_armTwist[hand] = twist;
+    g_armTwistMs[hand] = nowMs;
+    memcpy(g_armPrevPole[hand], pp0, sizeof pp0); // the base pole (pre-swivel): no feedback
+    float swivel = 0.0f;
+    if (fabsf(twist) > kComfort) {
+        swivel = fabsf(twist) - kComfort;
+        if (swivel > kMaxSwivel) swivel = kMaxSwivel;
+        if (twist < 0.0f) swivel = -swivel;
+        const float t2 = solve(swivel);
+        if (t2 != t2) return false;
+        twist = unwrap(t2, twist - swivel); // what the forearm helpers still carry
+    }
+    g_armTwistDeg[hand].store(twist * 57.29578f, std::memory_order_relaxed);
+
+    const float sS = g_armScaleS.load(std::memory_order_relaxed) ? sc : 1.0f;
+    float q[4], p[3], rel[3], relR[3];
+
+    // Upper arm at the shoulder, elbow at the elbow.
+    quat_mul(qUp, g_ref[upa].q, q);
+    write_arm_bone(upa, S, q, sS);
+    quat_mul(qFore, g_ref[elb].q, q);
+    write_arm_bone(elb, E, q, sS);
+
+    // Clavicle rides the upper arm's swing only loosely: its reference offset
+    // from the shoulder, turned by half of the upper-arm rotation.
+    {
+        float half[4];
+        quat_scale_angle(qUp, 0.35f, half);
+        v_sub(g_ref[cla].p, U0, rel);
+        for (float& c : rel) c *= sc;
+        qts_rotate(half, rel, relR);
+        for (int i = 0; i < 3; ++i) p[i] = S[i] + relR[i];
+        quat_mul(half, g_ref[cla].q, q);
+        write_arm_bone(cla, p, q, sS);
+    }
+
+    // Twist helpers: along the forearm (reference offset from the elbow,
+    // forearm rotation), sharing out the remaining roll - never past 150 deg,
+    // beyond which the skin between the helpers folds through itself.
+    {
+        constexpr float kMaxTwist = 150.0f / 57.29578f;
+        float tw = twist;
+        if (tw > kMaxTwist) tw = kMaxTwist;
+        if (tw < -kMaxTwist) tw = -kMaxTwist;
+        const int helpers[2] = {tw1, tw2};
+        const float frac[2] = {0.33f, 0.66f};
+        for (int k = 0; k < 2; ++k) {
+            const int hb = helpers[k];
+            const float h = 0.5f * tw * frac[k];
+            const float part[4] = {ax[0] * sinf(h), ax[1] * sinf(h), ax[2] * sinf(h), cosf(h)};
+            float qh[4];
+            v_sub(g_ref[hb].p, E0, rel);
+            for (float& c : rel) c *= sc;
+            qts_rotate(qFore, rel, relR);
+            for (int i = 0; i < 3; ++i) p[i] = E[i] + relR[i];
+            quat_mul(qFore, g_ref[hb].q, qh);
+            quat_mul(part, qh, q);
+            write_arm_bone(hb, p, q, sS);
+        }
+    }
+    g_armSolves.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+// Where the wrist of `hand` sits after rigid_cluster wrote it with (ptc, qtc)
+// from reference `src` about `anchor`.
+void written_wrist(int hand, int anchor, const float ptc[3], const float qtc[4], const Qts* src,
+                   float Wt[3]) {
+    const int wri = hand == 1 ? patterns::kBoneRClusterFirst : patterns::kBoneLWrist;
+    const float sc = g_scale[hand].load(std::memory_order_relaxed);
+    float rel[3] = {(src[wri].p[0] - src[anchor].p[0]) * sc, (src[wri].p[1] - src[anchor].p[1]) * sc,
+                    (src[wri].p[2] - src[anchor].p[2]) * sc};
+    float r[3];
+    qts_rotate(qtc, rel, r);
+    for (int i = 0; i < 3; ++i) Wt[i] = ptc[i] + r[i];
+}
+
+// ---- Grip-pose placement: Jack's palm on your palm ---------------------------
+// OpenXR's GRIP pose is anchored to the user's hand, not to the controller's
+// pointing ray: origin at the palm centroid, -Z through the tube the curled
+// fingers make (little finger -> thumb), +X along the palm normal (away from
+// the palm on the left hand, into it on the right: "right" for both). The same
+// frame is measured on Jack's hand from its own bones - wrist, the four finger
+// base knuckles, the thumb - expressed in the WRIST's local frame (it rides
+// the wrist rigidly, whatever the animation does to the fingers). Placing the
+// hand is then one rigid solve: put that palm frame on the grip frame.
+
+int wrist_of(int hand) { return hand == 1 ? patterns::kBoneRClusterFirst : patterns::kBoneLWrist; }
+
+bool compute_palm_local(int hand) {
+    if (!g_refValid || !g_skelInst) return false;
+    int first = 0, last = 0, anchor = 0;
+    cluster_of(hand, &first, &last, &anchor);
+    const int w = wrist_of(hand);
+    if (w < 0 || w + 15 >= g_boneCount) return false;
+    // Finger bases: by NAME first (3ds Max biped: Finger0 = thumb, Finger1..4 =
+    // index..little), else the measured layout - wrist, thumb x3, then four
+    // chains of three (the right cluster 27 | 28-30 | 31-42 is documented; the
+    // left 6 | 7-9 | 10-21 has the same shape).
+    int thumb0 = w + 1, thumb1 = w + 2, base[4] = {w + 4, w + 7, w + 10, w + 13};
+    bool named = false;
+    {
+        Skel sk{g_skelInst, g_bones, g_boneCount};
+        const wchar_t* names[kMaxBones] = {};
+        if (resolve_bone_names(sk, names, g_boneCount) > 0) {
+            int f[5] = {-1, -1, -1, -1, -1};
+            for (int i = first; i <= last && i < g_boneCount; ++i) {
+                if (!names[i]) continue;
+                const size_t n = wcslen(names[i]);
+                if (n < 7) continue;
+                const wchar_t* tail = names[i] + n - 7; // "FingerN"
+                if (_wcsnicmp(tail, L"Finger", 6) == 0 && tail[6] >= L'0' && tail[6] <= L'4')
+                    f[tail[6] - L'0'] = i;
+            }
+            if (f[0] >= 0 && f[1] >= 0 && f[2] >= 0 && f[3] >= 0 && f[4] >= 0) {
+                thumb0 = f[0];
+                thumb1 = f[0] + 1 <= last ? f[0] + 1 : f[0];
+                base[0] = f[1]; base[1] = f[2]; base[2] = f[3]; base[3] = f[4];
+                named = true;
+            }
+            if (!g_palmLogged[hand]) {
+                BVR_LOG("[bones] %s hand bones: %ls | %ls | %ls %ls %ls %ls (%s)",
+                        hand == 1 ? "right" : "left", names[w] ? names[w] : L"?",
+                        names[thumb0] ? names[thumb0] : L"?", names[base[0]] ? names[base[0]] : L"?",
+                        names[base[1]] ? names[base[1]] : L"?", names[base[2]] ? names[base[2]] : L"?",
+                        names[base[3]] ? names[base[3]] : L"?", named ? "by name" : "by layout");
+            }
+        }
+    }
+    const float* W = g_ref[w].p;
+    // Index = the base nearest the thumb, little = the farthest.
+    int idx = 0, lit = 0;
+    float dmin = 1e30f, dmax = -1.0f;
+    for (int k = 0; k < 4; ++k) {
+        float d[3];
+        v_sub(g_ref[base[k]].p, g_ref[thumb0].p, d);
+        const float l = v_len(d);
+        if (l < dmin) { dmin = l; idx = k; }
+        if (l > dmax) { dmax = l; lit = k; }
+    }
+    if (idx == lit) return false;
+    float K[3] = {0, 0, 0};
+    for (int k = 0; k < 4; ++k)
+        for (int i = 0; i < 3; ++i) K[i] += g_ref[base[k]].p[i] * 0.25f;
+    float f[3], wk[3], nrm[3];
+    v_sub(g_ref[base[idx]].p, g_ref[base[lit]].p, f); // little -> index: the tube
+    if (!v_norm(f)) return false;
+    v_sub(K, W, wk);
+    v_cross(wk, f, nrm);
+    if (!v_norm(nrm)) return false;
+    // Palm side: the thumb sits palm-side of the knuckle plane and curled
+    // fingertips fall on it.
+    float score = 0.0f;
+    {
+        float t[3];
+        v_sub(g_ref[thumb1].p, W, t);
+        score += 2.0f * v_dot(t, nrm);
+        for (int k = 0; k < 4; ++k) {
+            const int tip = base[k] + 2 <= last ? base[k] + 2 : base[k];
+            float c[3];
+            v_sub(g_ref[tip].p, g_ref[base[k]].p, c);
+            score += v_dot(c, nrm);
+        }
+    }
+    float face[3] = {nrm[0], nrm[1], nrm[2]};
+    if (score < 0.0f)
+        for (float& c : face) c = -c;
+    // Grip +X: into the right palm / away from the left palm.
+    float r[3];
+    for (int i = 0; i < 3; ++i) r[i] = hand == 1 ? -face[i] : face[i];
+    const float fr = v_dot(r, f);
+    for (int i = 0; i < 3; ++i) r[i] -= fr * f[i];
+    if (!v_norm(r)) return false;
+    float u[3];
+    v_cross(f, r, u);
+    const float m[3][3] = {{f[0], r[0], u[0]}, {f[1], r[1], u[1]}, {f[2], r[2], u[2]}};
+    float qp[4];
+    mat_to_quat(m, qp);
+    // Palm centroid: halfway from the wrist to the knuckle line.
+    const float C[3] = {(W[0] + K[0]) * 0.5f, (W[1] + K[1]) * 0.5f, (W[2] + K[2]) * 0.5f};
+    float wqInv[4], dC[3];
+    quat_conj(g_ref[w].q, wqInv);
+    v_sub(C, W, dC);
+    PalmLocal& pl = g_palm[hand];
+    qts_rotate(wqInv, dC, pl.p);
+    quat_mul(wqInv, qp, pl.q);
+    qts_rotate(wqInv, face, pl.face);
+    pl.valid = true;
+    if (!g_palmLogged[hand]) {
+        g_palmLogged[hand] = true;
+        float dk[3];
+        v_sub(K, W, dk);
+        BVR_LOG("[bones] %s palm frame: wrist->knuckles %.1f, index %d little %d, palm-side score "
+                "%.1f",
+                hand == 1 ? "right" : "left", v_len(dk), base[idx], base[lit], score);
+    }
+    return true;
+}
+
+// The pose `src` draws `hand` with (mirrors drive() / drive_off_hand()).
+const Qts* draw_source(int hand, bool driven) {
+    if (driven || hand == 1) return g_ref;
+    const bool wantGrip = g_offFollow || g_offPreview;
+    if (!wantGrip && g_neutralValid) return g_neutral;
+    if (wantGrip && g_gripShapeValid) return g_gripShape;
+    return g_ref;
+}
+
 // One cluster, moved rigidly: rotate its reference pose by qtc about its
 // reference anchor point, then put the anchor point at ptc. Appends every write
 // to the reapply cache (the caller resets it once per drive).
+// A second pose for rigid_cluster to blend toward, bone by bone (wB = 0..1).
+struct ClusterBlend {
+    const float* ptc;
+    const float* qtc;
+    const Qts* src;
+    float w;
+};
+
 bool rigid_cluster(int hand, int first, int last, int anchor, const float ptc[3],
-                   const float qtc[4], const Qts* src = g_ref) {
+                   const float qtc[4], const Qts* src = g_ref, const ClusterBlend* blend = nullptr) {
     // Rigid move: rotate the reference cluster by qtc about the reference
     // anchor point, then put the anchor point at the target. Every write is
     // also cached for reapply() - the stereo second pass must be able to
@@ -1157,6 +1738,26 @@ bool rigid_cluster(int hand, int first, int last, int anchor, const float ptc[3]
         float p[3] = {ptc[0] + rot[0], ptc[1] + rot[1], ptc[2] + rot[2]};
         float q[4];
         quat_mul(qtc, src[i].q, q);
+        if (blend && blend->w > 0.0f) {
+            const Qts* sb = blend->src;
+            const float* pab = sb[anchor].p;
+            const float relB[3] = {(sb[i].p[0] - pab[0]) * s, (sb[i].p[1] - pab[1]) * s,
+                                   (sb[i].p[2] - pab[2]) * s};
+            float rotB[3], qB[4];
+            qts_rotate(blend->qtc, relB, rotB);
+            quat_mul(blend->qtc, sb[i].q, qB);
+            const float w = blend->w;
+            for (int k = 0; k < 3; ++k) p[k] += (blend->ptc[k] + rotB[k] - p[k]) * w;
+            const float d = q[0] * qB[0] + q[1] * qB[1] + q[2] * qB[2] + q[3] * qB[3];
+            const float sg = d < 0.0f ? -1.0f : 1.0f;
+            float n2 = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                q[k] += (sg * qB[k] - q[k]) * w;
+                n2 += q[k] * q[k];
+            }
+            const float inv = n2 > 1e-12f ? 1.0f / sqrtf(n2) : 1.0f;
+            for (float& c : q) c *= inv;
+        }
         if (!write_n(g_bones[i].p, p, 12) || !write_n(g_bones[i].q, q, 16)) {
             g_skelInst = nullptr; // faulted mid-write: revalidate next frame
             g_cacheMs = 0;
@@ -1201,6 +1802,147 @@ bool target_to_component(const GamePose& gp, const float qaInv[4], const float a
     return ptc[0] * ptc[0] + ptc[1] * ptc[1] + ptc[2] * ptc[2] <= 500.0f * 500.0f;
 }
 
+// ---- Follow v5: the held hand rides the weapon PART under it ----------------
+// Every gun carries its own skeleton (the weapon-scale lane binds it): the
+// shotgun's SG_Pump, the chemical thrower's Bone_Wrench, the grenade
+// launcher's MainBarrelBone and ammo drum, the crossbow's levers. v4 copied the
+// ENGINE's off hand instead - right while that hand is on the moving part (the
+// pump), wrong when it leaves the gun (the grenade launcher's reload: the
+// engine hand goes to load a grenade and dragged yours off with it). The held
+// hand now rides the part your grab point is on: the grab point, attached to
+// that bone at rest, follows the bone's live motion. Measured (animation log):
+// the weapon skeleton's axes are the rig's component axes at rest - the barrel
+// bones run along +X and the shotgun pump sits exactly where the engine's
+// left hand holds it - with its origin at the attach bone, scaled by the
+// weapon-scale lane.
+Qts g_wRest[kMaxBones];          // weapon pose at rest (parts home)
+int g_wRestCount = 0;
+void* g_wRestHold = nullptr;      // the holdable it belongs to
+bool g_wRestValid = false;
+Qts g_wPrev[kMaxBones];           // last frame's weapon pose (stillness)
+uint64_t g_wStillSince = 0, g_wMovingSince = 0;
+bool g_wPrevValid = false;
+std::mutex g_partMx;              // guards the names + the choice (UI thread reads)
+char g_partNames[kMaxBones][40];
+int g_partCount = 0;
+void* g_partNamesHold = nullptr;
+char g_partWant[40] = "";         // "" auto (nearest), "*body", "*hand", or a bone name
+std::atomic<int> g_autoPart{-1};  // nearest part to the grab point right now
+std::atomic<int> g_ridePartUi{-3}; // what the held hand rides (-1 body, -2 classic, -3 idle)
+int g_ridePart = -1;
+bool g_rideLocked = false;
+bool g_wasFollow = false;
+// Watching Jack reload: while you hold the grip through a RELOAD, the held
+// hand blends over to the engine's own left hand - its fingers included - on
+// the drawn gun, so you see Jack load it; let go and the hand is yours again
+// (at your controller) to mime it. Fire-cycle animations (the pump after a
+// shot, the chemical thrower's wrench, the crossbow prime) keep riding the
+// part. A reload = an animation that starts with the reload button down, or
+// with no trigger pull in the second before it.
+bool g_jackWant = false;
+float g_jackW = 0.0f;
+uint64_t g_jackMs = 0;
+bool g_animWasOn = false;
+bool g_animIsReload = false;
+uint64_t g_lastReloadBtnMs = 0;
+std::atomic<bool> g_jackReloads{true}; // F10 toggle
+std::atomic<bool> g_clipEmpty{false};
+std::atomic<bool> g_jackFireCycle{false}; // this weapon: watch Jack between shots too   // the gun's magazine is empty (hands' learner)
+
+// The weapon's parts are still: nothing moved more than a hair for 300 ms (or
+// a part has been moving for 4 s - an idle loop, not an animation).
+void weapon_still_tick() {
+    const uint64_t now = GetTickCount64();
+    if (!g_wBones || g_wBoneCount <= 0 || g_wBoneCount > kMaxBones) {
+        g_wPrevValid = false;
+        return;
+    }
+    bool moved = !g_wPrevValid;
+    for (int i = 0; i < g_wBoneCount && !moved; ++i) {
+        const float dx = g_wAnim[i].p[0] - g_wPrev[i].p[0], dy = g_wAnim[i].p[1] - g_wPrev[i].p[1],
+                    dz = g_wAnim[i].p[2] - g_wPrev[i].p[2];
+        float d = fabsf(g_wAnim[i].q[0] * g_wPrev[i].q[0] + g_wAnim[i].q[1] * g_wPrev[i].q[1] +
+                        g_wAnim[i].q[2] * g_wPrev[i].q[2] + g_wAnim[i].q[3] * g_wPrev[i].q[3]);
+        if (dx * dx + dy * dy + dz * dz > 0.15f * 0.15f || d < 0.99999f) moved = true; // ~0.5 deg
+    }
+    memcpy(g_wPrev, g_wAnim, sizeof(Qts) * static_cast<size_t>(g_wBoneCount));
+    g_wPrevValid = true;
+    if (moved) {
+        if (!g_wMovingSince) g_wMovingSince = now; // start of this run of motion
+        g_wStillSince = now;
+    } else if (now - g_wStillSince > 100) {
+        g_wMovingSince = 0; // a real pause ends the run
+    }
+}
+bool weapon_still() {
+    const uint64_t now = GetTickCount64();
+    return now - g_wStillSince >= 300 || (g_wMovingSince && now - g_wMovingSince >= 4000);
+}
+
+// At rest (weapon hand raised): the parts' home pose, and their names.
+void capture_weapon_rest() {
+    if (!g_wBones || g_wBoneCount <= 0 || g_wBoneCount > kMaxBones || !weapon_still()) return;
+    memcpy(g_wRest, g_wAnim, sizeof(Qts) * static_cast<size_t>(g_wBoneCount));
+    g_wRestCount = g_wBoneCount;
+    g_wRestHold = g_wHoldable;
+    g_wRestValid = true;
+    if (g_partNamesHold == g_wHoldable) return;
+    Skel sk{};
+    const wchar_t* names[kMaxBones] = {};
+    const bool ok = g_wHoldable && resolve_skel(g_wHoldable, sk) && sk.count == g_wBoneCount;
+    if (ok) resolve_bone_names(sk, names, sk.count);
+    std::lock_guard<std::mutex> lk(g_partMx);
+    g_partCount = ok ? sk.count : 0;
+    for (int i = 0; i < g_partCount; ++i) {
+        char* o = g_partNames[i];
+        size_t k = 0;
+        if (names[i])
+            for (; k + 1 < sizeof g_partNames[i] && names[i][k]; ++k)
+                o[k] = names[i][k] < 128 ? static_cast<char>(names[i][k]) : '?';
+        if (!k) k = static_cast<size_t>(_snprintf_s(o, sizeof g_partNames[i], _TRUNCATE, "bone%d", i));
+        o[k] = 0;
+    }
+    g_partNamesHold = g_wHoldable;
+}
+
+bool weapon_rest_usable() {
+    return g_wRestValid && g_wBones && g_wRestHold == g_wHoldable && g_wRestCount == g_wBoneCount &&
+           g_wBoneCount > 0;
+}
+
+// The part to ride for a grab point at pw (weapon space, authored units):
+// the user's choice for this weapon, else the nearest bone. -1 = the gun body
+// only, -2 = the engine's own hand (v4).
+int choose_part(const float pw[3], int nearest) {
+    char want[40];
+    {
+        std::lock_guard<std::mutex> lk(g_partMx);
+        memcpy(want, g_partWant, sizeof want);
+        if (strcmp(want, "*body") == 0) return -1;
+        if (strcmp(want, "*hand") == 0) return -2;
+        if (want[0] && g_partNamesHold == g_wHoldable)
+            for (int i = 0; i < g_partCount; ++i)
+                if (strcmp(g_partNames[i], want) == 0) return i;
+    }
+    (void)pw;
+    return nearest;
+}
+
+// Jack's palm relative to the cluster anchor for a pose source (unscaled
+// units scaled like the cluster), or the anchor itself without a palm frame.
+void palm_rel_src(int hand, const Qts* src, float out[3]) {
+    out[0] = out[1] = out[2] = 0.0f;
+    if (!g_palm[hand].valid && !compute_palm_local(hand)) return;
+    int first = 0, last = 0, anchor = 0;
+    cluster_of(hand, &first, &last, &anchor);
+    const int w = wrist_of(hand);
+    if (w >= g_boneCount || anchor >= g_boneCount) return;
+    float pw[3];
+    qts_rotate(src[w].q, g_palm[hand].p, pw);
+    const float s = g_scale[hand].load(std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i) out[i] = (src[w].p[i] + pw[i] - src[anchor].p[i]) * s;
+}
+
 // The OFF hand, tracked (BioVR's always-visible free hand): its cluster goes
 // to g_offGp with the same rigid move, its sleeve collapses like the driven
 // one. The WEAPON cluster as the off hand (plasmid raised) keeps the holstered
@@ -1214,82 +1956,201 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
     if (first < 0 || last >= g_boneCount || anchor < first || anchor > last) return false;
     float ptc[3], qtc[4];
     if (!target_to_component(g_offGp, qaInv, actorLoc, ptc, qtc)) return false;
-    if (g_offFollow && ih == 0 && g_followBaseValid && g_liveValid) {
-        // v4. Two motions, applied in the order they happen:
+    const bool wantGripShape = g_offFollow || g_offPreview;
+    const Qts* shapeSrc = ih == 0 && !wantGripShape && g_neutralValid ? g_neutral
+                          : ih == 0 && wantGripShape && g_gripShapeValid ? g_gripShape
+                                                                         : g_ref;
+    // Part riding needs the weapon at rest and the grab point in its frame.
+    const bool parts = ih == 0 && weapon_rest_usable();
+    const float ws = g_wScale.load(std::memory_order_relaxed); // the gun's drawn size
+    float palmC[3] = {ptc[0], ptc[1], ptc[2]}, pw[3] = {0, 0, 0};
+    if (parts && (g_offFollow || g_offPreview) && ws > 1e-3f) {
+        float pr[3], prc[3], mInv0[4];
+        palm_rel_src(ih, shapeSrc, pr);
+        qts_rotate(qtc, pr, prc);
+        for (int k = 0; k < 3; ++k) palmC[k] = ptc[k] + prc[k];
+        quat_conj(qtcMain, mInv0);
+        const float dcm[3] = {palmC[0] - ptcMain[0], palmC[1] - ptcMain[1], palmC[2] - ptcMain[2]};
+        qts_rotate(mInv0, dcm, pw);
+        for (float& c : pw) c /= ws;
+        int best = -1;
+        float bestD = 1e30f;
+        for (int i = 0; i < g_wRestCount; ++i) {
+            const float dx = pw[0] - g_wRest[i].p[0], dy = pw[1] - g_wRest[i].p[1],
+                        dz = pw[2] - g_wRest[i].p[2];
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < bestD) {
+                bestD = d2;
+                best = i;
+            }
+        }
+        g_autoPart.store(best, std::memory_order_relaxed);
+    }
+    const bool following = g_offFollow && ih == 0 && g_followBaseValid && g_liveValid;
+    if (ih == 0) {
+        if (following && !g_wasFollow) g_rideLocked = false; // a new hold picks its part
+        g_wasFollow = following;
+    }
+    if (following) {
+        // Two motions, applied in the order they happen:
         //  1. TILT - the drawn gun turns about its attach bone (a pump rocks
         //     the whole shotgun back). The pinned hand was placed for the gun
-        //     at rest, so it must turn about the attach point with it:
-        //     T = qtcMain (ref43_now ref43_rest^-1) qtcMain^-1. v3 dropped this
-        //     term and the hand slid off the rocking shotgun.
-        //  2. STROKE - the engine hand's motion RELATIVE to the gun (the slide
-        //     itself, the lever), measured in the gun's live frame and applied
-        //     in the drawn frame G = qtcMain ref43_now.
-        const Qts& w = g_live[0];
-        const Qts& a = g_live[1];
-        const Qts& w0 = g_followBase[0];
-        const Qts& a0 = g_followBase[1];
+        //     at rest, so it turns about the attach point with it:
+        //     T = qtcMain (ref43_now ref43_rest^-1) qtcMain^-1.
+        //  2. The PART under the hand (v5), or the engine hand's stroke (v4).
         const Qts& r43 = g_ref[patterns::kBoneWeaponAttach];
-        float mInv[4], G[4], Gi[4];
+        float mInv[4];
         quat_conj(qtcMain, mInv);
-        quat_mul(qtcMain, r43.q, G);
-        quat_conj(G, Gi);
-
-        // 1. tilt
         float r0i[4], tl[4], t1[4], T[4];
         quat_conj(g_followBaseRef43.q, r0i);
         quat_mul(r43.q, r0i, tl);
         quat_mul(qtcMain, tl, t1);
         quat_mul(t1, mInv, T);
+        const float qtc0[4] = {qtc[0], qtc[1], qtc[2], qtc[3]};
+        float palmT[3];
         {
             const float off[3] = {ptc[0] - ptcMain[0], ptc[1] - ptcMain[1], ptc[2] - ptcMain[2]};
-            float offT[3];
+            const float offP[3] = {palmC[0] - ptcMain[0], palmC[1] - ptcMain[1], palmC[2] - ptcMain[2]};
+            float offT[3], offPT[3];
             qts_rotate(T, off, offT);
-            for (int k = 0; k < 3; ++k) ptc[k] = ptcMain[k] + offT[k];
+            qts_rotate(T, offP, offPT);
+            for (int k = 0; k < 3; ++k) {
+                ptc[k] = ptcMain[k] + offT[k];
+                palmT[k] = ptcMain[k] + offPT[k];
+            }
         }
+        quat_mul(T, qtc0, qtc);
 
-        // 2. stroke
-        float ai[4], a0i[4];
-        quat_conj(a.q, ai);
-        quat_conj(a0.q, a0i);
-        const float rw[3] = {w.p[0] - a.p[0], w.p[1] - a.p[1], w.p[2] - a.p[2]};
-        const float rw0[3] = {w0.p[0] - a0.p[0], w0.p[1] - a0.p[1], w0.p[2] - a0.p[2]};
-        float l[3], l0[3];
-        qts_rotate(ai, rw, l);
-        qts_rotate(a0i, rw0, l0);
-        float d[3] = {l[0] - l0[0], l[1] - l0[1], l[2] - l0[2]};
-        const float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-        constexpr float kMaxFollowUu = 40.0f; // a pump stroke, never an equip swing
-        if (len > kMaxFollowUu)
-            for (float& c : d) c *= kMaxFollowUu / len;
-        const float ws = g_wScale.load(std::memory_order_relaxed); // the gun's drawn size
-        for (float& c : d) c *= ws;
-        float dc[3];
-        qts_rotate(G, d, dc);
-        for (int k = 0; k < 3; ++k) ptc[k] += dc[k];
+        int part = -2;
+        if (parts && ws > 1e-3f) {
+            if (!g_rideLocked) {
+                g_ridePart = choose_part(pw, g_autoPart.load(std::memory_order_relaxed));
+                g_rideLocked = true;
+            }
+            part = g_ridePart;
+        }
+        g_ridePartUi.store(part, std::memory_order_relaxed);
 
-        // Orientation: ride the tilt, then the wrist's own turn relative to
-        // the gun (D = G (r r0^-1) G^-1, r = a^-1 w).
-        float r[4], rr0[4], rr0i[4], dr[4], u1[4], D[4], q2[4], q3[4];
-        quat_mul(ai, w.q, r);
-        quat_mul(a0i, w0.q, rr0);
-        quat_conj(rr0, rr0i);
-        quat_mul(r, rr0i, dr);
-        quat_mul(G, dr, u1);
-        quat_mul(u1, Gi, D);
-        quat_mul(T, qtc, q2);
-        quat_mul(D, q2, q3);
-        memcpy(qtc, q3, sizeof q3);
+        if (part >= 0 && part < g_wBoneCount) {
+            // The grab point, fixed to the part at rest, where the part has
+            // taken it: pw' = b_now (b_rest^-1 pw). Weapon space -> drawn:
+            // M = T qtcMain (the gun's rest axes, tilted with it), times ws.
+            const Qts& bn = g_wAnim[part];
+            const Qts& b0 = g_wRest[part];
+            float b0i[4], Rb[4], rel[3], relR[3];
+            quat_conj(b0.q, b0i);
+            quat_mul(bn.q, b0i, Rb);
+            for (int k = 0; k < 3; ++k) rel[k] = pw[k] - b0.p[k];
+            qts_rotate(Rb, rel, relR);
+            float dw[3];
+            for (int k = 0; k < 3; ++k) dw[k] = (bn.p[k] + relR[k] - pw[k]) * ws;
+            float M[4], Mi[4], dc[3], u[4], D[4];
+            quat_mul(T, qtcMain, M);
+            quat_conj(M, Mi);
+            qts_rotate(M, dw, dc);
+            quat_mul(M, Rb, u);
+            quat_mul(u, Mi, D); // the part's turn, in the drawn frame
+            // The hand turns WITH the part about the grab point.
+            float arm[3], armR[3];
+            for (int k = 0; k < 3; ++k) arm[k] = ptc[k] - palmT[k];
+            qts_rotate(D, arm, armR);
+            for (int k = 0; k < 3; ++k) ptc[k] = palmT[k] + dc[k] + armR[k];
+            float q2[4];
+            quat_mul(D, qtc, q2);
+            memcpy(qtc, q2, sizeof q2);
+        } else if (part == -2) {
+            // v4: the engine hand's motion RELATIVE to the gun, measured in the
+            // gun's live frame and applied in the drawn frame G = qtcMain ref43.
+            const Qts& w = g_live[0];
+            const Qts& a = g_live[1];
+            const Qts& w0 = g_followBase[0];
+            const Qts& a0 = g_followBase[1];
+            float G[4], Gi[4];
+            quat_mul(qtcMain, r43.q, G);
+            quat_conj(G, Gi);
+            float ai[4], a0i[4];
+            quat_conj(a.q, ai);
+            quat_conj(a0.q, a0i);
+            const float rw[3] = {w.p[0] - a.p[0], w.p[1] - a.p[1], w.p[2] - a.p[2]};
+            const float rw0[3] = {w0.p[0] - a0.p[0], w0.p[1] - a0.p[1], w0.p[2] - a0.p[2]};
+            float l[3], l0[3];
+            qts_rotate(ai, rw, l);
+            qts_rotate(a0i, rw0, l0);
+            float d[3] = {l[0] - l0[0], l[1] - l0[1], l[2] - l0[2]};
+            const float len = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            constexpr float kMaxFollowUu = 40.0f; // a pump stroke, never an equip swing
+            if (len > kMaxFollowUu)
+                for (float& c : d) c *= kMaxFollowUu / len;
+            for (float& c : d) c *= ws;
+            float dc[3];
+            qts_rotate(G, d, dc);
+            for (int k = 0; k < 3; ++k) ptc[k] += dc[k];
+            // Orientation: the wrist's own turn relative to the gun
+            // (D = G (r r0^-1) G^-1, r = a^-1 w), on top of the tilt.
+            float r[4], rr0[4], rr0i[4], dr[4], u1[4], D[4], q3[4];
+            quat_mul(ai, w.q, r);
+            quat_mul(a0i, w0.q, rr0);
+            quat_conj(rr0, rr0i);
+            quat_mul(r, rr0i, dr);
+            quat_mul(G, dr, u1);
+            quat_mul(u1, Gi, D);
+            quat_mul(D, qtc, q3);
+            memcpy(qtc, q3, sizeof q3);
+        }
+        // part == -1: the gun body only - the tilt above is the whole ride.
+    } else if (ih == 0) {
+        g_ridePartUi.store(-3, std::memory_order_relaxed);
     }
     // Shape: the rest grip while held, recording or in the grab zone (so you
     // see how the hand will sit); the relaxed pose otherwise.
     const bool wantGrip = g_offFollow || g_offPreview;
     const bool relaxed = ih == 0 && !wantGrip && g_neutralValid;
     const bool gripShape = ih == 0 && wantGrip && g_gripShapeValid;
-    if (!rigid_cluster(ih, first, last, anchor, ptc, qtc,
-                       relaxed ? g_neutral : gripShape ? g_gripShape : g_ref))
+    // Jack's own hand on the drawn gun (see g_jackWant): the engine's live left
+    // hand relative to its live attach bone, carried by the drawn gun's frame
+    // G = qtcMain ref43 live43^-1 and set on the gun at the gun's drawn size.
+    ClusterBlend jack{nullptr, nullptr, g_liveL, 0.0f};
+    float ptcJ[3], qtcJ[4];
+    if (ih == 0) {
+        const uint64_t nowJ = GetTickCount64();
+        const float dt = g_jackMs ? static_cast<float>(nowJ - g_jackMs) : 0.0f;
+        g_jackMs = nowJ;
+        if (g_jackWant) g_jackW = fminf(1.0f, g_jackW + dt / 150.0f); // in over 150 ms
+        else g_jackW = fmaxf(0.0f, g_jackW - dt / 200.0f);          // home over 200 ms
+        if (g_jackW > 0.0f && g_liveValid && anchor < g_boneCount) {
+            const Qts& L43 = g_live[1];
+            const Qts& r43 = g_ref[patterns::kBoneWeaponAttach];
+            float t[4], l43i[4];
+            quat_conj(L43.q, l43i);
+            quat_mul(qtcMain, r43.q, t);
+            quat_mul(t, l43i, qtcJ);
+            const float ws = g_wScale.load(std::memory_order_relaxed);
+            const float d[3] = {(g_liveL[anchor].p[0] - L43.p[0]) * ws,
+                                (g_liveL[anchor].p[1] - L43.p[1]) * ws,
+                                (g_liveL[anchor].p[2] - L43.p[2]) * ws};
+            float dr[3];
+            qts_rotate(qtcJ, d, dr);
+            for (int k = 0; k < 3; ++k) ptcJ[k] = ptcMain[k] + dr[k];
+            const float x = g_jackW;
+            jack = {ptcJ, qtcJ, g_liveL, x * x * (3.0f - 2.0f * x)}; // smoothstep
+        }
+    }
+    const Qts* srcUsed = relaxed ? g_neutral : gripShape ? g_gripShape : g_ref;
+    if (!rigid_cluster(ih, first, last, anchor, ptc, qtc, srcUsed, jack.w > 0.0f ? &jack : nullptr))
         return false;
     static const float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (collapse) {
+    bool armed = false;
+    if (g_armsOn.load(std::memory_order_relaxed)) {
+        float Wt[3];
+        written_wrist(ih, anchor, ptc, qtc, srcUsed, Wt);
+        if (jack.w > 0.0f) {
+            float WtJ[3];
+            written_wrist(ih, anchor, ptcJ, qtcJ, g_liveL, WtJ);
+            for (int k = 0; k < 3; ++k) Wt[k] += (WtJ[k] - Wt[k]) * jack.w;
+        }
+        armed = arm_ik(ih, Wt, qaInv, actorLoc);
+    }
+    if (collapse && !armed) {
         const int* sleeve = ih == 1 ? patterns::kBoneRSleeve : patterns::kBoneLSleeve;
         const size_t n = ih == 1 ? _countof(patterns::kBoneRSleeve) : _countof(patterns::kBoneLSleeve);
         for (size_t k = 0; k < n; ++k) {
@@ -1302,6 +2163,7 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
                 cs.idx = idx;
                 memcpy(cs.p, ptc, 12);
                 memcpy(cs.s, kZero, 12);
+                cs.writeQ = false;
             }
         }
     }
@@ -1326,6 +2188,214 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
         g_hiddenHand = 1;
     }
     return true;
+}
+
+// ---- Animation log (Developer tools) ----------------------------------------
+// One summary line per weapon animation (fire, pump, reload, twist): how far
+// the ENGINE's off hand moved and turned relative to the gun, how far the gun
+// tilted, and which of the WEAPON's own bones moved (named) - the data that
+// decides how a held hand should ride each gun's moving part. Plus, once per
+// weapon at rest, the weapon skeleton and the engine hands in the gun's frame.
+std::atomic<bool> g_animLog{false};
+char g_dumpedWeapon[64] = {};
+struct AnimEpisode {
+    bool on = false;
+    uint64_t startMs = 0;
+    float stroke = 0.0f, turn = 0.0f, tilt = 0.0f;
+    float wDisp[kMaxBones];
+    float wRot[kMaxBones];
+};
+AnimEpisode g_ep;
+
+float quat_angle_deg(const float a[4], const float b[4]) {
+    float d = fabsf(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
+    if (d > 1.0f) d = 1.0f;
+    return 2.0f * acosf(d) * 57.29578f;
+}
+
+void anim_log_rest(int anchor) {
+    if (!g_wRestValid) return;
+    if (!g_animLog.load(std::memory_order_relaxed)) return;
+    if (strcmp(g_dumpedWeapon, g_placeWeapon) == 0) return;
+    strncpy_s(g_dumpedWeapon, sizeof g_dumpedWeapon, g_placeWeapon, _TRUNCATE);
+    const Qts& a = g_ref[anchor];
+    float ai[4];
+    quat_conj(a.q, ai);
+    auto local = [&](int b, float out[3]) {
+        out[0] = out[1] = out[2] = 0.0f;
+        if (b < 0 || b >= g_boneCount) return;
+        const float d[3] = {g_ref[b].p[0] - a.p[0], g_ref[b].p[1] - a.p[1], g_ref[b].p[2] - a.p[2]};
+        qts_rotate(ai, d, out);
+    };
+    float lw[3], rw[3], tip[3];
+    local(patterns::kBoneLWrist, lw);
+    local(patterns::kBoneRClusterFirst, rw);
+    local(patterns::kBoneRClusterLast, tip);
+    BVR_LOG("[animlog] %s at rest, in the attach bone's frame: engine L wrist (%.2f %.2f %.2f) "
+            "R wrist (%.2f %.2f %.2f) bone44 (%.2f %.2f %.2f) | attach q (%.3f %.3f %.3f %.3f) "
+            "wscale %.3f",
+            g_placeWeapon, lw[0], lw[1], lw[2], rw[0], rw[1], rw[2], tip[0], tip[1], tip[2],
+            a.q[0], a.q[1], a.q[2], a.q[3], g_wScale.load(std::memory_order_relaxed));
+    Skel sk{};
+    if (!g_wHoldable || !resolve_skel(g_wHoldable, sk) || sk.count != g_wRestCount) {
+        BVR_LOG("[animlog] %s: no weapon skeleton bound", g_placeWeapon);
+        return;
+    }
+    const wchar_t* names[kMaxBones];
+    resolve_bone_names(sk, names, sk.count);
+    for (int i = 0; i < sk.count; ++i) {
+        const Qts& b = g_wRest[i];
+        BVR_LOG("[animlog]   w%2d %-24S pos(%8.2f %8.2f %8.2f) quat(%6.3f %6.3f %6.3f %6.3f)", i,
+                names[i] ? names[i] : L"<unnamed>", b.p[0], b.p[1], b.p[2], b.q[0], b.q[1], b.q[2],
+                b.q[3]);
+    }
+}
+
+void anim_log_tick(int anchor, bool busy) {
+    if (!g_animLog.load(std::memory_order_relaxed) || !g_followBaseValid || !g_liveValid) {
+        g_ep.on = false;
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    if (busy) {
+        if (!g_ep.on) {
+            g_ep.on = true;
+            g_ep.startMs = now;
+            g_ep.stroke = g_ep.turn = g_ep.tilt = 0.0f;
+            for (int i = 0; i < kMaxBones; ++i) g_ep.wDisp[i] = g_ep.wRot[i] = 0.0f;
+        }
+        const Qts& w = g_live[0];
+        const Qts& a = g_live[1];
+        const Qts& w0 = g_followBase[0];
+        const Qts& a0 = g_followBase[1];
+        float ai[4], a0i[4], l[3], l0[3];
+        quat_conj(a.q, ai);
+        quat_conj(a0.q, a0i);
+        const float rw[3] = {w.p[0] - a.p[0], w.p[1] - a.p[1], w.p[2] - a.p[2]};
+        const float rw0[3] = {w0.p[0] - a0.p[0], w0.p[1] - a0.p[1], w0.p[2] - a0.p[2]};
+        qts_rotate(ai, rw, l);
+        qts_rotate(a0i, rw0, l0);
+        const float d[3] = {l[0] - l0[0], l[1] - l0[1], l[2] - l0[2]};
+        g_ep.stroke = fmaxf(g_ep.stroke, sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]));
+        float r[4], r0[4];
+        quat_mul(ai, w.q, r);
+        quat_mul(a0i, w0.q, r0);
+        g_ep.turn = fmaxf(g_ep.turn, quat_angle_deg(r, r0));
+        g_ep.tilt = fmaxf(g_ep.tilt, quat_angle_deg(g_ref[anchor].q, g_followBaseRef43.q));
+        if (g_wBones && g_wRestCount == g_wBoneCount) {
+            for (int i = 0; i < g_wBoneCount; ++i) {
+                const float dx = g_wAnim[i].p[0] - g_wRest[i].p[0];
+                const float dy = g_wAnim[i].p[1] - g_wRest[i].p[1];
+                const float dz = g_wAnim[i].p[2] - g_wRest[i].p[2];
+                g_ep.wDisp[i] = fmaxf(g_ep.wDisp[i], sqrtf(dx * dx + dy * dy + dz * dz));
+                g_ep.wRot[i] = fmaxf(g_ep.wRot[i], quat_angle_deg(g_wAnim[i].q, g_wRest[i].q));
+            }
+        }
+        return;
+    }
+    if (!g_ep.on) return;
+    g_ep.on = false;
+    char parts[512] = {};
+    size_t used = 0;
+    Skel sk{};
+    const wchar_t* names[kMaxBones] = {};
+    if (g_wHoldable && resolve_skel(g_wHoldable, sk) && sk.count == g_wBoneCount)
+        resolve_bone_names(sk, names, sk.count);
+    for (int i = 0; i < g_wBoneCount && i < kMaxBones; ++i) {
+        if (g_ep.wDisp[i] < 0.5f && g_ep.wRot[i] < 3.0f) continue;
+        char nm[40] = {};
+        if (names[i]) {
+            size_t k = 0;
+            for (; k + 1 < sizeof nm && names[i][k]; ++k)
+                nm[k] = names[i][k] < 128 ? static_cast<char>(names[i][k]) : '?';
+        } else {
+            strcpy_s(nm, "?");
+        }
+        const int n = _snprintf_s(parts + used, sizeof parts - used, _TRUNCATE,
+                                  " w%d %s %.1fUU/%.0fdeg;", i, nm, g_ep.wDisp[i], g_ep.wRot[i]);
+        if (n < 0) break;
+        used += static_cast<size_t>(n);
+    }
+    const int rp = g_ridePartUi.load(std::memory_order_relaxed);
+    char ride[48];
+    if (rp >= 0 && rp < g_wBoneCount) {
+        std::lock_guard<std::mutex> lk(g_partMx);
+        _snprintf_s(ride, sizeof ride, _TRUNCATE, "w%d %s", rp,
+                    rp < g_partCount ? g_partNames[rp] : "?");
+    } else
+        strcpy_s(ride, rp == -1 ? "gun body" : rp == -2 ? "engine hand" : "not held");
+    BVR_LOG("[animlog] %s: %u ms | engine off hand moved %.1f UU, turned %.0f deg vs the gun | "
+            "gun tilted %.0f deg | held hand rides %s | weapon bones:%s",
+            g_placeWeapon, static_cast<unsigned>(now - g_ep.startMs), g_ep.stroke, g_ep.turn,
+            g_ep.tilt, ride, used ? parts : " none moved");
+}
+
+// Grip placement rest (see g_placeRest): called every frame the weapon hand is
+// at rest. The first take after a weapon/hand change is exact (the reference
+// equals what the live solve just used, so nothing moves); later takes blend
+// in over ~80 ms, so a re-freeze of the idle a hair off the old rest re-seats
+// the palm smoothly instead of stepping.
+void update_place_rest(int anchor) {
+    const int w = wrist_of(1);
+    if (w >= g_boneCount || anchor >= g_boneCount) return;
+    const Qts* now[2] = {&g_ref[w], &g_ref[anchor]};
+    const uint64_t t = GetTickCount64();
+    if (!g_placeRestValid) {
+        g_placeRest[0] = *now[0];
+        g_placeRest[1] = *now[1];
+        g_placeRestValid = true;
+        g_placeRestMs = t;
+        return;
+    }
+    const float dt = static_cast<float>(t - g_placeRestMs);
+    g_placeRestMs = t;
+    if (dt <= 0.0f) return;
+    const float a = 1.0f - expf(-dt / 80.0f);
+    for (int k = 0; k < 2; ++k) {
+        Qts& r = g_placeRest[k];
+        const Qts& n = *now[k];
+        for (int i = 0; i < 3; ++i) r.p[i] += (n.p[i] - r.p[i]) * a;
+        const float d = r.q[0] * n.q[0] + r.q[1] * n.q[1] + r.q[2] * n.q[2] + r.q[3] * n.q[3];
+        const float sgn = d < 0.0f ? -1.0f : 1.0f;
+        float len2 = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            r.q[i] += (sgn * n.q[i] - r.q[i]) * a;
+            len2 += r.q[i] * r.q[i];
+        }
+        const float inv = len2 > 1e-12f ? 1.0f / sqrtf(len2) : 1.0f;
+        for (float& c : r.q) c *= inv;
+    }
+}
+
+void set_anim_log(bool on) { g_animLog.store(on, std::memory_order_relaxed); }
+
+void set_ride_part(const char* want) {
+    std::lock_guard<std::mutex> lk(g_partMx);
+    if (strncmp(g_partWant, want ? want : "", sizeof g_partWant - 1) == 0) return;
+    strncpy_s(g_partWant, sizeof g_partWant, want ? want : "", _TRUNCATE);
+    g_rideLocked = false; // takes effect on the current hold too
+}
+
+int weapon_part_names(char (*out)[40], int cap) {
+    std::lock_guard<std::mutex> lk(g_partMx);
+    const int n = g_partCount < cap ? g_partCount : cap;
+    for (int i = 0; i < n; ++i) memcpy(out[i], g_partNames[i], sizeof g_partNames[i]);
+    return n;
+}
+
+int ride_part_auto() { return g_autoPart.load(std::memory_order_relaxed); }
+void set_jack_fire_cycle(bool on) { g_jackFireCycle.store(on, std::memory_order_relaxed); }
+void set_clip_empty(bool empty) { g_clipEmpty.store(empty, std::memory_order_relaxed); }
+void set_jack_reloads(bool on) { g_jackReloads.store(on, std::memory_order_relaxed); }
+bool jack_reloads() { return g_jackReloads.load(std::memory_order_relaxed); }
+int ride_part_active() { return g_ridePartUi.load(std::memory_order_relaxed); }
+
+void set_active_weapon(const char* key) {
+    if (!key) key = "";
+    if (strncmp(key, g_placeWeapon, sizeof g_placeWeapon - 1) == 0) return;
+    strncpy_s(g_placeWeapon, sizeof g_placeWeapon, key, _TRUNCATE);
+    g_placeRestValid = false; // a new gun holds differently: live until it settles
+    g_followBaseValid = false;
 }
 
 bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int hand) {
@@ -1405,6 +2475,8 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             // Track through the animation AND a settle window past its last
             // big frame, so the eventual freeze holds the SETTLED pose.
             adopt = (nowMs - g_lastBigDeltaMs) < kSwaySettleMs;
+            if (adopt && !g_refTracking) g_refTrackingSince = nowMs;
+            g_refTracking = adopt;
             if (g_telemetry.load(std::memory_order_relaxed) &&
                 nowMs - g_lastSwayTlmMs >= 1000) {
                 g_lastSwayTlmMs = nowMs;
@@ -1413,6 +2485,7 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
                         adopt ? "TRACKING" : "frozen");
             }
         }
+        if (!g_swayKill.load(std::memory_order_relaxed)) g_refTracking = false;
         if (adopt || !g_refValid) {
             // Session 61: pin the scale rows of bones OUR scale writes own.
             // If the bank still holds exactly what we last wrote, the engine
@@ -1431,6 +2504,24 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
                         g_scaleRestamps.fetch_add(1, std::memory_order_relaxed);
                         g_scaleWrote[i] = false; // the bank is the engine's again
                     }
+                }
+            }
+            // Arms: the same rule for the sleeve bones. Where a channel still
+            // holds exactly what the last drive wrote there (IK or collapse),
+            // the engine did not restamp it, and adopting it would turn our
+            // own solved arm into the next solve's REFERENCE - the error then
+            // compounds, and with the sway kill it froze in until the next
+            // big animation re-adopted (the contorted arm that only a reload
+            // or weapon switch fixed).
+            if (g_refValid) {
+                for (int k = 0; k < g_cacheSleeveCount; ++k) {
+                    const CachedSleeve& cs = g_cacheSleeve[k];
+                    if (cs.idx < 0 || cs.idx >= g_boneCount) continue;
+                    Qts& f = fresh[cs.idx];
+                    const Qts& r = g_ref[cs.idx];
+                    if (memcmp(f.p, cs.p, 12) == 0) memcpy(f.p, r.p, 12);
+                    if (memcmp(f.s, cs.s, 12) == 0) memcpy(f.s, r.s, 12);
+                    if (cs.writeQ && memcmp(f.q, cs.q, 16) == 0) memcpy(f.q, r.q, 16);
                 }
             }
             memcpy(g_ref, fresh, sizeof(Qts) * static_cast<size_t>(g_boneCount));
@@ -1452,8 +2543,21 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         if (rt >= 30) s_lastTriggerMs = GetTickCount64();
     }
     const bool firingWindow = GetTickCount64() - s_lastTriggerMs < 1000;
-    if (g_liveValid && firingWindow) g_restCandMs = 0; // restart the hold once it ends
-    if (g_liveValid && !firingWindow) {
+    // Plasmid up: the next raise re-settles - placement AND the follow base.
+    // A base kept from an earlier raise made the held hand tilt by the
+    // difference between two raises' idle freezes whenever you swapped back
+    // before the gun settled (frequent plasmid/gun swaps).
+    if (hand != 1) {
+        g_placeRestValid = false;
+        g_followBaseValid = false;
+    }
+    // Nor while the reference is following an animation: the grenade
+    // launcher's reload twists the whole gun with the engine's left hand
+    // holding still ON it, so the hand-to-gun relation alone looked like rest
+    // mid-twist - the tilt then reset and the held hand jumped off the gun.
+    const bool animating = ref_animating();
+    if (g_liveValid && (firingWindow || animating)) g_restCandMs = 0;
+    if (g_liveValid && !firingWindow && !animating) {
         const uint64_t nowR = GetTickCount64();
         auto rel_dist = [](const Qts* a, const Qts* b) {
             float d2 = 0.0f;
@@ -1467,7 +2571,10 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             g_restCand[0] = g_live[0];
             g_restCand[1] = g_live[1];
             g_restCandMs = nowR;
-        } else if (nowR - g_restCandMs >= kRestHoldMs) {
+        } else if (nowR - g_restCandMs >= kRestHoldMs && hand == 1) {
+            // Weapon hand raised only: with the plasmid up the attach bone is
+            // the HOLSTERED gun, and a base taken there tilted the held hand by
+            // the difference on the next raise.
             g_followBase[0] = g_live[0];
             g_followBase[1] = g_live[1];
             g_followBaseValid = true;
@@ -1475,6 +2582,20 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             // The grip shape is taken only while the weapon hand is raised:
             // that is when the engine's left hand is the one on the gun.
             if (hand == 1) {
+                update_place_rest(anchor);
+                capture_weapon_rest();
+                anim_log_rest(anchor);
+                {
+                    float qi[4];
+                    static const float kX[3] = {1.0f, 0.0f, 0.0f};
+                    static const float kY[3] = {0.0f, 1.0f, 0.0f};
+                    static const float kZ[3] = {0.0f, 0.0f, 1.0f};
+                    quat_conj(g_ref[patterns::kBoneWeaponAttach].q, qi);
+                    qts_rotate(qi, kX, g_barrelLocal);
+                    qts_rotate(qi, kY, g_barrelRightLocal);
+                    qts_rotate(qi, kZ, g_barrelUpLocal);
+                    g_barrelLocalValid = true;
+                }
                 int lf = 0, ll = 0, la = 0;
                 cluster_of(0, &lf, &ll, &la);
                 for (int i = lf; i <= ll && i < g_boneCount; ++i)
@@ -1483,6 +2604,32 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             }
         }
     }
+
+    if (hand == 1) {
+        const uint64_t nowJ = GetTickCount64();
+        uint16_t btn = 0;
+        bvr::input::last_composed_buttons(&btn);
+        if (btn & 0x4000) g_lastReloadBtnMs = nowJ; // XINPUT_GAMEPAD_X: reload
+        if (animating && !g_animWasOn)
+            g_animIsReload = !firingWindow || nowJ - g_lastReloadBtnMs < 800;
+        // An empty magazine makes any animation the reload - including the
+        // automatic one that runs straight on from the last shot.
+        if (animating && (g_clipEmpty.load(std::memory_order_relaxed) ||
+                          g_jackFireCycle.load(std::memory_order_relaxed)))
+            g_animIsReload = true;
+        if (!animating) g_animIsReload = false;
+        g_animWasOn = animating;
+        g_jackWant = g_jackReloads.load(std::memory_order_relaxed) && g_offFollow &&
+                     g_animIsReload && g_liveValid;
+    } else {
+        g_jackWant = false;
+        g_animWasOn = g_animIsReload = false;
+    }
+    if (hand == 1) {
+        weapon_still_tick();
+        anim_log_tick(anchor, g_liveValid && (firingWindow || animating));
+    }
+    else g_ep.on = false;
 
     // Neutral capture (v2: the first cut waited for the sway kill to report
     // SETTLED, which a looping plasmid idle never does): once the plasmid hand
@@ -1541,6 +2688,9 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
 
     float qa[4], qt[4], qaInv[4], qtc[4];
     ue_rot_to_quat(actorRot, qa);
+    memcpy(g_lastQa, qa, sizeof qa);
+    memcpy(g_lastActorLoc, actorLoc, sizeof actorLoc);
+    g_lastActorValid = true;
     ue_rot_to_quat(gp.rot, qt);
     quat_conj(qa, qaInv);
     quat_mul(qaInv, qt, qtc); // target rotation, component space
@@ -1609,10 +2759,17 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     // written back explicitly - the engine cannot be relied on to re-evaluate
     // while the drive keeps clearing the dirty flag.
     bool collapse = g_collapse.load(std::memory_order_relaxed);
+    bool armed = false;
+    if (g_armsOn.load(std::memory_order_relaxed)) {
+        float Wt[3];
+        written_wrist(hand, anchor, ptc, qtc, g_ref, Wt);
+        armed = arm_ik(hand, Wt, qaInv, actorLoc);
+    }
+    const bool collapseThis = collapse && !armed;
     const int* sleeve = hand == 1 ? patterns::kBoneRSleeve : patterns::kBoneLSleeve;
     const size_t sleeveCount = hand == 1 ? _countof(patterns::kBoneRSleeve)
                                          : _countof(patterns::kBoneLSleeve);
-    if (collapse) {
+    if (collapseThis) {
         static const float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         for (size_t k = 0; k < sleeveCount; ++k) {
             int idx = sleeve[k];
@@ -1624,9 +2781,10 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
                 cs.idx = idx;
                 memcpy(cs.p, ptc, 12);
                 memcpy(cs.s, kZero, 12);
+                cs.writeQ = false;
             }
         }
-    } else if (g_wasCollapsed) {
+    } else if (g_wasCollapsed && !armed) {
         for (size_t k = 0; k < sleeveCount; ++k) {
             int idx = sleeve[k];
             if (idx >= g_boneCount) continue;
@@ -1634,8 +2792,8 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
             write_n(g_bones[idx].s, g_ref[idx].s, 12);
         }
     }
-    g_wasCollapsed = collapse;
-    g_collapsedHand = collapse ? hand : -1;
+    g_wasCollapsed = collapseThis;
+    g_collapsedHand = collapseThis ? hand : -1;
 
     // Collapse the whole INACTIVE hand: cluster + its sleeve (session 19).
     // Zero scale hides the skin exactly like the sleeve collapse; positions
@@ -1687,6 +2845,91 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
     return true;
 }
 
+void set_arm_target(int hand, bool valid, const float shoulderW[3], const float poleW[3],
+                    const float outW[3]) {
+    if (hand != 0 && hand != 1) return;
+    g_armTargetValid[hand] = valid && shoulderW && poleW && outW;
+    if (!g_armTargetValid[hand]) return;
+    memcpy(g_armShoulderW[hand], shoulderW, 12);
+    memcpy(g_armPoleW[hand], poleW, 12);
+    memcpy(g_armOutW[hand], outW, 12);
+}
+void set_arms(bool on) { g_armsOn.store(on, std::memory_order_relaxed); }
+void set_arm_length(float m) { g_armLength.store(m, std::memory_order_relaxed); }
+float arm_length() { return g_armLength.load(std::memory_order_relaxed); }
+bool arms() { return g_armsOn.load(std::memory_order_relaxed); }
+void set_arm_scale_skin(bool on) { g_armScaleS.store(on, std::memory_order_relaxed); }
+bool arm_scale_skin() { return g_armScaleS.load(std::memory_order_relaxed); }
+float arm_twist_deg(int hand) {
+    return hand == 0 || hand == 1 ? g_armTwistDeg[hand].load(std::memory_order_relaxed) : 0.0f;
+}
+void arm_stats(unsigned* solves, unsigned* stretched) {
+    *solves = g_armSolves.load(std::memory_order_relaxed);
+    *stretched = g_armStretched.load(std::memory_order_relaxed);
+}
+
+bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float gripQ[4],
+                    float palmDepthUu, float outLoc[3], float outQ[4]) {
+    if (hand != 0 && hand != 1) return false;
+    if (!g_palm[hand].valid && !compute_palm_local(hand)) return false;
+    int first = 0, last = 0, anchor = 0;
+    cluster_of(hand, &first, &last, &anchor);
+    const Qts* src = draw_source(hand, driven);
+    const int w = wrist_of(hand);
+    if (w >= g_boneCount || anchor >= g_boneCount) return false;
+    const PalmLocal& pl = g_palm[hand];
+    // The weapon hand solves against the gun's REST relation (g_placeRest) so
+    // the gun stays rigid to the controller through its own animations.
+    const bool rest = driven && hand == 1 && g_placeRestValid;
+    const Qts& W = rest ? g_placeRest[0] : src[w];
+    const Qts& A = rest ? g_placeRest[1] : src[anchor];
+    // Palm frame in component space for the pose that will actually be drawn.
+    float qPalm[4], pw[3], face[3];
+    quat_mul(W.q, pl.q, qPalm);
+    qts_rotate(W.q, pl.p, pw);
+    qts_rotate(W.q, pl.face, face);
+    const float s = g_scale[hand].load(std::memory_order_relaxed);
+    // Relative to the anchor, scaled like the cluster, then pushed toward the
+    // palm surface: the grip origin sits inside the fist, a handle's radius in.
+    float rel[3];
+    for (int i = 0; i < 3; ++i) rel[i] = (W.p[i] + pw[i] - A.p[i]) * s + face[i] * palmDepthUu;
+    // Drive frame: q = qGrip * qPalm^-1, anchor = gripLoc - q * rel.
+    float pinv[4], rr[3];
+    quat_conj(qPalm, pinv);
+    quat_mul(gripQ, pinv, outQ);
+    qts_rotate(outQ, rel, rr);
+    for (int i = 0; i < 3; ++i) outLoc[i] = gripLoc[i] - rr[i];
+    return true;
+}
+
+bool barrel_dir_target(float yawDeg, float pitchDeg, float out[3]) {
+    if (!g_refValid || g_boneCount <= patterns::kBoneWeaponAttach) return false;
+    if (!g_barrelLocalValid) return barrel_ref_axis(out);
+    // The weapon's own barrel angle in its idle pose (yaw right+, pitch up+,
+    // the rig's un-mirrored frame): some models are authored toed in toward
+    // the crosshair rather than straight down the view.
+    const float y = yawDeg / 57.29578f, pt = pitchDeg / 57.29578f;
+    const float cf = cosf(pt) * cosf(y), cr = cosf(pt) * sinf(y), cu = sinf(pt);
+    float local[3];
+    for (int i = 0; i < 3; ++i)
+        local[i] = g_barrelLocal[i] * cf + g_barrelRightLocal[i] * cr + g_barrelUpLocal[i] * cu;
+    // Carried by the attach bone's CURRENT reference rotation, so the barrel
+    // follows the gun through its own animations (a pump rocks it back).
+    qts_rotate(g_ref[patterns::kBoneWeaponAttach].q, local, out);
+    return true;
+}
+
+bool written_world(int idx, float out[3]) {
+    for (int k = 0; k < g_cacheCount; ++k) {
+        if (g_cache[k].idx != idx) continue;
+        float r[3];
+        qts_rotate(g_lastQa, g_cache[k].p, r);
+        for (int i = 0; i < 3; ++i) out[i] = g_lastActorLoc[i] + r[i];
+        return g_lastActorValid;
+    }
+    return false;
+}
+
 void set_off_follow(bool on) { g_offFollow = on; }
 void set_off_preview(bool on) { g_offPreview = on; }
 
@@ -1715,6 +2958,7 @@ void reapply() {
         if (cs.idx >= g_boneCount) continue;
         write_n(g_bones[cs.idx].p, cs.p, 12);
         write_n(g_bones[cs.idx].s, cs.s, 12);
+        if (cs.writeQ) write_n(g_bones[cs.idx].q, cs.q, 16);
     }
     for (int k = 0; k < g_cacheHiddenCount; ++k) {
         const CachedHidden& ch = g_cacheHidden[k];

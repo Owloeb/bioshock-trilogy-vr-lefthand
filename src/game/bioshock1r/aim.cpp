@@ -1241,6 +1241,12 @@ bool g_calHaveTarget = false;
 float g_calTarget[3] = {};
 bool g_calSqueeze = false;
 std::atomic<bool> g_plasmidDot{true};
+// Calibration distance. Your eye sights the target but the cast leaves your
+// hand ~30-40 cm away, so the two lines cross at exactly one range - the
+// calibration dot's - and part beyond it. 4 m (the first cut) crossed them too
+// close: long shots drifted by hand-offset x (range / 4 m - 1). Fights happen
+// at 8-20 m; 12 m keeps both ends within a hand's width.
+std::atomic<float> g_calDistM{12.0f};
 
 const char* cal_setup() {
     if (!bvr::input::left_handed()) return "R";
@@ -1266,6 +1272,8 @@ void cal_load() {
             g_cal[key] = {true, p, y};
         } else if (sscanf_s(line, "plasmidDot=%f", &p) == 1) {
             g_plasmidDot.store(p != 0.0f);
+        } else if (sscanf_s(line, "calDistM=%f", &p) == 1) {
+            if (p >= 2.0f && p <= 40.0f) g_calDistM.store(p);
         }
     }
     fclose(f);
@@ -1278,6 +1286,7 @@ void cal_save() {
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "# plasmid aim calibration: <R|L|LM>=pitch yaw (deg)\n");
     fprintf(f, "plasmidDot=%d\n", g_plasmidDot.load() ? 1 : 0);
+    fprintf(f, "calDistM=%.1f\n", g_calDistM.load());
     std::lock_guard<std::mutex> lk(g_calMx);
     for (const auto& [k, c] : g_cal)
         if (c.valid) fprintf(f, "%s=%.2f %.2f\n", k.c_str(), c.pitch, c.yaw);
@@ -1330,6 +1339,31 @@ void apply_origin_offset(int i, Ray& out, float worldScale) {
 // Written and read on the game thread only (commands run there too).
 static FrameContext g_lastCtx{};
 static bool g_haveCtx = false;
+
+// Barrel aim (hands.cpp publish_barrel): the next weapon shot leaves the
+// rendered muzzle along the rendered barrel. Game thread writes and reads.
+bool g_barrelValid = false;
+uint64_t g_barrelMs = 0;
+float g_barrelO[3] = {}, g_barrelD[3] = {1, 0, 0};
+bool g_barrelLaser = false;
+float g_barrelLO[3] = {}, g_barrelLD[3] = {0, 0, -1};
+
+void set_barrel(bool valid, const float origin[3], const float dir[3], const float laserOrigin[3],
+                const float laserDir[3]) {
+    g_barrelValid = valid && origin && dir;
+    if (!g_barrelValid) return;
+    memcpy(g_barrelO, origin, 12);
+    memcpy(g_barrelD, dir, 12);
+    g_barrelLaser = laserOrigin && laserDir;
+    if (g_barrelLaser) {
+        memcpy(g_barrelLO, laserOrigin, 12);
+        memcpy(g_barrelLD, laserDir, 12);
+    }
+    g_barrelMs = GetTickCount64();
+}
+
+bool barrel_fresh() { return g_barrelValid && GetTickCount64() - g_barrelMs < 150; }
+
 
 void on_calcview(const FrameContext& ctx) {
     uint64_t now = GetTickCount64();
@@ -1427,6 +1461,15 @@ void on_calcview(const FrameContext& ctx) {
         out.origin = gp.loc;
         out.rot = gp.rot;
 
+        // Barrel aim (grip placement): the shot leaves the RENDERED muzzle
+        // along the RENDERED barrel - the gun you see is the gun that fires.
+        if (i == 1 && barrel_fresh()) {
+            out.origin = {g_barrelO[0], g_barrelO[1], g_barrelO[2]};
+            out.rot = ue_dir_to_rot(g_barrelD);
+            out.valid = true;
+            continue;
+        }
+
         // Muzzle ray (session 20, right hand only): the bullet leaves along
         // the RENDERED barrel. The model's target rotation is recomputed here
         // through the same pure function hands.cpp uses this frame (same ctx,
@@ -1469,11 +1512,13 @@ void on_calcview(const FrameContext& ctx) {
     if (g_calArmed.load() && ctx.vrDriving) {
         bvr::vr::HeadPose head{};
         if (!g_calHaveTarget && bvr::vr::peek_head_pose(head)) {
-            // 4 m straight along your gaze, fixed in the room once placed.
+            // Straight along your gaze at the calibration distance, fixed in
+            // the room once placed.
             const float fwd[3] = {0.0f, 0.0f, -1.0f};
             float d[3];
             quat_rotate(head.qx, head.qy, head.qz, head.qw, fwd, d);
-            for (int k = 0; k < 3; ++k) g_calTarget[k] = (&head.px)[k] + d[k] * 4.0f;
+            const float dist = g_calDistM.load();
+            for (int k = 0; k < 3; ++k) g_calTarget[k] = (&head.px)[k] + d[k] * dist;
             g_calHaveTarget = true;
         }
         bvr::vr::reserve_grip_bumper(0, true); // this squeeze must not raise plasmids
@@ -1538,6 +1583,11 @@ void on_calcview(const FrameContext& ctx) {
             lc.modelYawTrimDeg = hands::model_trim_yaw_deg(1) * mirror_side();
             lc.modelRollTrimDeg = hands::model_trim_roll_deg(1) * mirror_side();
         }
+    }
+    if (lc.hand == 1 && barrel_fresh() && g_barrelLaser) {
+        lc.gripLocal = true;
+        memcpy(lc.gripOrigin, g_barrelLO, 12);
+        memcpy(lc.gripDir, g_barrelLD, 12);
     }
     bvr::vr::set_laser(lc);
 
@@ -1947,6 +1997,7 @@ void* learned_weapon_object() {
 }
 
 const char* active_weapon_key() { return g_weaponKey.c_str(); }
+
 uint32_t player_shot_count() { return g_playerShots.load(std::memory_order_relaxed); }
 uint32_t player_ability_count() { return g_playerAbilities.load(std::memory_order_relaxed); }
 
@@ -2051,6 +2102,13 @@ void draw_debug_ui() {
                 ImGui::Text("calibrated: pitch %.1f yaw %.1f", c.pitch, c.yaw * side);
             }
         }
+        float cd = g_calDistM.load();
+        if (ImGui::SliderFloat("calibration distance (m)", &cd, 3.0f, 30.0f, "%.0f")) {
+            g_calDistM.store(cd);
+            cal_save();
+        }
+        ImGui::TextDisabled("Casts are exact at this range. Recalibrate after changing it; set the "
+                            "aim dot distance to match.");
         bool pd = g_plasmidDot.load();
         if (ImGui::Checkbox("Aim dot for plasmids", &pd)) {
             g_plasmidDot.store(pd);
@@ -2127,7 +2185,7 @@ void draw_debug_ui() {
                           "Set the distance to your calibration wall: a dot and a bullet "
                           "hole only fuse in stereo at matching depth.");
     float dotDist = g_dotDistM.load(std::memory_order_relaxed);
-    if (ImGui::SliderFloat("aim dot distance (m)", &dotDist, 0.5f, 20.0f))
+    if (ImGui::SliderFloat("aim dot distance (m)", &dotDist, 0.5f, 30.0f))
         g_dotDistM.store(dotDist, std::memory_order_relaxed);
     float dotSize = g_dotSizeDeg.load(std::memory_order_relaxed);
     if (ImGui::SliderFloat("aim dot size (deg)", &dotSize, 0.1f, 3.0f))

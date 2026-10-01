@@ -54,6 +54,67 @@ void set_off_target(bool track, const GamePose* gp);
 // own off-hand motion relative to the gun (shotgun pump, chemical thrower
 // crank) onto it. Game thread, before drive().
 void set_off_follow(bool on);
+
+// Grip-pose placement: given where the OpenXR GRIP pose is (game space, the
+// quaternion in the skeleton convention - ue_rot_to_quat), the drive target
+// (anchor location + frame) that puts Jack's measured palm frame exactly on
+// it, for the pose `hand` will be drawn with (driven = the raised hand).
+// palmDepthUu pushes the palm centroid toward the palm surface. False until
+// the rig has a reference pose.
+bool grip_to_anchor(int hand, bool driven, const float gripLoc[3], const float gripQ[4],
+                    float palmDepthUu, float outLoc[3], float outQ[4]);
+// The weapon now in hand (class key). A change drops the weapon hand's rest
+// relation, so the new gun is placed live until it settles. Game thread,
+// before grip_to_anchor for the driven weapon hand.
+void set_active_weapon(const char* key);
+// Developer tools: log one summary per weapon animation (engine off hand, gun
+// tilt, the weapon's own moving bones) to bioshockvr.log.
+void set_anim_log(bool on);
+// Two-handed grip, follow v5: what the held hand rides for the weapon in hand.
+// "" = the weapon part nearest the grab point (default), "*body" = the gun body
+// only, "*hand" = the engine's own off hand (v4), or a weapon bone name. Game
+// thread, every frame.
+void set_ride_part(const char* want);
+// The current weapon's part (bone) names; returns how many (render-safe copy).
+int weapon_part_names(char (*out)[40], int cap);
+// Nearest part to the grab point while the hand is near/holding (-1 none), and
+// what the held hand rides right now (index, -1 body, -2 engine hand, -3 idle).
+int ride_part_auto();
+int ride_part_active();
+// While held through a RELOAD, show Jack's own hand doing it (default on).
+void set_jack_reloads(bool on);
+// The gun in hand has an empty magazine (so the next animation is its reload).
+void set_clip_empty(bool empty);
+// This weapon's between-shot animation (the crossbow's priming pull) is a hand
+// action too: show Jack's hand for it while held. Game thread, every frame.
+void set_jack_fire_cycle(bool on);
+bool jack_reloads();
+// World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
+bool written_world(int idx, float out[3]);
+// The gun's barrel direction in the drive target's frame: its idle forward,
+// learned at rest in the attach bone's frame and carried through animations.
+// Falls back to 43->44 before the first rest.
+// yaw/pitch (deg, right+/up+, un-mirrored rig frame) = that weapon's own barrel
+// angle in its idle pose.
+bool barrel_dir_target(float yawDeg, float pitchDeg, float out[3]);
+
+// Arms (two-bone IK): instead of collapsing a visible hand's
+// sleeve, pose clavicle / upper arm / elbow / twist helpers from a shoulder
+// point to the written wrist. Targets are in ENGINE world space (already
+// mirrored when the viewmodel mirror is on) and persist until changed; pole =
+// the direction the elbow bends toward. Game thread, before drive().
+void set_arm_target(int hand, bool valid, const float shoulderW[3], const float poleW[3],
+                    const float outW[3]);
+void set_arms(bool on);
+void set_arm_length(float mult); // 1.0 = Jack's own arm (reference pose)
+float arm_length();
+bool arms();
+void set_arm_scale_skin(bool on); // scale the arm skin like the hands (default on)
+bool arm_scale_skin();
+void arm_stats(unsigned* solves, unsigned* stretched);
+// The wrist's roll about the forearm the helpers carry, after the elbow lift
+// (deg; readout).
+float arm_twist_deg(int hand);
 // Draw the off hand in its grip shape without following (grab-point recording,
 // grab-zone preview). Game thread, before drive().
 void set_off_preview(bool on);
