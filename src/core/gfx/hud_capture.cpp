@@ -53,6 +53,7 @@ ID3D11DepthStencilView* g_dsv = nullptr;
 // (correct over-composite coverage), rgb ops untouched. Keyed by the
 // original state pointer; variants are ours and released with the RT.
 std::map<ID3D11BlendState*, ID3D11BlendState*> g_blendVariants;
+bool g_maskDrawLogged = false; // render thread only
 
 // ---- per-interval classifier state ----------------------------------------
 // Current binding (tracked at SetRT; resources are identity keys only).
@@ -1789,7 +1790,24 @@ void fix_blend_alpha(ID3D11DeviceContext* ctx) {
         d.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
         d.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
         d.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-        d.RenderTarget[0].RenderTargetWriteMask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
+        // Only a draw that writes COLOUR gets coverage. gameswf builds its clip
+        // masks with every colour channel write-disabled (stencil only); forcing
+        // the alpha write on for those stamped the whole mask shape onto the
+        // panel as opaque coverage, and the glow drawn inside it then showed as
+        // a solid tinted arc around the health gauge - visible only with the VR
+        // HUD on, untouched by the bar alpha repair. A colourless draw keeps its
+        // mask exactly as authored.
+        constexpr UINT8 kRgb = D3D11_COLOR_WRITE_ENABLE_RED |
+                               D3D11_COLOR_WRITE_ENABLE_GREEN |
+                               D3D11_COLOR_WRITE_ENABLE_BLUE;
+        if (d.RenderTarget[0].RenderTargetWriteMask & kRgb) {
+            d.RenderTarget[0].RenderTargetWriteMask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
+        } else if (!g_maskDrawLogged) {
+            g_maskDrawLogged = true;
+            BVR_LOG("[hud] colourless (mask) gameswf draw redirected - write mask 0x%X kept, "
+                    "no alpha coverage added",
+                    static_cast<unsigned>(d.RenderTarget[0].RenderTargetWriteMask));
+        }
         ID3D11Device* dev = nullptr;
         ctx->GetDevice(&dev);
         if (dev) {
