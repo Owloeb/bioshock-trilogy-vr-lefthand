@@ -5,6 +5,7 @@
 #include "core/util/log.h"
 #include "game/bioshock1r/bones.h"
 #include "game/bioshock1r/camera.h"
+#include "game/bioshock1r/console_exec.h"
 #include "game/bioshock1r/hands.h"
 #include "game/bioshock1r/patterns.h"
 
@@ -33,6 +34,8 @@ bool read_block(const void* src, void* out, size_t n) {
         return false;
     }
 }
+
+bool may_log();
 
 bool write_block(void* dst, const void* in, size_t n) {
     __try {
@@ -83,6 +86,7 @@ Watch g_watch[5 + kLinks] = {{"pawn", 0x1000 / 4}, {"pc", 0x1000 / 4}, {"hands",
 constexpr uint32_t kHypoFlagsOff = 0x0D0, kHypoBoneOff = 0x0F0;
 constexpr uint32_t kHypoHiddenBit = 0x100000;
 std::atomic<bool> g_showTest{false};
+std::atomic<int> g_hiddenReq{0}; // console bHidden test: 1 = False, 2 = True
 bool g_showWas = false;
 uint32_t g_flagsSaved = 0;
 float g_locSaved[3] = {};
@@ -171,6 +175,131 @@ void census_arrays(void* obj, const char* name, uint32_t bytes) {
             }
         }
         if (objs) BVR_LOG("[eve] %s+0x%03X array of %u:%s", name, i * 4, n, line.c_str());
+    }
+}
+
+// ---- inventory lists (v4) ------------------------------------------------------
+// Every TArray {data, count, max} in the inventory manager: its elements once
+// (object/class names where they are objects, else ints), then its data block
+// watched for changes - the hypo count is an element of one of these.
+struct ArrWatch {
+    uint32_t off = 0, n = 0;
+    uintptr_t data = 0;
+    uint32_t prev[64];
+    bool have = false;
+};
+ArrWatch g_arr[12];
+int g_arrCount = 0;
+void* g_arrOwner = nullptr;
+
+std::string obj_name(const void* obj) {
+    int32_t idx = 0;
+    if (!read_block(static_cast<const uint8_t*>(obj) + patterns::kUObjectNameIndexOffset, &idx, 4)) return "?";
+    const wchar_t* w = patterns::fname_text(idx);
+    std::string s;
+    if (w)
+        for (size_t i = 0; w[i] && i < 47; ++i) s += w[i] < 128 ? static_cast<char>(w[i]) : '?';
+    return s.empty() ? "?" : s;
+}
+
+void inv_arrays(void* im) {
+    if (!im) return;
+    if (im != g_arrOwner) {
+        g_arrOwner = im;
+        g_arrCount = 0;
+        uint32_t w[0x800 / 4];
+        if (!read_block(im, w, sizeof w)) return;
+        for (uint32_t i = 0; i + 2 < 0x800 / 4 && g_arrCount < 12; ++i) {
+            const uint32_t data = w[i], n = w[i + 1], mx = w[i + 2];
+            if (data < 0x10000 || (data & 3) || n == 0 || n > 64 || mx < n || mx > 4096) continue;
+            uint32_t el[64];
+            if (!read_block(reinterpret_cast<void*>(static_cast<uintptr_t>(data)), el, n * 4)) continue;
+            std::string line;
+            for (uint32_t k = 0; k < n; ++k) {
+                char b[96];
+                void* p = reinterpret_cast<void*>(static_cast<uintptr_t>(el[k]));
+                if (el[k] >= 0x10000 && patterns::object_class_name(p))
+                    _snprintf_s(b, sizeof b, _TRUNCATE, " [%u]%s:%s", k, class_of(p).c_str(), obj_name(p).c_str());
+                else
+                    _snprintf_s(b, sizeof b, _TRUNCATE, " [%u]%d", k, static_cast<int32_t>(el[k]));
+                if (line.size() < 1700) line += b;
+            }
+            BVR_LOG("[eve] inv+0x%03X (%u):%s", i * 4, n, line.c_str());
+            ArrWatch& a = g_arr[g_arrCount++];
+            a.off = i * 4;
+            a.n = n;
+            a.data = data;
+            memcpy(a.prev, el, n * 4);
+            a.have = true;
+            i += 2;
+        }
+    }
+    for (int j = 0; j < g_arrCount; ++j) {
+        ArrWatch& a = g_arr[j];
+        uint32_t cur[64];
+        if (!read_block(reinterpret_cast<void*>(a.data), cur, a.n * 4)) continue;
+        for (uint32_t k = 0; k < a.n; ++k)
+            if (cur[k] != a.prev[k] && may_log())
+                BVR_LOG("[eve] inv+0x%03X[%u]: %d -> %d", a.off, k, static_cast<int32_t>(a.prev[k]),
+                        static_cast<int32_t>(cur[k]));
+        memcpy(a.prev, cur, a.n * 4);
+    }
+}
+
+// ---- the hands' animation clock (v4) -------------------------------------------
+// Snapshots of the hands actor and its SkeletonInstance 0.25 s before X and
+// at +0.25/+0.5/+1.0/+1.5/+2.0 s after it; floats that change across them are
+// logged as a sequence. An animation time ramps; its rate holds steady.
+constexpr int kSnapWords = 0x800 / 4;
+struct Snap {
+    float h[kSnapWords];
+    float k[kSnapWords];
+};
+Snap g_snapRing[4];   // rolling pre-X history (one every ~80 ms)
+int g_snapRingAt = 0;
+uint64_t g_snapRingMs = 0;
+Snap g_snap[6];
+int g_snapTaken = 0;
+uint64_t g_xMs = 0;
+
+void take_snap(Snap& s) {
+    void* h = hands::hands_actor();
+    void* k = bones::skeleton_instance();
+    if (!h || !read_block(h, s.h, sizeof s.h)) memset(s.h, 0, sizeof s.h);
+    if (!k || !read_block(k, s.k, sizeof s.k)) memset(s.k, 0, sizeof s.k);
+}
+
+void clock_tick(bool xPressed) {
+    const uint64_t now = GetTickCount64();
+    if (now - g_snapRingMs >= 80) {
+        g_snapRingMs = now;
+        take_snap(g_snapRing[g_snapRingAt]);
+        g_snapRingAt = (g_snapRingAt + 1) % 4;
+    }
+    if (xPressed && g_snapTaken == 0) {
+        g_snap[0] = g_snapRing[(g_snapRingAt + 1) % 4]; // ~0.25 s before
+        g_snapTaken = 1;
+        g_xMs = now;
+    }
+    static const uint64_t kAt[6] = {0, 250, 500, 1000, 1500, 2000};
+    if (g_snapTaken > 0 && g_snapTaken < 6 && now - g_xMs >= kAt[g_snapTaken]) take_snap(g_snap[g_snapTaken++]);
+    if (g_snapTaken == 6) {
+        g_snapTaken = 0;
+        int lines = 0;
+        for (int pass = 0; pass < 2; ++pass)
+            for (int i = 0; i < kSnapWords && lines < 80; ++i) {
+                float v[6];
+                bool diff = false, sane = true;
+                for (int t = 0; t < 6; ++t) {
+                    v[t] = pass ? g_snap[t].k[i] : g_snap[t].h[i];
+                    if (!(fabsf(v[t]) < 1e6f) || (v[t] != 0.0f && fabsf(v[t]) < 1e-6f)) sane = false;
+                    if (t && v[t] != v[0]) diff = true;
+                }
+                if (!diff || !sane) continue;
+                ++lines;
+                BVR_LOG("[eve] clock %s+0x%03X: %.4g | %.4g %.4g %.4g %.4g %.4g", pass ? "skel" : "hands",
+                        i * 4, v[0], v[1], v[2], v[3], v[4], v[5]);
+            }
     }
 }
 
@@ -455,6 +584,27 @@ void tick() {
         }
     }
     show_test();
+    {
+        void* im = nullptr;
+        if (pawn) read_block(static_cast<uint8_t*>(pawn) + 0x948, &im, 4);
+        inv_arrays(im);
+    }
+    {
+        static uint16_t s_prevBtn = 0;
+        uint16_t btn = 0;
+        bvr::input::last_composed_buttons(&btn);
+        const bool xEdge = (btn & 0x4000) && !(s_prevBtn & 0x4000) && hands::active_hand() == 0;
+        s_prevBtn = btn;
+        clock_tick(xEdge);
+    }
+    {
+        const int req = g_hiddenReq.exchange(0);
+        if (req) {
+            const char* cmd = req == 1 ? "set BioAmmoHypoTool bHidden False" : "set BioAmmoHypoTool bHidden True";
+            BVR_LOG("[eve] console: %s", cmd);
+            console_exec::run_engine(cmd);
+        }
+    }
     watch_tick(g_watch[0], pawn);
     watch_tick(g_watch[1], camera::player_controller());
     watch_tick(g_watch[2], handsA);
@@ -479,6 +629,9 @@ void draw_debug_ui() {
     ImGui::TextDisabled("empty and cast again, pick up an EVE hypo, use a med hypo, reload a gun.");
     bool st = g_showTest.load();
     if (ImGui::Checkbox("TEST: show the syringe in front of me (inject once first)", &st)) g_showTest.store(st);
+    if (ImGui::Button("TEST: console bHidden False")) g_hiddenReq.store(1);
+    ImGui::SameLine();
+    if (ImGui::Button("TEST: console bHidden True")) g_hiddenReq.store(2);
 }
 
 } // namespace bvr::b1r::eve
