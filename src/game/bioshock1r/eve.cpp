@@ -532,10 +532,11 @@ std::atomic<int> g_spot{kStomach};
 std::atomic<float> g_dropM[2] = {0.55f, 0.62f}; // below the eyes
 std::atomic<float> g_sideM[2] = {0.00f, 0.20f}; // toward the weapon hand's side
 std::atomic<float> g_fwdM[2] = {0.10f, 0.02f};  // forward of the eyes
-std::atomic<float> g_zoneM[2] = {0.19f, 0.20f}; // grab radius (the stomach's busy-gun gates allow near the hip's)
-// eve.ini layout: 2 = the stomach reach default went 15 -> 19 cm (an older
-// file's 15 is that old default, not a choice, so it is not loaded).
-constexpr int kCfgVersion = 2;
+std::atomic<float> g_zoneM[2] = {0.16f, 0.20f}; // grab radius (the settled-height anchor keeps the stomach spot steady)
+// eve.ini layout: 2 = stomach reach default 15 -> 19 cm, 3 = 19 -> 16 cm. An
+// older file's stomach reach is that version's default, not a choice, so it
+// is not loaded.
+constexpr int kCfgVersion = 3;
 int g_cfgFileVersion = 0;
 const char* spot_name() { return g_spot.load() == kHip ? "hip" : "stomach"; }
 std::atomic<float> g_needleUu{14.0f};  // needle tip below the grip (syringe axis)
@@ -642,7 +643,7 @@ void cfg_load() {
         else if (!strcmp(key, "bellyDropM")) g_dropM[kStomach].store(v);
         else if (!strcmp(key, "bellySideM")) g_sideM[kStomach].store(v);
         else if (!strcmp(key, "bellyFwdM")) g_fwdM[kStomach].store(v);
-        else if (!strcmp(key, "bellyZoneM") && g_cfgFileVersion >= 2) g_zoneM[kStomach].store(v);
+        else if (!strcmp(key, "bellyZoneM") && g_cfgFileVersion >= kCfgVersion) g_zoneM[kStomach].store(v);
         else if (!strcmp(key, "hipDropM")) g_dropM[kHip].store(v);
         else if (!strcmp(key, "hipSideM")) g_sideM[kHip].store(v);
         else if (!strcmp(key, "hipFwdM")) g_fwdM[kHip].store(v);

@@ -202,7 +202,7 @@ never reaches the game, so it can't open the weapon wheel.
 **Staying out of the way at the stomach:** your weapon hand passes in front of your stomach all
 the time, so there the holster ignores the hand while it's busy with the gun: two-handing it,
 on the trigger, or aimed ahead (hip-fire). In those cases there's no buzz, and the squeeze goes
-to the game. The stomach reach is 19 cm (the hip's is 20 cm). The log
+to the game. The stomach reach is 16 cm (the hip's is 20 cm). The log
 says why when a squeeze at the stomach was left to the game (`[eve] holster: squeeze at the
 stomach left to the game - ...`).
 
