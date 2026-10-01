@@ -11,6 +11,7 @@
 #include "game/bioshock1r/console_exec.h"
 #include "game/bioshock1r/hands.h"
 #include "game/bioshock1r/patterns.h"
+#include "game/bioshock1r/twohand.h"
 
 #include <windows.h>
 
@@ -511,7 +512,8 @@ void input_edges() {
 
 
 // =============================================================================
-// THE HOLSTER (feature). Weapon hand at the hip + grip = Jack's EVE syringe in
+// THE HOLSTER (feature). Weapon hand at the holster (stomach by default, or
+// the hip) + grip = Jack's EVE syringe in
 // that hand (the game's own BioAmmoHypoTool, un-hidden and placed on the hand's
 // gun socket every frame). Needle tip inside the plasmid forearm = it sticks,
 // both hands buzz; weapon trigger = the game's REAL injection (X with the
@@ -522,10 +524,17 @@ void input_edges() {
 // =============================================================================
 std::atomic<bool> g_holsterOn{true};
 std::atomic<bool> g_blockAuto{true};
-std::atomic<float> g_hipDropM{0.62f};  // below the eyes
-std::atomic<float> g_hipSideM{0.20f};  // out to the weapon hand's side
-std::atomic<float> g_hipFwdM{0.02f};   // forward of the eyes
-std::atomic<float> g_zoneM{0.20f};     // grab radius
+// Two holster spots, each with its own position and reach, so switching
+// keeps both tunings. STOMACH is the default: the hips are where the main
+// mod's manual reloading keeps its magazines. Distances are from the eyes with
+// the head level (the anchor itself hangs from the neck - see holster_offset).
+enum Spot { kStomach = 0, kHip = 1 };
+std::atomic<int> g_spot{kStomach};
+std::atomic<float> g_dropM[2] = {0.55f, 0.62f}; // below the eyes
+std::atomic<float> g_sideM[2] = {0.00f, 0.20f}; // toward the weapon hand's side
+std::atomic<float> g_fwdM[2] = {0.10f, 0.02f};  // forward of the eyes
+std::atomic<float> g_zoneM[2] = {0.15f, 0.20f}; // grab radius (the stomach is busier: tighter)
+const char* spot_name() { return g_spot.load() == kHip ? "hip" : "stomach"; }
 std::atomic<float> g_needleUu{14.0f};  // needle tip below the grip (syringe axis)
 std::atomic<float> g_surgeAmt{1.0f};   // injection tremor strength (0 = off)
 std::atomic<bool> g_cfgDirty{false};
@@ -605,9 +614,10 @@ void cfg_save() {
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "# BioShock VR - EVE holster\n");
-    fprintf(f, "holster=%d\nblockAutoInject=%d\nhipDropM=%.3f\nhipSideM=%.3f\nhipFwdM=%.3f\nzoneM=%.3f\nneedleUu=%.1f\nsurge=%.2f\nhiddenOff=%d\nhiddenMask=%d\n",
-            g_holsterOn.load() ? 1 : 0, g_blockAuto.load() ? 1 : 0, g_hipDropM.load(), g_hipSideM.load(),
-            g_hipFwdM.load(), g_zoneM.load(), g_needleUu.load(), g_surgeAmt.load(), g_hidOff, static_cast<int>(g_hidMask));
+    fprintf(f, "holster=%d\nblockAutoInject=%d\nspot=%d\nbellyDropM=%.3f\nbellySideM=%.3f\nbellyFwdM=%.3f\nbellyZoneM=%.3f\nhipDropM=%.3f\nhipSideM=%.3f\nhipFwdM=%.3f\nzoneM=%.3f\nneedleUu=%.1f\nsurge=%.2f\nhiddenOff=%d\nhiddenMask=%d\n",
+            g_holsterOn.load() ? 1 : 0, g_blockAuto.load() ? 1 : 0, g_spot.load(), g_dropM[kStomach].load(),
+            g_sideM[kStomach].load(), g_fwdM[kStomach].load(), g_zoneM[kStomach].load(), g_dropM[kHip].load(),
+            g_sideM[kHip].load(), g_fwdM[kHip].load(), g_zoneM[kHip].load(), g_needleUu.load(), g_surgeAmt.load(), g_hidOff, static_cast<int>(g_hidMask));
     fclose(f);
 }
 void cfg_load() {
@@ -623,10 +633,15 @@ void cfg_load() {
         if (line[0] == '#' || sscanf_s(line, "%47[^=]=%f", key, static_cast<unsigned>(sizeof key), &v) != 2) continue;
         if (!strcmp(key, "holster")) g_holsterOn.store(v != 0.0f);
         else if (!strcmp(key, "blockAutoInject")) g_blockAuto.store(v != 0.0f);
-        else if (!strcmp(key, "hipDropM")) g_hipDropM.store(v);
-        else if (!strcmp(key, "hipSideM")) g_hipSideM.store(v);
-        else if (!strcmp(key, "hipFwdM")) g_hipFwdM.store(v);
-        else if (!strcmp(key, "zoneM")) g_zoneM.store(v);
+        else if (!strcmp(key, "spot")) g_spot.store(v == 1.0f ? kHip : kStomach);
+        else if (!strcmp(key, "bellyDropM")) g_dropM[kStomach].store(v);
+        else if (!strcmp(key, "bellySideM")) g_sideM[kStomach].store(v);
+        else if (!strcmp(key, "bellyFwdM")) g_fwdM[kStomach].store(v);
+        else if (!strcmp(key, "bellyZoneM")) g_zoneM[kStomach].store(v);
+        else if (!strcmp(key, "hipDropM")) g_dropM[kHip].store(v);
+        else if (!strcmp(key, "hipSideM")) g_sideM[kHip].store(v);
+        else if (!strcmp(key, "hipFwdM")) g_fwdM[kHip].store(v);
+        else if (!strcmp(key, "zoneM")) g_zoneM[kHip].store(v);
         else if (!strcmp(key, "needleUu")) g_needleUu.store(v);
         else if (!strcmp(key, "hiddenOff") && v >= 0.0f && v < kSnapBytes) g_hidOff = static_cast<int>(v);
         else if (!strcmp(key, "hiddenMask") && v >= 1.0f && v <= 128.0f) g_hidMask = static_cast<uint8_t>(v);
@@ -999,7 +1014,7 @@ void set_state(Hs s, const char* why) {
 // where the holster had been and the squeeze missed. The neck sits 10 cm below
 // and 8 cm behind the eyes; the settings still read "from your eyes" with the
 // head level, so existing positions carry over unchanged.
-bool hip_offset(float out[3]) {
+bool holster_offset(float out[3]) {
     bvr::vr::HeadPose head{}, hand{};
     if (!bvr::vr::peek_head_pose(head) || !bvr::vr::get_raw_hand_pose(1, false, hand)) return false;
     const float fz[3] = {0.0f, 0.0f, -1.0f};
@@ -1030,10 +1045,11 @@ bool hip_offset(float out[3]) {
     const float neck[3] = {head.px + nk[0], head.py + nk[1], head.pz + nk[2]};
     const float side = bvr::input::left_handed() ? -1.0f : 1.0f; // weapon hand's side
     const float rx = -g_bodyFwd[1], rz = g_bodyFwd[0];               // body right (XR)
-    const float drop = g_hipDropM.load() - 0.10f, fwd = g_hipFwdM.load() + 0.08f, out_ = g_hipSideM.load();
-    const float hip[3] = {neck[0] + rx * side * out_ + g_bodyFwd[0] * fwd, neck[1] - drop,
+    const int sp = g_spot.load();
+    const float drop = g_dropM[sp].load() - 0.10f, fwd = g_fwdM[sp].load() + 0.08f, out_ = g_sideM[sp].load();
+    const float spotAt[3] = {neck[0] + rx * side * out_ + g_bodyFwd[0] * fwd, neck[1] - drop,
                           neck[2] + rz * side * out_ + g_bodyFwd[1] * fwd};
-    const float d[3] = {hand.px - hip[0], hand.py - hip[1], hand.pz - hip[2]};
+    const float d[3] = {hand.px - spotAt[0], hand.py - spotAt[1], hand.pz - spotAt[2]};
     out[0] = (d[0] * rx + d[2] * rz) * side;
     out[1] = d[1];
     out[2] = d[0] * g_bodyFwd[0] + d[2] * g_bodyFwd[1];
@@ -1044,8 +1060,28 @@ bool hip_offset(float out[3]) {
 // is wide (the hip does not sit at one exact height under a head that bobs).
 // Kept tight on purpose - every grip squeeze inside it belongs to the holster,
 // not to the weapon wheel.
+// Why the weapon hand is busy with the gun at the stomach (nullptr = free to
+// draw). Hip spot: never - nothing else happens at your side.
+const char* gun_busy_at_stomach(uint8_t rtRaw) {
+    if (g_spot.load() != kStomach) return nullptr;
+    if (twohand::gripped()) return "two-handing the gun";
+    if (rtRaw >= 30) return "on the trigger";
+    bvr::vr::HeadPose aim{};
+    if (bvr::vr::get_raw_hand_pose(1, true, aim)) {
+        const float fz[3] = {0.0f, 0.0f, -1.0f};
+        float f[3];
+        bvr::xrmath::quat_rotate(aim.qx, aim.qy, aim.qz, aim.qw, fz, f);
+        const float hl = sqrtf(f[0] * f[0] + f[2] * f[2]);
+        if (hl > 1e-3f) {
+            const float ahead = (f[0] * g_bodyFwd[0] + f[2] * g_bodyFwd[1]) / hl; // cos of yaw from body forward
+            if (ahead > 0.707f && fabsf(f[1]) < 0.574f) return "the gun is aimed ahead (hip-fire)"; // 45 / 35 deg
+        }
+    }
+    return nullptr;
+}
+
 bool in_reach(const float o[3], float scale) {
-    const float r = g_zoneM.load() * scale, h = r * 1.25f;
+    const float r = g_zoneM[g_spot.load()].load() * scale, h = r * 1.25f;
     return (o[0] * o[0] + o[2] * o[2]) / (r * r) + o[1] * o[1] / (h * h) < 1.0f;
 }
 
@@ -1335,7 +1371,7 @@ void holster_tick() {
         // and the ring alone (v1, no motion test) swallowed it everywhere
         // below the shoulder.
         float o[3] = {};
-        const bool posed = hip_offset(o);
+        const bool posed = holster_offset(o);
         const float dist = posed ? sqrtf(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]) : -1.0f;
         if (posed && g_hipDistPrev >= 0.0f && now > g_hipDistMs) {
             const float dt = (now - g_hipDistMs) / 1000.0f;
@@ -1346,15 +1382,28 @@ void holster_tick() {
         }
         g_hipDistPrev = dist;
         g_hipDistMs = now;
-        const bool zone = posed && in_reach(o, 1.0f);
-        const bool ring = posed && in_reach(o, 1.5f);
+        // The stomach is in the weapon hand's working space - hip-fire, a
+        // lowered gun, a two-handed hold, the weapon wheel - so there the
+        // holster only answers a hand that is plainly NOT using the gun:
+        // not two-handing it, not on the trigger, and not aimed ahead. A gun
+        // pointed forward and level at belly height is hip-fire; a hand
+        // reaching for a buckle points down or across the body. Blocked, the
+        // squeeze goes to the game as usual (no buzz, no reservation).
+        const char* blocked = gun_busy_at_stomach(rtRaw);
+        const bool zone = posed && in_reach(o, 1.0f) && !blocked;
+        const bool ring = posed && in_reach(o, 1.5f) && !blocked;
         if (rising) {
             g_squeezeRiseMs = now;
             if (zone || (ring && g_approach > 0.35f)) g_zoneSqueeze = true;
+            static uint64_t s_blockLogMs = 0;
+            if (blocked && posed && in_reach(o, 1.5f) && now - s_blockLogMs > 1500) {
+                s_blockLogMs = now;
+                BVR_LOG("[eve] holster: squeeze at the stomach left to the game - %s", blocked);
+            }
         }
         if (!g_squeeze) g_zoneSqueeze = g_drawSpent = false;
         if (rising && !g_zoneSqueeze && posed && dist < 0.45f && now - g_missLogMs > 1500) {
-            g_missLogMs = now; // near the hip but not taken: tuning data
+            g_missLogMs = now; // near the holster but not taken: tuning data
             BVR_LOG("[eve] holster: squeeze %.0f cm from the holster (side %+.0f, up %+.0f, fwd %+.0f cm, "
                     "approach %.2f m/s) - not a draw",
                     dist * 100.0f, o[0] * 100.0f, o[1] * 100.0f, o[2] * 100.0f, g_approach);
@@ -1374,7 +1423,8 @@ void holster_tick() {
             BVR_LOG("[eve] holster: reach squeeze never arrived (%.0f cm away after 450 ms)", dist * 100.0f);
         }
         if (grab) {
-            BVR_LOG("[eve] holster: grip at the hip (syringe %p, socket bone %d, socket %s)", g_hypo, g_socket,
+            BVR_LOG("[eve] holster: grip at the %s (syringe %p, socket bone %d, socket %s)", spot_name(), g_hypo,
+                    g_socket,
                     g_tg.socketOk ? "ok" : "missing");
             const int cnt = hypo_count();
             if (cnt == 0 || !g_tg.socketOk) {
@@ -1405,7 +1455,7 @@ void holster_tick() {
             buzz(1, 0.6f, 60);
             g_heldSinceMs = now;
             g_gameHides = 0;
-            set_state(Hs::Held, "drawn from the hip");
+            set_state(Hs::Held, g_spot.load() == kHip ? "drawn from the hip" : "drawn from the stomach");
         }
         break;
     }
@@ -1700,7 +1750,7 @@ void tick() {
 void draw_debug_ui() {
     if (ImGui::CollapsingHeader("EVE holster")) {
         bool b = g_holsterOn.load();
-        if (ImGui::Checkbox("EVE holster at the hip (grip to draw, needle in your arm, trigger)", &b)) {
+        if (ImGui::Checkbox("EVE holster (grip to draw, needle in your arm, trigger)", &b)) {
             g_holsterOn.store(b);
             g_cfgDirty.store(true);
         }
@@ -1709,25 +1759,41 @@ void draw_debug_ui() {
             g_blockAuto.store(b);
             g_cfgDirty.store(true);
         }
-        ImGui::TextDisabled("Holster position, from your eyes (on your weapon hand's side):");
-        float v = g_hipDropM.load() * 100.0f;
+        int sp = g_spot.load();
+        ImGui::TextUnformatted("Holster on your:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("stomach", sp == kStomach)) sp = kStomach;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("hip", sp == kHip)) sp = kHip;
+        if (sp != g_spot.load()) {
+            g_spot.store(sp);
+            g_cfgDirty.store(true);
+        }
+        if (sp == kStomach)
+            ImGui::TextDisabled("Not drawn while you two-hand the gun, hold the trigger or aim it ahead.");
+        else
+            ImGui::TextDisabled("The hips are where manual reloading keeps magazines - pick one use for them.");
+        ImGui::TextDisabled(sp == kStomach ? "Position from your eyes (side: + toward your weapon hand):"
+                                           : "Position from your eyes (on your weapon hand's side):");
+        float v = g_dropM[sp].load() * 100.0f;
         if (ImGui::SliderFloat("down (cm)", &v, 30.0f, 90.0f, "%.0f")) {
-            g_hipDropM.store(v / 100.0f);
+            g_dropM[sp].store(v / 100.0f);
             g_cfgDirty.store(true);
         }
-        v = g_hipSideM.load() * 100.0f;
-        if (ImGui::SliderFloat("out to the side (cm)", &v, 0.0f, 40.0f, "%.0f")) {
-            g_hipSideM.store(v / 100.0f);
+        v = g_sideM[sp].load() * 100.0f;
+        if (ImGui::SliderFloat(sp == kStomach ? "sideways (cm)" : "out to the side (cm)", &v,
+                               sp == kStomach ? -20.0f : 0.0f, 40.0f, "%.0f")) {
+            g_sideM[sp].store(v / 100.0f);
             g_cfgDirty.store(true);
         }
-        v = g_hipFwdM.load() * 100.0f;
-        if (ImGui::SliderFloat("forward (cm)", &v, -25.0f, 25.0f, "%.0f")) {
-            g_hipFwdM.store(v / 100.0f);
+        v = g_fwdM[sp].load() * 100.0f;
+        if (ImGui::SliderFloat("forward (cm)", &v, -25.0f, 35.0f, "%.0f")) {
+            g_fwdM[sp].store(v / 100.0f);
             g_cfgDirty.store(true);
         }
-        v = g_zoneM.load() * 100.0f;
+        v = g_zoneM[sp].load() * 100.0f;
         if (ImGui::SliderFloat("reach (cm)", &v, 6.0f, 30.0f, "%.0f")) {
-            g_zoneM.store(v / 100.0f);
+            g_zoneM[sp].store(v / 100.0f);
             g_cfgDirty.store(true);
         }
         v = g_surgeAmt.load();

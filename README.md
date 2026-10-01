@@ -13,7 +13,7 @@ physical feel that VR shooters need.
 - **Two-handed grips** on any weapon. Hold the shotgun's pump or the Tommy gun's foregrip with
   your real hand, and the gun aims along both hands. Your hand rides the gun's moving parts,
   and if you keep holding through a reload you watch Jack do it.
-- **A physical EVE hypo** (experimental). Draw it from your hip, put the needle in your arm,
+- **A physical EVE hypo** (experimental). Draw it from your stomach (or hip), put the needle in your arm,
   pull the trigger.
 - **Recoil and haptics** on every weapon, wrench hits and plasmid casts.
 - **Plasmid aim calibration** for your hand, plus an aim dot for plasmids.
@@ -61,7 +61,7 @@ machine.
 6. Optional: open **Arms** and adjust where your shoulders sit if the arms look too long or
    too short.
 7. Optional: open **EVE holster** and move the holster if it doesn't sit where your hand
-   naturally goes.
+   naturally goes. It's on your stomach by default; you can switch it to your hip.
 
 All of these save themselves. You do this once, not every launch.
 
@@ -180,23 +180,31 @@ reload while you hold the grip**. Guns without a grab point stay one-handed, del
 
 ### 7. EVE holster (BioShock 1, experimental)
 
-**What you get:** a physical EVE hypo on the hip of your weapon hand (the left hip in
-left-handed mode).
+**What you get:** a physical EVE hypo in a holster on your **stomach**, drawn with your weapon
+hand. The holster can be moved back to the **hip** of your weapon hand in F10. The stomach is
+the default because the main mod's manual reloading keeps its magazines on the hips.
 
-1. **Draw.** Reach your weapon hand to that hip; the controller buzzes steadily while you're in
-   reach. Squeeze the grip and Jack's real EVE syringe is in your hand. You can squeeze on the
-   way in: a squeeze that starts just short of the hip while your hand is moving toward it
-   still draws if the hand gets there within about half a second. A squeeze with your hand
-   held still near your side goes to the game as usual (the weapon wheel). If a gun was out, the plasmid comes up so your other arm is
-   ready.
+1. **Draw.** Reach your weapon hand to the holster; the controller buzzes steadily while
+   you're in reach. Squeeze the grip and Jack's real EVE syringe is in your hand. You can
+   squeeze on the way in: a squeeze that starts just short of the holster while your hand is
+   moving toward it still draws if the hand gets there within about half a second. A squeeze
+   with your hand held still nearby goes to the game as usual (the weapon wheel). If a gun was
+   out, the plasmid comes up so your other arm is ready.
 2. **Needle in.** Push the needle into your plasmid forearm. Both controllers buzz when it goes
    in.
 3. **Inject.** Pull the trigger. The game runs its own injection: the plunger goes down, the
    EVE fills, a hypo is used. Your hand trembles as the plunger goes down and jolts as the EVE
    hits, then settles. The empty syringe stays in your hand for a moment, then goes back.
 
-Let go of the grip before pulling the trigger and the hypo goes back unused. The hip squeeze
+Let go of the grip before pulling the trigger and the hypo goes back unused. A holster squeeze
 never reaches the game, so it can't open the weapon wheel.
+
+**Staying out of the way at the stomach:** your weapon hand passes in front of your stomach all
+the time, so there the holster ignores the hand while it's busy with the gun: two-handing it,
+on the trigger, or aimed ahead (hip-fire). In those cases there's no buzz, and the squeeze goes
+to the game. The stomach reach is also tighter than the hip's (15 cm against 20 cm). The log
+says why when a squeeze at the stomach was left to the game (`[eve] holster: squeeze at the
+stomach left to the game - ...`).
 
 **No automatic injection:** the mod learns what each plasmid costs from your casts. A cast you
 can't afford never reaches the game, so the game can't inject on its own. You get an empty
@@ -210,13 +218,14 @@ game takes over without a jump. The needle test is a capsule around the forearm,
 elbow, using the arm solver. The holster hangs from your neck rather than your eyes, so looking
 down at it or leaning into a fight doesn't move it away from your hand.
 
-**Settings:** holster position (down, out to the side, forward), reach and injection surge
-strength (0 turns the shake off), in F10 → **EVE holster**. A squeeze that misses near the hip
-logs where your hand was relative to the holster (`[eve] holster: squeeze ... outside the
-reach`), which is the quickest way to tune the position.
+**Settings:** in F10 → **EVE holster**: stomach or hip, then that spot's position (down,
+sideways, forward) and reach. Each spot keeps its own position, so switching back and forth
+loses nothing. Also the injection surge strength (0 turns the shake off). A squeeze that misses
+near the holster logs where your hand was relative to it (`[eve] holster: squeeze ... not a
+draw`), which is the quickest way to tune the position.
 
-**Still being tuned:** feedback on the hip position, the reach and how the needle registers is
-welcome.
+**Still being tuned:** feedback on the stomach position, the reach and how the needle registers
+is welcome.
 
 ### 8. Recoil and haptics (BioShock 1)
 
@@ -291,7 +300,7 @@ that feature.
 | `twohand.ini` | off-hand and grip settings, grab points, what the held hand rides, per weapon |
 | `mirror.ini` | per-weapon muzzle trims (mirror mode) |
 | `aim_plasmid.ini` | plasmid aim calibration, calibration distance, plasmid aim dot |
-| `eve.ini` | EVE holster on/off, automatic-injection guard, holster position, reach and injection surge |
+| `eve.ini` | EVE holster on/off, automatic-injection guard, stomach or hip, each spot's position and reach, injection surge |
 | `offhand_neutral.ini` | the relaxed off-hand pose |
 | `overlay.ini` | F10 text size, Developer tools |
 
