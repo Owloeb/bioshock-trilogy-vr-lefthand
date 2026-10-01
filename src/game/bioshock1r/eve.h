@@ -40,6 +40,10 @@ struct Targets {
 void set_targets(const Targets& t);
 // The hands-bone index of the syringe's socket, once found (-1 before).
 int socket_bone();
+// The injection surge for the WEAPON hand this frame (game thread): a small
+// tremor while the plunger runs and as the EVE lands. Visual only; the hand
+// carries the syringe, so it shakes with it. False when nothing to apply.
+bool surge(float* pitchDeg, float* yawDeg, float* rollDeg, float* backCm);
 // F10 section (render thread).
 void draw_debug_ui();
 

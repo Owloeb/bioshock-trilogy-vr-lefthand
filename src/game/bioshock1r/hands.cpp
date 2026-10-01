@@ -936,6 +936,32 @@ void apply_kick(const Kick& k, GamePose& gp) {
     gp.rot = basis_to_rot(fK, uK);
 }
 
+// A kick about the pose's own origin: up by pitch, sideways by yaw, rolled
+// about the new forward, pushed back along the old forward.
+void make_kick(const FrameContext& ctx, const GamePose& gp, float pitchDeg, float yawDeg, float rollDeg,
+               float backCm, Kick& k) {
+    ue_rot_basis(gp.rot, k.f, k.r, k.u);
+    k.P[0] = gp.loc.x;
+    k.P[1] = gp.loc.y;
+    k.P[2] = gp.loc.z;
+    const float a = pitchDeg / kRadToDeg, b = yawDeg / kRadToDeg, c = rollDeg / kRadToDeg;
+    float f1[3], u1[3], r2[3];
+    for (int i = 0; i < 3; ++i) {
+        f1[i] = k.f[i] * cosf(a) + k.u[i] * sinf(a); // muzzle up
+        u1[i] = k.u[i] * cosf(a) - k.f[i] * sinf(a);
+    }
+    for (int i = 0; i < 3; ++i) {
+        k.f2[i] = f1[i] * cosf(b) + k.r[i] * sinf(b); // and a little sideways
+        r2[i] = k.r[i] * cosf(b) - f1[i] * sinf(b);
+    }
+    for (int i = 0; i < 3; ++i) { // and rolled about the new forward
+        k.r2[i] = r2[i] * cosf(c) + u1[i] * sinf(c);
+        k.u2[i] = u1[i] * cosf(c) - r2[i] * sinf(c);
+    }
+    const float backUu = backCm * ctx.worldScale / 100.0f;
+    for (int i = 0; i < 3; ++i) k.back[i] = -k.f[i] * backUu;
+}
+
 // Advance the recoil spring and build this frame's kick for the weapon pose.
 // False when there is nothing to apply.
 bool recoil_kick(const FrameContext& ctx, const GamePose& gp, bool held, Kick& k) {
@@ -978,24 +1004,16 @@ bool recoil_kick(const FrameContext& ctx, const GamePose& gp, bool held, Kick& k
         if (fabsf(g_rcCur[i]) > 0.01f) any = true;
     }
     if (!any) return false;
+    make_kick(ctx, gp, g_rcCur[0], g_rcCur[1], 0.0f, g_rcCur[2], k);
+    return true;
+}
 
-    ue_rot_basis(gp.rot, k.f, k.r, k.u);
-    k.P[0] = gp.loc.x;
-    k.P[1] = gp.loc.y;
-    k.P[2] = gp.loc.z;
-    const float a = g_rcCur[0] / kRadToDeg, b = g_rcCur[1] / kRadToDeg;
-    float f1[3], u1[3];
-    for (int i = 0; i < 3; ++i) {
-        f1[i] = k.f[i] * cosf(a) + k.u[i] * sinf(a); // muzzle up
-        u1[i] = k.u[i] * cosf(a) - k.f[i] * sinf(a);
-    }
-    for (int i = 0; i < 3; ++i) {
-        k.f2[i] = f1[i] * cosf(b) + k.r[i] * sinf(b); // and a little sideways
-        k.r2[i] = k.r[i] * cosf(b) - f1[i] * sinf(b);
-        k.u2[i] = u1[i];
-    }
-    const float backUu = g_rcCur[2] * ctx.worldScale / 100.0f;
-    for (int i = 0; i < 3; ++i) k.back[i] = -k.f[i] * backUu;
+// The EVE injection surge on the weapon hand (eve.cpp shapes it): the same
+// rigid kick about the hand, so the syringe in it trembles with the arm.
+bool surge_kick(const FrameContext& ctx, const GamePose& gp, Kick& k) {
+    float p = 0.0f, y = 0.0f, r = 0.0f, b = 0.0f;
+    if (!eve::surge(&p, &y, &r, &b)) return false;
+    make_kick(ctx, gp, p, y, r, b, k);
     return true;
 }
 
@@ -1440,6 +1458,10 @@ bool off_hand_pose(const FrameContext& ctx, int offHand, bool mirrorPose, bool g
               gp.loc.z + fwd[2] * of + right[2] * orr + up[2] * ou};
     to_anchor(ctx, offHand, false, gp); // grip placement: palm on your palm
     if (kick) apply_kick(*kick, gp); // held on the gun: ride its recoil
+    if (offHand == 1) {              // the weapon hand holding an EVE hypo: the surge
+        Kick sk{};
+        if (surge_kick(ctx, gp, sk)) apply_kick(sk, gp);
+    }
     if (gunPlane) {
         reflect_pose(gp, g_hdH, g_hdN);
         reflect_pose(gp, g_eyePlaneQ, g_eyePlaneN);
@@ -2179,6 +2201,10 @@ void on_calcview(const FrameContext& ctx) {
         Kick kick{};
         const bool kicked = hand == 1 && recoil_kick(ctx, gp, twohand::gripped(), kick);
         if (kicked) apply_kick(kick, gp);
+        if (hand == 1) { // the EVE surge, when the syringe is in the driven hand
+            Kick sk{};
+            if (surge_kick(ctx, gp, sk)) apply_kick(sk, gp);
+        }
         if (mirrorPose) {
             const float trim = sync_weapon_trim(hand);
             float muzzle[3] = {0.0f, 0.0f, 0.0f};

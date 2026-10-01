@@ -524,6 +524,7 @@ std::atomic<float> g_hipSideM{0.20f};  // out to the weapon hand's side
 std::atomic<float> g_hipFwdM{0.02f};   // forward of the eyes
 std::atomic<float> g_zoneM{0.20f};     // grab radius
 std::atomic<float> g_needleUu{14.0f};  // needle tip below the grip (syringe axis)
+std::atomic<float> g_surgeAmt{1.0f};   // injection tremor strength (0 = off)
 std::atomic<bool> g_cfgDirty{false};
 bool g_cfgLoaded = false;
 
@@ -535,6 +536,12 @@ uint64_t g_tgMs = 0;
 bool g_squeeze = false;
 bool g_inZone = false;
 bool g_zoneSqueeze = false; // this squeeze began in the holster: never reaches the game
+bool g_drawSpent = false;     // this squeeze already drew (or was refused)
+uint64_t g_squeezeRiseMs = 0; // when the current squeeze began (a grab may finish on arrival)
+uint64_t g_missLogMs = 0;
+// The injection surge: a tremor that builds while the plunger runs, peaks as
+// the EVE lands and dies away in the hand.
+uint64_t g_surgeStartMs = 0, g_surgeLandMs = 0;
 bool g_trigPrev = false;
 bool g_shown = false;
 uint64_t g_stateMs = 0, g_lastBuzzMs = 0, g_xQueuedMs = 0;
@@ -575,9 +582,9 @@ void cfg_save() {
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "# BioShock VR - EVE holster\n");
-    fprintf(f, "holster=%d\nblockAutoInject=%d\nhipDropM=%.3f\nhipSideM=%.3f\nhipFwdM=%.3f\nzoneM=%.3f\nneedleUu=%.1f\n",
+    fprintf(f, "holster=%d\nblockAutoInject=%d\nhipDropM=%.3f\nhipSideM=%.3f\nhipFwdM=%.3f\nzoneM=%.3f\nneedleUu=%.1f\nsurge=%.2f\n",
             g_holsterOn.load() ? 1 : 0, g_blockAuto.load() ? 1 : 0, g_hipDropM.load(), g_hipSideM.load(),
-            g_hipFwdM.load(), g_zoneM.load(), g_needleUu.load());
+            g_hipFwdM.load(), g_zoneM.load(), g_needleUu.load(), g_surgeAmt.load());
     fclose(f);
 }
 void cfg_load() {
@@ -598,6 +605,7 @@ void cfg_load() {
         else if (!strcmp(key, "hipFwdM")) g_hipFwdM.store(v);
         else if (!strcmp(key, "zoneM")) g_zoneM.store(v);
         else if (!strcmp(key, "needleUu")) g_needleUu.store(v);
+        else if (!strcmp(key, "surge")) g_surgeAmt.store(v < 0.0f ? 0.0f : v > 2.0f ? 2.0f : v);
     }
     fclose(f);
 }
@@ -830,8 +838,16 @@ void set_state(Hs s, const char* why) {
     g_stateMs = GetTickCount64();
 }
 
-// The weapon controller is at the hip (XR space, body-relative).
-bool at_hip() {
+// Where the weapon controller is relative to the holster, in BODY axes
+// (metres: out to the weapon side, up, forward). False without poses.
+//
+// The holster hangs from the NECK, not the eyes: the eyes swing ~10 cm forward
+// and down about the neck when you look down at your hip or lean into a
+// fight, and a zone hung from the eyes swung with them - the hand arrived
+// where the holster had been and the squeeze missed. The neck sits 10 cm below
+// and 8 cm behind the eyes; the settings still read "from your eyes" with the
+// head level, so existing positions carry over unchanged.
+bool hip_offset(float out[3]) {
     bvr::vr::HeadPose head{}, hand{};
     if (!bvr::vr::peek_head_pose(head) || !bvr::vr::get_raw_hand_pose(1, false, hand)) return false;
     const float fz[3] = {0.0f, 0.0f, -1.0f};
@@ -856,13 +872,28 @@ bool at_hip() {
             g_bodyFwd[1] /= n;
         }
     }
+    const float neckLocal[3] = {0.0f, -0.10f, 0.08f}; // XR head space: below, behind
+    float nk[3];
+    bvr::xrmath::quat_rotate(head.qx, head.qy, head.qz, head.qw, neckLocal, nk);
+    const float neck[3] = {head.px + nk[0], head.py + nk[1], head.pz + nk[2]};
     const float side = bvr::input::left_handed() ? -1.0f : 1.0f; // weapon hand's side
     const float rx = -g_bodyFwd[1], rz = g_bodyFwd[0];               // body right (XR)
-    const float hip[3] = {head.px + rx * side * g_hipSideM.load() + g_bodyFwd[0] * g_hipFwdM.load(),
-                          head.py - g_hipDropM.load(),
-                          head.pz + rz * side * g_hipSideM.load() + g_bodyFwd[1] * g_hipFwdM.load()};
+    const float drop = g_hipDropM.load() - 0.10f, fwd = g_hipFwdM.load() + 0.08f, out_ = g_hipSideM.load();
+    const float hip[3] = {neck[0] + rx * side * out_ + g_bodyFwd[0] * fwd, neck[1] - drop,
+                          neck[2] + rz * side * out_ + g_bodyFwd[1] * fwd};
     const float d[3] = {hand.px - hip[0], hand.py - hip[1], hand.pz - hip[2]};
-    return sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) < g_zoneM.load();
+    out[0] = (d[0] * rx + d[2] * rz) * side;
+    out[1] = d[1];
+    out[2] = d[0] * g_bodyFwd[0] + d[2] * g_bodyFwd[1];
+    return true;
+}
+
+// Inside the holster's reach, scaled. An upright capsule rather than a ball:
+// your hip does not sit at one exact height under a head that bobs, ducks and
+// strafes, so height gets half again the horizontal reach.
+bool in_reach(const float o[3], float scale) {
+    const float r = g_zoneM.load() * scale;
+    return o[0] * o[0] + o[2] * o[2] < r * r && fabsf(o[1]) < r * 1.5f;
 }
 
 void buzz(int role, float a, int ms) { bvr::vr::haptic_pulse(role, a, ms); }
@@ -871,6 +902,7 @@ void put_away(const char* why) {
     if (g_hs == Hs::Idle) return;
     if (!hypo_attached()) hypo_show(false);
     g_xQueued = false;
+    g_surgeStartMs = g_surgeLandMs = 0;
     set_state(Hs::Idle, why);
 }
 
@@ -1020,19 +1052,40 @@ void holster_tick() {
 
     switch (g_hs) {
     case Hs::Idle: {
-        const bool zone = at_hip();
-        if (zone && rising) g_zoneSqueeze = true;
-        if (!g_squeeze) g_zoneSqueeze = false;
-        // The hip squeeze never reaches the game - in the zone, and for the
-        // rest of a squeeze that started there (leaving the zone with the grip
+        // Reach for the hip and squeeze in one movement, as you would in a
+        // fight: the squeeze often lands a moment BEFORE the hand is inside
+        // the reach, and the old edge-only test then needed a release and a
+        // second squeeze. Now a squeeze that begins in the approach ring
+        // (1.6x the reach) is held for the holster and completes the draw if
+        // the hand arrives within 450 ms; one that begins inside draws at once.
+        float o[3] = {};
+        const bool posed = hip_offset(o);
+        const bool zone = posed && in_reach(o, 1.0f);
+        const bool ring = posed && in_reach(o, 1.6f);
+        if (rising) g_squeezeRiseMs = now;
+        if (ring && rising) g_zoneSqueeze = true;
+        if (!g_squeeze) g_zoneSqueeze = g_drawSpent = false;
+        if (rising && !ring && posed && now - g_missLogMs > 2000) {
+            const float dist = sqrtf(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);
+            if (dist < 0.45f) { // near the hip but outside: tuning data
+                g_missLogMs = now;
+                BVR_LOG("[eve] holster: squeeze %.0f cm from the holster (side %+.0f, up %+.0f, fwd %+.0f cm) - "
+                        "outside the reach",
+                        dist * 100.0f, o[0] * 100.0f, o[1] * 100.0f, o[2] * 100.0f);
+            }
+        }
+        // The hip squeeze never reaches the game - in the ring, and for the
+        // rest of a squeeze that started there (leaving it with the grip
         // still held used to open the weapon wheel).
-        if (zone || g_zoneSqueeze) bvr::vr::reserve_grip_bumper(1, true);
-        if (zone && !g_zoneSqueeze && now - g_lastBuzzMs >= 90) { // in reach: a steady light buzz
+        if (ring || g_zoneSqueeze) bvr::vr::reserve_grip_bumper(1, true);
+        if (zone && !g_squeeze && now - g_lastBuzzMs >= 90) { // in reach: a steady light buzz
             g_lastBuzzMs = now;
             buzz(1, 0.22f, 60);
         }
         g_inZone = zone;
-        if (zone && rising) {
+        const bool grab = zone && g_squeeze && g_zoneSqueeze && !g_drawSpent && now - g_squeezeRiseMs <= 450;
+        if (grab) g_drawSpent = true; // one draw per squeeze (a refusal must not repeat)
+        if (grab) {
             BVR_LOG("[eve] holster: grip at the hip (syringe %p, socket bone %d, socket %s)", g_hypo, g_socket,
                     g_tg.socketOk ? "ok" : "missing");
             const int cnt = hypo_count();
@@ -1093,9 +1146,16 @@ void holster_tick() {
         bvr::vr::reserve_grip_bumper(1, true);
         supRt = true;
         place_hypo();
+        if (now - g_lastBuzzMs > 110 && now - g_stateMs < 450) { // the rush fading out
+            g_lastBuzzMs = now;
+            const float a = 0.55f * expf(-(now - g_stateMs) / 220.0f);
+            buzz(0, a, 35);
+            buzz(1, a, 35);
+        }
         if (now - g_stateMs > kLingerMs || !g_squeeze) {
             g_shown = true;
             hypo_show(false);
+            g_surgeStartMs = g_surgeLandMs = 0;
             set_state(Hs::Idle, "put away");
         }
         break;
@@ -1106,16 +1166,19 @@ void holster_tick() {
         if (g_xQueued && hands::active_hand() == 0) {
             bvr::input::pulse_buttons(0x4000, 150); // X with the plasmid raised: the game injects
             g_xQueued = false;
+            g_surgeStartMs = now; // the plunger starts: the surge builds
+            g_surgeLandMs = 0;
         }
         if (g_xQueued && now - g_xQueuedMs > 1500) {
             g_xQueued = false;
             BVR_LOG("[eve] injection: the plasmid never came up");
         }
         if (!hypo_attached()) place_hypo(); // until the game takes it over
-        if (now - g_lastBuzzMs > 120) {
+        if (now - g_lastBuzzMs > 120) { // a pulse that swells with the plunge
             g_lastBuzzMs = now;
-            buzz(0, 0.25f, 40);
-            buzz(1, 0.25f, 40);
+            const float ramp = g_surgeStartMs ? fminf(1.0f, (now - g_surgeStartMs) / 1500.0f) : 0.0f;
+            buzz(0, 0.22f + 0.25f * ramp, 40);
+            buzz(1, 0.22f + 0.25f * ramp, 40);
         }
         const bool landed = eve >= 0.0f && eve > g_eveAtInject + 1.0f;
         if (landed) {
@@ -1126,6 +1189,7 @@ void holster_tick() {
             g_shown = false;
             hypo_show(true);
             place_hypo();
+            g_surgeLandMs = now; // the rush: peak tremor, then it fades in the hand
             set_state(Hs::Linger, "EVE in");
         } else if (now - g_stateMs > 3500 || (now - g_stateMs > 1600 && g_hypo && !hypo_attached())) {
             buzz(1, 0.4f, 20);
@@ -1140,6 +1204,36 @@ void holster_tick() {
 } // namespace
 
 bool probe_on() { return g_probe.load(std::memory_order_relaxed); }
+
+// The injection surge, as a small rotation/translation of the weapon hand.
+// A tremor (a few incommensurate 8-17 Hz sines, so it never reads as a loop)
+// whose envelope builds over the plunge, jumps as the EVE lands, with one
+// jolt of the wrist, then dies away over the linger. A few degrees at most:
+// felt more than seen.
+bool surge(float* pitchDeg, float* yawDeg, float* rollDeg, float* backCm) {
+    const float amt = g_surgeAmt.load(std::memory_order_relaxed);
+    if (amt <= 0.0f || !g_surgeStartMs || (g_hs != Hs::Injecting && g_hs != Hs::Linger)) return false;
+    const uint64_t now = GetTickCount64();
+    float env, jolt = 0.0f;
+    if (!g_surgeLandMs) {
+        const float t = (now - g_surgeStartMs) / 1000.0f;
+        env = 0.15f + 0.45f * fminf(1.0f, t / 1.6f); // the plunge: a growing shiver
+    } else {
+        const float t = (now - g_surgeLandMs) / 1000.0f;
+        env = 1.0f * expf(-t / 0.35f) + 0.05f;    // the rush, fading
+        jolt = expf(-t / 0.09f);                  // one sharp jerk as it hits
+        if (t > 1.2f) return false;
+    }
+    env *= amt;
+    const float t = (now % 100000) / 1000.0f;
+    constexpr float k2Pi = 6.2831853f;
+    *pitchDeg = env * 1.4f * (sinf(k2Pi * 11.0f * t) + 0.6f * sinf(k2Pi * 17.3f * t + 1.3f)) / 1.6f +
+                jolt * 3.0f * amt;
+    *yawDeg = env * 1.0f * (sinf(k2Pi * 13.1f * t + 0.7f) + 0.5f * sinf(k2Pi * 7.9f * t + 2.1f)) / 1.5f;
+    *rollDeg = env * 0.9f * sinf(k2Pi * 9.7f * t + 0.4f) - jolt * 1.5f * amt;
+    *backCm = env * 0.25f * sinf(k2Pi * 15.2f * t + 2.6f) + jolt * 0.6f * amt;
+    return true;
+}
 
 void on_attach(void* parent, void* child) {
     if (!child || GetCurrentThreadId() != g_gameTid) return;
@@ -1299,6 +1393,11 @@ void draw_debug_ui() {
         v = g_zoneM.load() * 100.0f;
         if (ImGui::SliderFloat("reach (cm)", &v, 6.0f, 30.0f, "%.0f")) {
             g_zoneM.store(v / 100.0f);
+            g_cfgDirty.store(true);
+        }
+        v = g_surgeAmt.load();
+        if (ImGui::SliderFloat("injection surge (hand shake)", &v, 0.0f, 2.0f, "%.2f")) {
+            g_surgeAmt.store(v);
             g_cfgDirty.store(true);
         }
         static const char* kState[] = {"ready", "holding a hypo", "needle in - pull the trigger", "injecting",
