@@ -543,7 +543,7 @@ uint64_t g_missLogMs = 0;
 float g_hipDistPrev = -1.0f;  // last tick's hand-to-holster distance (approach speed)
 uint64_t g_hipDistMs = 0;
 float g_approach = 0.0f;      // m/s toward the holster, smoothed
-uint64_t g_reshowMs = 0;
+int g_xTries = 0;            // X presses sent for this injection
 uint64_t g_xSentMs = 0;       // when X went to the game for this injection
 bool g_sawAttach = false;     // the game took the syringe for this injection
 // The injection surge: a tremor that builds while the plunger runs, peaks as
@@ -582,6 +582,20 @@ std::atomic<int> g_countUi{-1};
 
 std::string g_curPlasmid;
 
+constexpr int kSnapBytes = 0x800;
+struct HidCand {
+    uint16_t off;
+    uint8_t mask;
+    uint8_t flips; // bit 0: seen going hidden, bit 1: seen going visible
+};
+HidCand g_hidCand[32];
+int g_hidCandN = -1; // -1 = no toggle observed yet
+int g_hidToggles = 0;
+int g_hidOff = -1;   // learned (or loaded) byte offset of bHidden
+uint8_t g_hidMask = 0;
+bool g_hidVerified = false; // the loaded offset agreed with a console toggle this session
+uint8_t g_snapPre[kSnapBytes], g_snapPost[kSnapBytes];
+
 void cfg_path(wchar_t* out, size_t n) { swprintf_s(out, n, L"%s\\eve.ini", bvr::log::data_dir()); }
 void cfg_save() {
     wchar_t path[MAX_PATH];
@@ -589,9 +603,9 @@ void cfg_save() {
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "# BioShock VR - EVE holster\n");
-    fprintf(f, "holster=%d\nblockAutoInject=%d\nhipDropM=%.3f\nhipSideM=%.3f\nhipFwdM=%.3f\nzoneM=%.3f\nneedleUu=%.1f\nsurge=%.2f\n",
+    fprintf(f, "holster=%d\nblockAutoInject=%d\nhipDropM=%.3f\nhipSideM=%.3f\nhipFwdM=%.3f\nzoneM=%.3f\nneedleUu=%.1f\nsurge=%.2f\nhiddenOff=%d\nhiddenMask=%d\n",
             g_holsterOn.load() ? 1 : 0, g_blockAuto.load() ? 1 : 0, g_hipDropM.load(), g_hipSideM.load(),
-            g_hipFwdM.load(), g_zoneM.load(), g_needleUu.load(), g_surgeAmt.load());
+            g_hipFwdM.load(), g_zoneM.load(), g_needleUu.load(), g_surgeAmt.load(), g_hidOff, static_cast<int>(g_hidMask));
     fclose(f);
 }
 void cfg_load() {
@@ -612,6 +626,8 @@ void cfg_load() {
         else if (!strcmp(key, "hipFwdM")) g_hipFwdM.store(v);
         else if (!strcmp(key, "zoneM")) g_zoneM.store(v);
         else if (!strcmp(key, "needleUu")) g_needleUu.store(v);
+        else if (!strcmp(key, "hiddenOff") && v >= 0.0f && v < kSnapBytes) g_hidOff = static_cast<int>(v);
+        else if (!strcmp(key, "hiddenMask") && v >= 1.0f && v <= 128.0f) g_hidMask = static_cast<uint8_t>(v);
         else if (!strcmp(key, "surge")) g_surgeAmt.store(v < 0.0f ? 0.0f : v > 2.0f ? 2.0f : v);
     }
     fclose(f);
@@ -634,10 +650,137 @@ bool hypo_attached() {
     void* base = nullptr;
     return g_hypo && read_block(static_cast<uint8_t*>(g_hypo) + patterns::kHypoToolBaseOffset, &base, 4) && base;
 }
+// ---- The syringe's hidden flag, learned -------------------------------------
+// The console `set ... bHidden` is the only proven show/hide, but it walks
+// every object (too slow to repeat) and it is write-only: the game hides the
+// syringe on its own hand events (the plasmid coming up during a draw among
+// them) and the mod could not see that, so a held hypo sometimes was never
+// drawn. Learn where the flag lives instead: snapshot the actor around each
+// console toggle and keep the bits that always read hidden after a hide and
+// visible after a show, and that flipped both ways. One survivor over several
+// toggles is AActor::bHidden. From then on it is READ every frame, so a hide
+// by the game is answered the same frame. Showing still goes through the
+// console: in this build the property change also refreshes render-state
+// fields (ENGINE_NOTES), which a raw bit write would skip. Learned once,
+// saved to eve.ini, re-verified against the next console toggle each session.
+
+bool hid_known() { return g_hidOff >= 0 && g_hidVerified; }
+bool hid_read(bool* hidden) {
+    uint8_t b = 0;
+    if (!g_hypo || g_hidOff < 0 || !read_block(static_cast<uint8_t*>(g_hypo) + g_hidOff, &b, 1)) return false;
+    *hidden = (b & g_hidMask) != 0;
+    return true;
+}
+
+void hid_learn(bool hidden) {
+    const int want = hidden ? 1 : 0;
+    if (g_hidOff >= 0 && !g_hidVerified) { // a loaded offset: one toggle confirms or discards it
+        const int got = (g_snapPost[g_hidOff] & g_hidMask) ? 1 : 0;
+        const int was = (g_snapPre[g_hidOff] & g_hidMask) ? 1 : 0;
+        if (got != want) {
+            BVR_LOG("[eve] syringe hidden flag +0x%X/0x%02X disagreed with the console - relearning", g_hidOff,
+                    g_hidMask);
+            g_hidOff = -1;
+            g_hidCandN = -1;
+            g_hidToggles = 0;
+        } else if (got != was) {
+            g_hidVerified = true;
+            BVR_LOG("[eve] syringe hidden flag +0x%X/0x%02X confirmed", g_hidOff, g_hidMask);
+        }
+        return;
+    }
+    if (g_hidOff >= 0) return;
+    ++g_hidToggles;
+    if (g_hidCandN < 0) { // first toggle: every bit that flipped into the wanted state
+        g_hidCandN = 0;
+        for (int i = 0; i < kSnapBytes && g_hidCandN < 32; ++i) {
+            const uint8_t d = g_snapPre[i] ^ g_snapPost[i];
+            // A flag, not a value: the aligned dword around it must change by
+            // this one bit alone (the console's render-state words change by
+            // whole values, and a pointer bit must never be mistaken for it).
+            const int w = i & ~3;
+            int changed = 0;
+            for (int j = w; j < w + 4; ++j) changed += g_snapPre[j] != g_snapPost[j];
+            if (changed != 1 || (d & (d - 1)) != 0) continue;
+            for (int b = 0; b < 8 && d; ++b) {
+                const uint8_t m = static_cast<uint8_t>(1u << b);
+                if ((d & m) && ((g_snapPost[i] & m) ? 1 : 0) == want && g_hidCandN < 32)
+                    g_hidCand[g_hidCandN++] = {static_cast<uint16_t>(i), m, static_cast<uint8_t>(hidden ? 1 : 2)};
+            }
+        }
+        return;
+    }
+    int n = 0;
+    for (int k = 0; k < g_hidCandN; ++k) {
+        HidCand c = g_hidCand[k];
+        const int got = (g_snapPost[c.off] & c.mask) ? 1 : 0;
+        if (got != want) continue; // wrong after this toggle: not the flag
+        if ((g_snapPre[c.off] ^ g_snapPost[c.off]) & c.mask) c.flips |= hidden ? 1 : 2;
+        g_hidCand[n++] = c;
+    }
+    g_hidCandN = n;
+    if (n == 0) { // nothing consistent (the actor changed?): start over
+        g_hidCandN = -1;
+        g_hidToggles = 0;
+        return;
+    }
+    if (n == 1 && g_hidCand[0].flips == 3 && g_hidToggles >= 3) {
+        g_hidOff = g_hidCand[0].off;
+        g_hidMask = g_hidCand[0].mask;
+        g_hidVerified = true;
+        BVR_LOG("[eve] syringe hidden flag learned: +0x%X mask 0x%02X (after %d toggles)", g_hidOff, g_hidMask,
+                g_hidToggles);
+        cfg_save();
+    }
+}
+
 void hypo_show(bool on) {
     if (on == g_shown) return;
     g_shown = on;
+    const bool snap = g_hypo && read_block(g_hypo, g_snapPre, kSnapBytes);
     console_exec::run_engine(on ? "set BioAmmoHypoTool bHidden False" : "set BioAmmoHypoTool bHidden True");
+    if (snap && read_block(g_hypo, g_snapPost, kSnapBytes)) hid_learn(!on);
+}
+
+// Held, needle in or lingering: the syringe must be visible. With the flag
+// known, a hide by the game is undone the frame it happens (logged, so the
+// event is on record); before that, re-show after hand changes.
+uint64_t g_heldSinceMs = 0;
+int g_gameHides = 0;
+void keep_shown(uint64_t now) {
+    if (hid_known()) {
+        bool hidden = false;
+        static uint64_t s_lastShowMs = 0;
+        if (hid_read(&hidden) && hidden && now - s_lastShowMs >= 100) { // (a game that re-hides every frame
+            s_lastShowMs = now;                                           //  must not get a console walk each)
+            g_shown = false;
+            hypo_show(true);
+            if (++g_gameHides <= 6)
+                BVR_LOG("[eve] the game hid the held syringe %llu ms into the draw (raised hand %d) - re-shown",
+                        static_cast<unsigned long long>(now - g_heldSinceMs), hands::active_hand());
+        }
+        return;
+    }
+    // Not learned yet: re-show (console) a beat after the raised hand,
+    // weapon or plasmid changes - each such toggle also teaches the learner.
+    void* hold = nullptr;
+    hands::current_holdable(&hold);
+    const uintptr_t key = reinterpret_cast<uintptr_t>(hold) ^ (static_cast<uintptr_t>(hands::active_hand()) << 1) ^
+                          std::hash<std::string>{}(g_curPlasmid);
+    static uintptr_t s_key = 0;
+    static int s_stage = 0;
+    static uint64_t s_at = 0;
+    if (key != s_key) {
+        s_key = key;
+        s_at = now;
+        s_stage = 2;
+    }
+    const uint64_t due = s_stage == 2 ? 60 : 350;
+    if (s_stage > 0 && now - s_at >= due) {
+        --s_stage;
+        g_shown = false;
+        hypo_show(true);
+    }
 }
 
 // Bounded breadth-first search for the syringe actor among objects linked
@@ -1149,6 +1292,8 @@ void holster_tick() {
             hypo_show(true);
             place_hypo();
             buzz(1, 0.6f, 60);
+            g_heldSinceMs = now;
+            g_gameHides = 0;
             set_state(Hs::Held, "drawn from the hip");
         }
         break;
@@ -1163,31 +1308,7 @@ void holster_tick() {
             put_away(why);
             break;
         }
-        // The game hides the BioAmmoHypoTool on its own hand events (the
-        // raised hand switching, a plasmid or weapon change) and the console
-        // show is one-shot, so a held syringe could vanish from the hand.
-        // Re-show it right after any such change (a beat later too, in case
-        // the game's hide lands after ours). Event-driven: the console `set`
-        // walks every object, too heavy to run on a timer in VR.
-        {
-            void* hold = nullptr;
-            hands::current_holdable(&hold);
-            const uintptr_t key = reinterpret_cast<uintptr_t>(hold) ^ (hands::active_hand() << 1) ^
-                                  std::hash<std::string>{}(g_curPlasmid);
-            static uintptr_t s_key = 0;
-            static int s_stage = 0; // re-shows still due: at +60 ms, then +350 ms
-            if (key != s_key) {
-                s_key = key;
-                g_reshowMs = now;
-                s_stage = 2;
-            }
-            const uint64_t due = s_stage == 2 ? 60 : 350;
-            if (s_stage > 0 && now - g_reshowMs >= due) {
-                --s_stage;
-                g_shown = false;
-                hypo_show(true);
-            }
-        }
+        keep_shown(now);
         place_hypo();
         const bool in = rigNow && needle_in_arm(g_hs == Hs::In ? 1.5f : 1.0f);
         if (in && g_hs == Hs::Held) {
@@ -1210,6 +1331,7 @@ void holster_tick() {
     case Hs::Linger: {
         bvr::vr::reserve_grip_bumper(1, true);
         supRt = true;
+        if (!hypo_attached()) keep_shown(now);
         place_hypo();
         if (now - g_lastBuzzMs > 110 && now - g_stateMs < 450) { // the rush fading out
             g_lastBuzzMs = now;
@@ -1228,17 +1350,34 @@ void holster_tick() {
     case Hs::Injecting: {
         bvr::vr::reserve_grip_bumper(1, true);
         supRt = true;
-        if (g_xQueued && hands::active_hand() == 0) {
+        // X only reaches a game that can act on it: plasmid raised AND the
+        // hands at rest. Pressed while the plasmid is still coming up (a draw
+        // with a gun out, or mid-run) the game drops it - the log had one
+        // such "never took the syringe". Not taken within 700 ms: press again,
+        // three times in all.
+        int action = -1;
+        if (void* h = hands::hands_actor())
+            read_block(static_cast<uint8_t*>(h) + patterns::kHandsActionStateOffset, &action, 4);
+        const bool ready = hands::active_hand() == 0 && action == 5;
+        if (g_xQueued && ready) {
             bvr::input::pulse_buttons(0x4000, 150); // X with the plasmid raised: the game injects
             g_xQueued = false;
             g_xSentMs = now;
+            g_xTries = 1;
             g_sawAttach = false;
             g_surgeStartMs = now; // the plunger starts: the surge builds
             g_surgeLandMs = 0;
+        } else if (!g_xQueued && g_xSentMs && !g_sawAttach && g_xTries < 3 && now - g_xSentMs > 700 && ready) {
+            ++g_xTries;
+            g_xSentMs = now;
+            g_surgeStartMs = now;
+            bvr::input::pulse_buttons(0x4000, 150);
+            BVR_LOG("[eve] injection: X not taken - pressing again (try %d)", g_xTries);
         }
-        if (g_xQueued && now - g_xQueuedMs > 1500) {
+        if (g_xQueued && now - g_xQueuedMs > 2000) {
             g_xQueued = false;
-            BVR_LOG("[eve] injection: the plasmid never came up");
+            BVR_LOG("[eve] injection: the hands never came to rest with the plasmid up (hand %d, action %d)",
+                    hands::active_hand(), action);
         }
         if (hypo_attached()) g_sawAttach = true;
         else place_hypo(); // until the game takes it over
@@ -1264,9 +1403,9 @@ void holster_tick() {
             // took it and let go with no EVE. Timed from X, not from the
             // trigger: raising the plasmid first can take most of a second,
             // and the old 1.6 s-from-trigger test put a good injection away.
-            const bool neverTook = g_xSentMs && !g_sawAttach && g_hypo && now - g_xSentMs > 1200;
+            const bool neverTook = g_xSentMs && !g_sawAttach && g_hypo && g_xTries >= 3 && now - g_xSentMs > 900;
             const bool letGoEmpty = g_sawAttach && !hypo_attached() && now - g_xSentMs > 2600;
-            if (neverTook || letGoEmpty || now - g_stateMs > 4500) {
+            if (neverTook || letGoEmpty || now - g_stateMs > 6000) {
                 buzz(1, 0.4f, 20);
                 BVR_LOG("[eve] injection refused (%s)", neverTook    ? "the game never took the syringe - EVE full?"
                                                         : letGoEmpty ? "the game let go with no EVE"

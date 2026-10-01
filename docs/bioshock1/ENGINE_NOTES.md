@@ -3541,6 +3541,17 @@ attached to the hands, and pointer/TArray censuses. Four headset runs.
   hides it - the bit flips its render-state fields (`+0x13C..+0x154`, `+0x3A8..+0x3B0`) rather
   than anything visible in the flag word at `+0x0D0`, whose `0x100000` bit only pulses for a
   frame around attach/detach (a first guess that it was bHidden was disproven in-headset).
+- 2026-10-01: the syringe's real `bHidden` bit is LEARNED at runtime rather than hardcoded
+  (eve.cpp `hid_learn`): the actor's first 0x800 bytes are snapshotted around each console
+  show/hide, and the one bit that reads hidden after every hide, visible after every show, and
+  flipped both ways over 3+ toggles is kept (saved as `hiddenOff`/`hiddenMask` in eve.ini,
+  re-verified against a console toggle each session). Reason: the game hides the syringe on its
+  own hand events (the plasmid raise during a draw), and the console command is write-only and
+  walks every object. With the bit known it is POLLED per frame; showing still uses the console
+  (it refreshes the render-state fields too). Candidates must be the only change in their dword.
+- The game ignores X while the hands are busy (action state != 5): an injection pressed while the
+  plasmid is still coming up never attaches the syringe. The holster presses X only at rest and
+  re-presses (up to 3) if no attach follows within 700 ms.
   Writing `AActor::Location`/`Rotation` places it (proven: parked in front of the eyes).
 - **AHands action state** `hands+0x494`: 5 at rest, 1 while an action (cast, injection) runs.
   `hands+0x454` holds the raised plasmid's ability object (0 with a gun up) - its class names
