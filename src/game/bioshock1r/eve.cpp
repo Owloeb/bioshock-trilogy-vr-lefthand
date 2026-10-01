@@ -534,6 +534,7 @@ Targets g_tg;
 uint64_t g_tgMs = 0;
 bool g_squeeze = false;
 bool g_inZone = false;
+bool g_zoneSqueeze = false; // this squeeze began in the holster: never reaches the game
 bool g_trigPrev = false;
 bool g_shown = false;
 uint64_t g_stateMs = 0, g_lastBuzzMs = 0, g_xQueuedMs = 0;
@@ -985,10 +986,15 @@ void holster_tick() {
             BVR_LOG("[eve] syringe search %d: %p", g_hypoSearches, g_hypo);
         }
         void* sk = bones::skeleton_instance();
-        if (g_socket < 0 || sk != g_socketSkel) {
+        if (sk && sk != g_socketSkel) {
             g_socketSkel = sk;
-            g_socket = bones::hands_bone_index(L"Pistol");
-            if (g_socket >= 0) BVR_LOG("[eve] syringe socket: hands bone %d (Pistol)", g_socket);
+            const int byName = bones::hands_bone_index(L"Pistol");
+            // "Pistol" is the attach name the game uses; when it is a socket
+            // rather than a skeleton bone, the weapon attach bone is the same
+            // place (every gun's R_Grip hangs there).
+            g_socket = byName >= 0 ? byName : patterns::kBoneWeaponAttach;
+            BVR_LOG("[eve] syringe socket: hands bone %d (%s)", g_socket,
+                    byName >= 0 ? "named Pistol" : "no bone named Pistol - weapon attach bone");
         }
     }
 
@@ -1009,17 +1015,25 @@ void holster_tick() {
     switch (g_hs) {
     case Hs::Idle: {
         const bool zone = at_hip();
-        if (zone) bvr::vr::reserve_grip_bumper(1, true); // the hip squeeze never raises the gun
-        if (zone && now - g_lastBuzzMs >= 90) { // in reach: a steady light buzz, like the grab zone
+        if (zone && rising) g_zoneSqueeze = true;
+        if (!g_squeeze) g_zoneSqueeze = false;
+        // The hip squeeze never reaches the game - in the zone, and for the
+        // rest of a squeeze that started there (leaving the zone with the grip
+        // still held used to open the weapon wheel).
+        if (zone || g_zoneSqueeze) bvr::vr::reserve_grip_bumper(1, true);
+        if (zone && !g_zoneSqueeze && now - g_lastBuzzMs >= 90) { // in reach: a steady light buzz
             g_lastBuzzMs = now;
             buzz(1, 0.22f, 60);
         }
         g_inZone = zone;
         if (zone && rising) {
+            BVR_LOG("[eve] holster: grip at the hip (syringe %p, socket bone %d, socket %s)", g_hypo, g_socket,
+                    g_tg.socketOk ? "ok" : "missing");
             const int cnt = hypo_count();
             if (cnt == 0 || !g_tg.socketOk) {
-                buzz(1, 0.7f, 140); // one long buzz: nothing to draw
-                BVR_LOG("[eve] holster empty (%s)", cnt == 0 ? "no hypos" : "weapon hand not drawn (off hand off?)");
+                buzz(1, 0.9f, 250); // one long buzz: nothing to draw
+                BVR_LOG("[eve] holster: can't draw - %s (socket bone %d, wrist %s)",
+                        cnt == 0 ? "no hypos" : "no socket pose", g_socket, g_tg.wristOk ? "ok" : "missing");
                 break;
             }
             if (!g_hypo) {
