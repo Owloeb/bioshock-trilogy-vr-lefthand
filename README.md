@@ -202,8 +202,7 @@ PRESET block. A few marked **(this session)** reset every launch.
 - **EVE holster**: on/off.
 - **No automatic EVE injection**: a plasmid cast you can't afford just clicks, instead of the
   game injecting a hypo for you.
-- **Holster on your: stomach / hip**: the stomach is the default (the hips are where the main
-  mod's manual reloading keeps magazines). Each spot keeps its own position.
+- **Holster on your: stomach / hip**: the stomach is the default. Each spot keeps its own position.
 - **down / sideways (or out to the side) / forward (cm)**: where the holster is, from your eyes.
 - **reach (cm)**: how close your hand has to be (stomach 16, hip 20).
 - **injection surge (hand shake)**: the tremor as the EVE goes in; 0 turns it off.
@@ -331,7 +330,7 @@ reload while you hold the grip**. Guns without a grab point stay one-handed, del
 
 **What you get:** a physical EVE hypo in a holster on your **stomach**, drawn with your weapon
 hand. The holster can be moved back to the **hip** of your weapon hand in F10. The stomach is
-the default because the main mod's manual reloading keeps its magazines on the hips.
+the default because the main mod's (planned) manual reloading will use the hips for something else.
 
 1. **Draw.** Reach your weapon hand to the holster; the controller buzzes steadily while
    you're in reach. Squeeze the grip and Jack's real EVE syringe is in your hand. You can
