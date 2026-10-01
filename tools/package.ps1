@@ -22,8 +22,12 @@ if ($cml -notmatch 'project\(BioshockVR\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') {
 $version = $Matches[1]
 "version: $version"
 if (-not $Tag) {
-    $t = (& git -C $repo describe --tags --exact-match 2>$null)
-    if ($LASTEXITCODE -eq 0 -and $t) { $Tag = $t.Trim() }
+    # `tag --points-at` prints nothing (and nothing on stderr) when HEAD is
+    # untagged. `describe --exact-match` errors instead, and under
+    # $ErrorActionPreference=Stop PowerShell 5.1 turns a native program's
+    # stderr into a terminating error even with 2>$null.
+    $t = @(& git -C $repo tag --points-at HEAD) | Where-Object { $_ -like "v*" } | Select-Object -First 1
+    if ($t) { $Tag = $t.Trim() }
 }
 $label = if ($Tag) { $Tag } else { "v$version" }
 "release label: $label"
