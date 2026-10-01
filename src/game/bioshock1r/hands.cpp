@@ -69,6 +69,8 @@ std::atomic<bool> g_useAimPose{true}; // aim pose = the ray the laser/bullet use
 std::atomic<bool> g_gripPlace{true};
 std::atomic<float> g_palmDepthCm{2.0f};
 std::atomic<bool> g_barrelAim{true};
+std::atomic<bool> g_palmCast{true};  // plasmid casts leave Jack's palm (else the controller)
+std::atomic<bool> g_palmPlane{true}; // plasmid mirror plane through the palm (else the wrist)
 std::atomic<int> g_handMode{2};       // 0 left, 1 right, 2 auto
 std::atomic<int> g_autoHand{1};       // the latched auto choice
 // Model offsets, PER HAND (0 left / 1 right, same convention as aim.cpp): the
@@ -427,6 +429,7 @@ void save_config() {
     fprintf(f, "aimPose=%d\n", g_useAimPose.load(std::memory_order_relaxed) ? 1 : 0);
     fprintf(f, "gripPlacement=%d\npalmDepthCm=%.2f\nbarrelAim=%d\n", g_gripPlace.load() ? 1 : 0,
             g_palmDepthCm.load(), g_barrelAim.load() ? 1 : 0);
+    fprintf(f, "palmCast=%d\npalmPlane=%d\n", g_palmCast.load() ? 1 : 0, g_palmPlane.load() ? 1 : 0);
     for (int h = 0; h < 2; ++h) {
         const char* s = h == 0 ? "L" : "R";
         fprintf(f, "posFwdCm%s=%.2f\n", s, g_posFwdCm[h].load(std::memory_order_relaxed));
@@ -478,6 +481,8 @@ void load_config() {
         else if (strcmp(key, "gripPlacement") == 0) g_gripPlace.store(v != 0.0f);
         else if (strcmp(key, "palmDepthCm") == 0) g_palmDepthCm.store(v);
         else if (strcmp(key, "barrelAim") == 0) g_barrelAim.store(v != 0.0f);
+        else if (strcmp(key, "palmCast") == 0) g_palmCast.store(v != 0.0f);
+        else if (strcmp(key, "palmPlane") == 0) g_palmPlane.store(v != 0.0f);
         else if (store_hand_key(key, "posFwdCm", g_posFwdCm, v)) {}
         else if (store_hand_key(key, "posRightCm", g_posRightCm, v)) {}
         else if (store_hand_key(key, "posUpCm", g_posUpCm, v)) {}
@@ -1152,6 +1157,113 @@ bool to_anchor(const FrameContext& ctx, int hand, bool driven, GamePose& gp) {
     gp.rot = basis_to_rot(f, u);
     gp.loc = {ol[0], ol[1], ol[2]};
     return true;
+}
+
+// ---- Magazine watch: is the gun in hand empty? ------------------------------
+// The engine reloads on its own when a magazine runs dry, and that reload is
+// indistinguishable from a fire-cycle animation (pump, wrench) by timing. So
+// each gun's magazine counter is LEARNED: the int in the holdable (or its
+// weapon object) that drops by exactly the shot count between shots, three
+// times running, with a sane value. The smallest such counter is the magazine
+// (a total-ammo count would be >= it). Read-only, per weapon, per session.
+constexpr int kClipWords = 0x800 / 4;
+struct ClipSource {
+    void* obj = nullptr;
+    int32_t prev[kClipWords];
+    uint8_t score[kClipWords];
+    bool havePrev = false;
+};
+struct ClipWatch {
+    std::string key;
+    ClipSource src[2];
+    uint32_t shots = 0;
+    int foundSrc = -1, foundWord = -1;
+};
+ClipWatch g_clip;
+std::map<std::string, std::pair<int, int>> g_clipLearned; // key -> (source, word)
+
+bool read_block(const void* src, void* out, size_t n) {
+    __try {
+        memcpy(out, src, n);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void clip_tick() {
+    void* objs[2] = {nullptr, nullptr};
+    hands::current_holdable(&objs[0]);
+    objs[1] = aim::learned_weapon_object();
+    if (objs[1] == objs[0]) objs[1] = nullptr;
+    const std::string key = aim::active_weapon_key();
+    if (key != g_clip.key || objs[0] != g_clip.src[0].obj) {
+        g_clip.key = key;
+        g_clip.shots = aim::player_shot_count();
+        g_clip.foundSrc = g_clip.foundWord = -1;
+        auto it = g_clipLearned.find(key);
+        if (it != g_clipLearned.end()) {
+            g_clip.foundSrc = it->second.first;
+            g_clip.foundWord = it->second.second;
+        }
+        for (int k = 0; k < 2; ++k) {
+            g_clip.src[k].obj = objs[k];
+            g_clip.src[k].havePrev = false;
+            memset(g_clip.src[k].score, 0, sizeof g_clip.src[k].score);
+        }
+    }
+    for (int k = 0; k < 2; ++k)
+        if (g_clip.src[k].obj != objs[k]) {
+            g_clip.src[k].obj = objs[k];
+            g_clip.src[k].havePrev = false;
+            memset(g_clip.src[k].score, 0, sizeof g_clip.src[k].score);
+        }
+    const uint32_t shots = aim::player_shot_count();
+    if (shots != g_clip.shots) {
+        const int32_t n = static_cast<int32_t>(shots - g_clip.shots);
+        g_clip.shots = shots;
+        int bestSrc = -1, bestWord = -1;
+        int32_t bestVal = 0x7fffffff;
+        for (int k = 0; k < 2; ++k) {
+            ClipSource& cs = g_clip.src[k];
+            if (!cs.obj) continue;
+            int32_t cur[kClipWords];
+            if (!read_block(cs.obj, cur, sizeof cur)) {
+                cs.havePrev = false;
+                continue;
+            }
+            if (cs.havePrev)
+                for (int i = 0; i < kClipWords; ++i) {
+                    const int32_t d = cs.prev[i] - cur[i];
+                    if (d == n && cur[i] >= 0 && cur[i] < 1000) {
+                        if (cs.score[i] < 255) ++cs.score[i];
+                    } else if (d != 0) {
+                        cs.score[i] = 0;
+                    }
+                    if (cs.score[i] >= 3 && cur[i] < bestVal) {
+                        bestVal = cur[i];
+                        bestSrc = k;
+                        bestWord = i;
+                    }
+                }
+            memcpy(cs.prev, cur, sizeof cur);
+            cs.havePrev = true;
+        }
+        if (bestSrc >= 0 && (bestSrc != g_clip.foundSrc || bestWord != g_clip.foundWord)) {
+            g_clip.foundSrc = bestSrc;
+            g_clip.foundWord = bestWord;
+            g_clipLearned[key] = {bestSrc, bestWord};
+            BVR_LOG("[hands] %s: magazine counter learned (%s +0x%X, now %d)", key.c_str(),
+                    bestSrc == 0 ? "holdable" : "weapon object", bestWord * 4, bestVal);
+        }
+    }
+    bool empty = false;
+    if (g_clip.foundSrc >= 0 && g_clip.src[g_clip.foundSrc].obj) {
+        int32_t v = -1;
+        if (read_block(static_cast<uint8_t*>(g_clip.src[g_clip.foundSrc].obj) + g_clip.foundWord * 4, &v, 4))
+            empty = v == 0;
+    }
+    bones::set_clip_empty(empty);
 }
 
 // ---- Per-weapon barrel angle (barrel.ini, keyed by weapon class name) ----
@@ -2068,7 +2180,12 @@ void on_calcview(const FrameContext& ctx) {
         // culling, correct engine-side FX anchoring) and the hand CLUSTER
         // moves to the controller instead.
         gp.loc = {loc[0], loc[1], loc[2]};
-        if (hand == 1) bones::set_active_weapon(aim::active_weapon_key());
+        if (hand == 1) {
+            bones::set_active_weapon(aim::active_weapon_key());
+            clip_tick();
+        } else {
+            bones::set_clip_empty(false);
+        }
         bones::set_anim_log(bvr::overlay::dev_tools());
         to_anchor(ctx, hand, true, gp); // grip placement: palm on your palm
         const GamePose gpPreKick = gp;  // the barrel the bullets follow (no recoil)
@@ -2084,7 +2201,7 @@ void on_calcview(const FrameContext& ctx) {
             auto learned = hand == 1 ? g_flashY.find(g_trimKey) : g_flashY.end();
             const bool haveFlash = learned != g_flashY.end();
             bool havePalm = false;
-            if (hand == 0) {
+            if (hand == 0 && g_palmPlane.load(std::memory_order_relaxed)) {
                 // The plasmid hand's effects hang off the ENGINE hand, which
                 // is placed at the reflection of the hand you see about this
                 // plane: through the anchor bone it put them a hand's width to
@@ -2162,7 +2279,8 @@ void on_calcview(const FrameContext& ctx) {
             publish_barrel(ctx, gpPreKick, mirrorPose, headW);
         else
             aim::set_barrel(false, nullptr, nullptr, nullptr, nullptr);
-        if (hand == 0 && g_gripPlace.load(std::memory_order_relaxed))
+        if (hand == 0 && g_gripPlace.load(std::memory_order_relaxed) &&
+            g_palmCast.load(std::memory_order_relaxed))
             publish_palm(ctx, gpPreKick, mirrorPose, headW);
         else
             aim::set_palm(false, nullptr, nullptr);
@@ -2464,6 +2582,16 @@ void draw_debug_ui() {
                 }
                 if (done) save_barrel_angles();
             }
+        }
+        bool pc = g_palmCast.load();
+        if (ImGui::Checkbox("Plasmid casts leave Jack's palm (off: the controller tip)", &pc)) {
+            g_palmCast.store(pc);
+            save_config();
+        }
+        bool pp = g_palmPlane.load();
+        if (ImGui::Checkbox("Plasmid effects mirrored about the palm (off: the wrist)", &pp)) {
+            g_palmPlane.store(pp);
+            save_config();
         }
         ImGui::TextDisabled("The offset/trim sliders below now fine-tune from your palm.");
     }

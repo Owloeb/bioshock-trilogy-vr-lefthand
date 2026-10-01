@@ -83,6 +83,8 @@ int ride_part_auto();
 int ride_part_active();
 // While held through a RELOAD, show Jack's own hand doing it (default on).
 void set_jack_reloads(bool on);
+// The gun in hand has an empty magazine (so the next animation is its reload).
+void set_clip_empty(bool empty);
 bool jack_reloads();
 // World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
 bool written_world(int idx, float out[3]);

@@ -1846,6 +1846,7 @@ bool g_animWasOn = false;
 bool g_animIsReload = false;
 uint64_t g_lastReloadBtnMs = 0;
 std::atomic<bool> g_jackReloads{true}; // F10 toggle
+std::atomic<bool> g_clipEmpty{false};   // the gun's magazine is empty (hands' learner)
 
 // The weapon's parts are still: nothing moved more than a hair for 300 ms (or
 // a part has been moving for 4 s - an idle loop, not an animation).
@@ -2382,6 +2383,7 @@ int weapon_part_names(char (*out)[40], int cap) {
 }
 
 int ride_part_auto() { return g_autoPart.load(std::memory_order_relaxed); }
+void set_clip_empty(bool empty) { g_clipEmpty.store(empty, std::memory_order_relaxed); }
 void set_jack_reloads(bool on) { g_jackReloads.store(on, std::memory_order_relaxed); }
 bool jack_reloads() { return g_jackReloads.load(std::memory_order_relaxed); }
 int ride_part_active() { return g_ridePartUi.load(std::memory_order_relaxed); }
@@ -2597,6 +2599,9 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         if (btn & 0x4000) g_lastReloadBtnMs = nowJ; // XINPUT_GAMEPAD_X: reload
         if (animating && !g_animWasOn)
             g_animIsReload = !firingWindow || nowJ - g_lastReloadBtnMs < 800;
+        // An empty magazine makes any animation the reload - including the
+        // automatic one that runs straight on from the last shot.
+        if (animating && g_clipEmpty.load(std::memory_order_relaxed)) g_animIsReload = true;
         if (!animating) g_animIsReload = false;
         g_animWasOn = animating;
         g_jackWant = g_jackReloads.load(std::memory_order_relaxed) && g_offFollow &&
