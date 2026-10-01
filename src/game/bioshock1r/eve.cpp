@@ -1,5 +1,6 @@
 #include "game/bioshock1r/eve.h"
 
+#include "core/gfx/vm_mirror.h"
 #include "core/input/xinput_bridge.h"
 #include "core/ui/overlay.h"
 #include "core/util/log.h"
@@ -1058,6 +1059,36 @@ void put_away(const char* why) {
     set_state(Hs::Idle, why);
 }
 
+// ---- The left-handed mirror must take the syringe ---------------------------
+// Left-handed, the viewmodel mirror reflects every first-person draw within
+// 1.3 m of the camera (the limit that keeps world meshes on the same skinning
+// path out). With the plasmid raised the reflection plane runs through the
+// plasmid hand, so the syringe in the other hand sits on the far side of it in
+// ENGINE space - usually inside 1.3 m, past it with the hands spread. Past it,
+// the mirror filed the syringe as world and drew it unreflected, away from the
+// hand: the rare left-handed-only vanish (right-handed has no mirror). Each
+// frame it is held, tell the mirror where to expect it - only a draw at that
+// distance (+-25 cm) gets past the limit, for 200 ms.
+int g_reachLogs = 0;
+void mirror_expect(uint64_t now) {
+    if (!g_tg.socketOk) return;
+    float eye[3];
+    int32_t er[3];
+    if (!camera::driven_eye_cam(0, eye, er)) return;
+    float d[3];
+    v3_sub(g_tg.socket, eye, d);
+    const float m = sqrtf(v3_dot(d, d)) / g_tg.worldScale;
+    bvr::vm_mirror::set_reach_exception(m, 0.25f, 200);
+    static uint64_t s_loggedDraw = 0; // once per draw, at most 20 per session
+    if (m > 1.25f && s_loggedDraw != g_heldSinceMs && g_reachLogs < 20) {
+        s_loggedDraw = g_heldSinceMs;
+        ++g_reachLogs;
+        BVR_LOG("[eve] held syringe is %.2f m from the engine camera (mirror reach 1.3 m) %llu ms into the "
+                "draw - the mirror is told to take it",
+                m, static_cast<unsigned long long>(now - g_heldSinceMs));
+    }
+}
+
 // ---- The syringe's ZONE, kept with the player's ----------------------------
 // The renderer skips actors whose zone (AActor::Region) is not visible, and
 // a raw Location write - all the holster does - never re-zones the actor. A
@@ -1390,6 +1421,7 @@ void holster_tick() {
         }
         keep_shown(now);
         sync_zone(now);
+        mirror_expect(now);
         place_hypo();
         const bool in = rigNow && needle_in_arm(g_hs == Hs::In ? 1.5f : 1.0f);
         if (in && g_hs == Hs::Held) {
@@ -1416,6 +1448,7 @@ void holster_tick() {
             keep_shown(now);
             sync_zone(now);
         }
+        mirror_expect(now);
         place_hypo();
         if (now - g_lastBuzzMs > 110 && now - g_stateMs < 450) { // the rush fading out
             g_lastBuzzMs = now;
@@ -1434,6 +1467,7 @@ void holster_tick() {
     case Hs::Injecting: {
         bvr::vr::reserve_grip_bumper(1, true);
         supRt = true;
+        mirror_expect(now); // the game holds it on the same socket
         // X only reaches a game that can act on it: plasmid raised AND the
         // hands at rest. Pressed while the plasmid is still coming up (a draw
         // with a gun out, or mid-run) the game drops it - the log had one

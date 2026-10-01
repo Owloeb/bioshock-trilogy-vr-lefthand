@@ -56,6 +56,8 @@ std::atomic<bool> g_skipUnmatched{true};
 std::atomic<int> g_scanBytes{6144};
 std::atomic<float> g_worldScale{100.0f};
 std::atomic<float> g_maxReachM{1.3f}; // gun + hands never sit further than this
+std::atomic<float> g_reachExcM{0.0f}, g_reachExcTolM{0.0f}; // see set_reach_exception
+std::atomic<uint64_t> g_reachExcUntilMs{0};
 
 // ---- per-buffer copy of the last game upload (render thread only) ----------
 struct Entry {
@@ -187,9 +189,12 @@ bool within_reach(const Entry& e, int row) {
     const float y = e.data[row + 7] * tanV;
     const float z = e.data[row + 15];
     const float d = sqrtf(x * x + y * y + z * z);
-    const float maxUu = g_maxReachM.load(std::memory_order_relaxed) *
-                        g_worldScale.load(std::memory_order_relaxed);
-    return d <= maxUu;
+    const float ws = g_worldScale.load(std::memory_order_relaxed);
+    const float maxUu = g_maxReachM.load(std::memory_order_relaxed) * ws;
+    if (d <= maxUu) return true;
+    const float exc = g_reachExcM.load(std::memory_order_relaxed);
+    return exc > 0.0f && GetTickCount64() < g_reachExcUntilMs.load(std::memory_order_relaxed) &&
+           fabsf(d - exc * ws) <= g_reachExcTolM.load(std::memory_order_relaxed) * ws;
 }
 
 // Reflect a draw's component->clip rows (x, y, z, w; 4 floats each) about the
@@ -486,6 +491,12 @@ PlaneMode plane_mode() {
     return static_cast<PlaneMode>(g_planeMode.load(std::memory_order_relaxed));
 }
 float plane_shift_uu() { return g_shiftUu.load(std::memory_order_relaxed); }
+void set_reach_exception(float distM, float tolM, int ttlMs) {
+    g_reachExcM.store(distM > 0.0f ? distM : 0.0f, std::memory_order_relaxed);
+    g_reachExcTolM.store(tolM, std::memory_order_relaxed);
+    g_reachExcUntilMs.store(distM > 0.0f ? GetTickCount64() + static_cast<uint64_t>(ttlMs) : 0,
+                            std::memory_order_relaxed);
+}
 void set_world_scale(float s) {
     if (s > 1.0f) g_worldScale.store(s, std::memory_order_relaxed);
 }

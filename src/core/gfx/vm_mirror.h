@@ -64,6 +64,13 @@ void set_eye_half_uu(float halfIpdUu);
 // UU per metre, for the arm's-reach filter that rejects world meshes which
 // happen to go through the same bake code as the viewmodel.
 void set_world_scale(float uuPerMetre);
+// A first-person object the game draws far out in ENGINE space while it sits on
+// a visible hand (BS1: the EVE syringe in the weapon hand while the plasmid
+// rig is mirrored - the reflection about the plasmid hand's plane carries it
+// past the reach limit). Draws whose origin is distM +- tolM from the camera
+// pass the reach test for ttlMs; everything else keeps the normal limit.
+// Additive; game thread. distM <= 0 clears it.
+void set_reach_exception(float distM, float tolM, int ttlMs);
 
 // v5: the reflection plane, per eye, in that eye's view space as the draw's
 // own clip transform reconstructs it (x right = clip.x*tanH, y up =
