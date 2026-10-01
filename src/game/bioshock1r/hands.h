@@ -38,7 +38,7 @@ void on_calcview(const FrameContext& ctx);
 // reentry pass), right before that eye's scene is built. Re-expresses this
 // frame's world-space gun plane in that exact eye's view so both eyes reflect
 // about the same world plane - no one-frame-stale eye while moving.
-// Arms (experimental) F10 section (render thread).
+// Arms F10 section (render thread).
 void draw_arms_ui();
 // True while the hands are placed by the grip pose (your real palm).
 bool grip_placement();

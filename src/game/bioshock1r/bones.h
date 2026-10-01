@@ -98,7 +98,7 @@ bool written_world(int idx, float out[3]);
 // angle in its idle pose.
 bool barrel_dir_target(float yawDeg, float pitchDeg, float out[3]);
 
-// Arms (two-bone IK, experimental): instead of collapsing a visible hand's
+// Arms (two-bone IK): instead of collapsing a visible hand's
 // sleeve, pose clavicle / upper arm / elbow / twist helpers from a shoulder
 // point to the written wrist. Targets are in ENGINE world space (already
 // mirrored when the viewmodel mirror is on) and persist until changed; pole =

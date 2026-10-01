@@ -998,7 +998,7 @@ bool recoil_kick(const FrameContext& ctx, const GamePose& gp, bool held, Kick& k
     return true;
 }
 
-// ---- Arms: shoulder anchors (experimental, arms.ini) -------------------------
+// ---- Arms: shoulder anchors (arms.ini) ---------------------------------------
 // Each visible hand's arm hangs from a shoulder below and beside the head. The
 // shoulders follow a TORSO yaw that lags the head (a 25 deg deadzone plus a
 // slow drift), so looking around does not swing both arms. Computed in the
@@ -1022,7 +1022,7 @@ void arms_save() {
     arms_ini_path(path, MAX_PATH);
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "# BioShock VR - arms (experimental)\n");
+    fprintf(f, "# BioShock VR - arms\n");
     fprintf(f, "armsOn=%d\nshoulderDownCm=%.1f\nshoulderSideCm=%.1f\nshoulderBackCm=%.1f\n"
                "elbowOut=%.2f\narmLength=%.2f\nscaleSkin=%d\n",
             g_armsOn.load() ? 1 : 0, g_shDownCm.load(), g_shSideCm.load(), g_shBackCm.load(),
@@ -2608,7 +2608,7 @@ void draw_debug_ui() {
 bool grip_placement() { return g_gripPlace.load(std::memory_order_relaxed); }
 
 void draw_arms_ui() {
-    if (!ImGui::CollapsingHeader("Arms (experimental)")) return;
+    if (!ImGui::CollapsingHeader("Arms")) return;
     bool on = g_armsOn.load();
     if (ImGui::Checkbox("Full arms (IK from the shoulders)", &on)) {
         g_armsOn.store(on);
@@ -2640,21 +2640,21 @@ void draw_arms_ui() {
         bones::set_arm_length(v);
         g_armsSave.store(true);
     }
-    unsigned solves = 0, stretched = 0;
-    bones::arm_stats(&solves, &stretched);
-    static unsigned s_ls = 0, s_lt = 0, s_rs = 0, s_rt = 0;
-    static uint64_t s_ms = 0;
-    const uint64_t now = GetTickCount64();
-    if (now - s_ms >= 1000) {
-        s_rs = solves - s_ls;
-        s_rt = stretched - s_lt;
-        s_ls = solves;
-        s_lt = stretched;
-        s_ms = now;
-    }
-    ImGui::Text("arms posed/s %u | at full reach/s %u", s_rs, s_rt);
-    ImGui::TextDisabled("Lots of 'full reach'? Raise the arm length or lower the shoulders.");
     if (bvr::overlay::dev_tools()) {
+        unsigned solves = 0, stretched = 0;
+        bones::arm_stats(&solves, &stretched);
+        static unsigned s_ls = 0, s_lt = 0, s_rs = 0, s_rt = 0;
+        static uint64_t s_ms = 0;
+        const uint64_t now = GetTickCount64();
+        if (now - s_ms >= 1000) {
+            s_rs = solves - s_ls;
+            s_rt = stretched - s_lt;
+            s_ls = solves;
+            s_lt = stretched;
+            s_ms = now;
+        }
+        ImGui::Text("arms posed/s %u | at full reach/s %u", s_rs, s_rt);
+        ImGui::TextDisabled("Lots of 'full reach'? Raise the arm length or lower the shoulders.");
         ImGui::Text("forearm roll L %.0f | R %.0f deg (elbow lifts past 80)",
                     bones::arm_twist_deg(0), bones::arm_twist_deg(1));
         bool sk = bones::arm_scale_skin();
