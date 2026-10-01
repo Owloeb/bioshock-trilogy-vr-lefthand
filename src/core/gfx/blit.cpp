@@ -49,16 +49,9 @@ float4 ps_process(VSOut i) : SV_Target {
 // floor above lets a saturated red health fill keep ~10% alpha - composited
 // ONE/INV_SRC_ALPHA that fill barely occludes the world and reads as a
 // see-through, glowing bar.
-// Only for STRONG colour, though: the soft glow around the bars is ADDED light
-// (colour with ~zero coverage), and under this composite zero coverage is
-// exactly "add without occluding". Raising its alpha to its colour turned the
-// halo into a tinted shape over the world around the health bar. So the floor
-// fades in between 0.30 and 0.55 of the brightest channel: dim glow stays
-// additive, the saturated fills stay solid.
 float4 ps_process_premul(VSOut i) : SV_Target {
     float4 c = tex0.Sample(samp0, i.uv);
-    float m = saturate(max(c.r, max(c.g, c.b)));
-    c.a = max(c.a, m * smoothstep(0.30, 0.55, m));
+    c.a = max(c.a, saturate(max(c.r, max(c.g, c.b))));
     return c;
 }
 )";
