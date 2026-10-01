@@ -2904,23 +2904,6 @@ bool barrel_dir_target(float yawDeg, float pitchDeg, float out[3]) {
     return true;
 }
 
-bool palm_in_target(int hand, bool driven, float palmDepthUu, float out[3]) {
-    if (hand != 0 && hand != 1) return false;
-    if (!g_palm[hand].valid && !compute_palm_local(hand)) return false;
-    int first = 0, last = 0, anchor = 0;
-    cluster_of(hand, &first, &last, &anchor);
-    const Qts* src = draw_source(hand, driven);
-    const int w = wrist_of(hand);
-    const PalmLocal& pl = g_palm[hand];
-    float pw[3], face[3];
-    qts_rotate(src[w].q, pl.p, pw);
-    qts_rotate(src[w].q, pl.face, face);
-    const float s = g_scale[hand].load(std::memory_order_relaxed);
-    for (int i = 0; i < 3; ++i)
-        out[i] = (src[w].p[i] + pw[i] - src[anchor].p[i]) * s + face[i] * palmDepthUu;
-    return true;
-}
-
 bool written_world(int idx, float out[3]) {
     for (int k = 0; k < g_cacheCount; ++k) {
         if (g_cache[k].idx != idx) continue;

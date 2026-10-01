@@ -94,9 +94,6 @@ bool written_world(int idx, float out[3]);
 // yaw/pitch (deg, right+/up+, un-mirrored rig frame) = that weapon's own barrel
 // angle in its idle pose.
 bool barrel_dir_target(float yawDeg, float pitchDeg, float out[3]);
-// Jack's palm centroid relative to the anchor, in the drive target's frame,
-// for the pose `hand` is drawn with (same solve as grip_to_anchor).
-bool palm_in_target(int hand, bool driven, float palmDepthUu, float out[3]);
 
 // Arms (two-bone IK, experimental): instead of collapsing a visible hand's
 // sleeve, pose clavicle / upper arm / elbow / twist helpers from a shoulder

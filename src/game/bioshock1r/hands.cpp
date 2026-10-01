@@ -69,8 +69,6 @@ std::atomic<bool> g_useAimPose{true}; // aim pose = the ray the laser/bullet use
 std::atomic<bool> g_gripPlace{true};
 std::atomic<float> g_palmDepthCm{2.0f};
 std::atomic<bool> g_barrelAim{true};
-std::atomic<bool> g_palmCast{true};  // plasmid casts leave Jack's palm (else the controller)
-std::atomic<bool> g_palmPlane{true}; // plasmid mirror plane through the palm (else the wrist)
 std::atomic<int> g_handMode{2};       // 0 left, 1 right, 2 auto
 std::atomic<int> g_autoHand{1};       // the latched auto choice
 // Model offsets, PER HAND (0 left / 1 right, same convention as aim.cpp): the
@@ -429,7 +427,6 @@ void save_config() {
     fprintf(f, "aimPose=%d\n", g_useAimPose.load(std::memory_order_relaxed) ? 1 : 0);
     fprintf(f, "gripPlacement=%d\npalmDepthCm=%.2f\nbarrelAim=%d\n", g_gripPlace.load() ? 1 : 0,
             g_palmDepthCm.load(), g_barrelAim.load() ? 1 : 0);
-    fprintf(f, "palmCast=%d\npalmPlane=%d\n", g_palmCast.load() ? 1 : 0, g_palmPlane.load() ? 1 : 0);
     for (int h = 0; h < 2; ++h) {
         const char* s = h == 0 ? "L" : "R";
         fprintf(f, "posFwdCm%s=%.2f\n", s, g_posFwdCm[h].load(std::memory_order_relaxed));
@@ -481,8 +478,6 @@ void load_config() {
         else if (strcmp(key, "gripPlacement") == 0) g_gripPlace.store(v != 0.0f);
         else if (strcmp(key, "palmDepthCm") == 0) g_palmDepthCm.store(v);
         else if (strcmp(key, "barrelAim") == 0) g_barrelAim.store(v != 0.0f);
-        else if (strcmp(key, "palmCast") == 0) g_palmCast.store(v != 0.0f);
-        else if (strcmp(key, "palmPlane") == 0) g_palmPlane.store(v != 0.0f);
         else if (store_hand_key(key, "posFwdCm", g_posFwdCm, v)) {}
         else if (store_hand_key(key, "posRightCm", g_posRightCm, v)) {}
         else if (store_hand_key(key, "posUpCm", g_posUpCm, v)) {}
@@ -1389,41 +1384,6 @@ void publish_barrel(const FrameContext& ctx, const GamePose& gpV, bool mirrorPos
     aim::set_barrel(true, o, d, laserOk ? lo : nullptr, laserOk ? ldir : nullptr);
 }
 
-// Plasmid casts: with the hand on your real palm, the cast has to leave JACK'S
-// palm, not the controller's pointing-ray origin a few centimetres away. The
-// palm point (rig space -> as SEEN when mirroring) and its offset from the
-// plasmid hand's grip pose (XR, for the laser) go to aim.cpp; the direction
-// stays the calibrated pointing ray.
-void publish_palm(const FrameContext& ctx, const GamePose& gpV, bool mirrorPose,
-                  const GamePose& headW) {
-    float rel[3];
-    const float depth = g_palmDepthCm.load(std::memory_order_relaxed) * ctx.worldScale / 100.0f;
-    if (!bones::palm_in_target(0, true, depth, rel)) {
-        aim::set_palm(false, nullptr, nullptr);
-        return;
-    }
-    float f[3], r[3], u[3], p[3];
-    ue_rot_basis(gpV.rot, f, r, u);
-    for (int i = 0; i < 3; ++i) p[i] = (&gpV.loc.x)[i] + f[i] * rel[0] + r[i] * rel[1] + u[i] * rel[2];
-    if (mirrorPose) {
-        float hf[3], hr[3], hu[3];
-        ue_rot_basis(headW.rot, hf, hr, hu);
-        const float H[3] = {headW.loc.x, headW.loc.y, headW.loc.z};
-        reflect_point(p, H, hr);
-    }
-    float lo[3] = {0, 0, 0};
-    bool laserOk = false;
-    bvr::vr::HeadPose hp{};
-    if (bvr::vr::get_hand_pose(0, false, hp)) {
-        float xo[3];
-        game_point_to_xr(ctx, FVector{p[0], p[1], p[2]}, xo);
-        const float d[3] = {xo[0] - hp.px, xo[1] - hp.py, xo[2] - hp.pz};
-        quat_rotate(-hp.qx, -hp.qy, -hp.qz, hp.qw, d, lo);
-        laserOk = true;
-    }
-    aim::set_palm(true, p, laserOk ? lo : nullptr);
-}
-
 // Always-visible off hand: the OTHER role's controller through the same chain
 // as the driven hand - XR pose (two-handed pose when gripped), the head-mirror
 // when mirroring, that hand's model trims and offsets, and in gun-plane mode
@@ -2200,24 +2160,8 @@ void on_calcview(const FrameContext& ctx) {
             // where the engine really spawns the flash; else bone 44 (v6).
             auto learned = hand == 1 ? g_flashY.find(g_trimKey) : g_flashY.end();
             const bool haveFlash = learned != g_flashY.end();
-            bool havePalm = false;
-            if (hand == 0 && g_palmPlane.load(std::memory_order_relaxed)) {
-                // The plasmid hand's effects hang off the ENGINE hand, which
-                // is placed at the reflection of the hand you see about this
-                // plane: through the anchor bone it put them a hand's width to
-                // the side. Through the PALM (where the casts leave) the
-                // engine palm and the visible palm are the same point - the
-                // gun's muzzle rule, applied to the hand.
-                float rel[3];
-                const float depth = g_palmDepthCm.load(std::memory_order_relaxed) *
-                                    ctx.worldScale / 100.0f;
-                if (bones::palm_in_target(0, true, depth, rel)) {
-                    muzzle[1] = rel[1];
-                    havePalm = true;
-                }
-            }
             const bool haveMuzzle =
-                havePalm || haveFlash || (hand == 1 && bones::muzzle_ref_offset(muzzle));
+                haveFlash || (hand == 1 && bones::muzzle_ref_offset(muzzle));
             if (haveFlash) muzzle[1] = learned->second;
             float shift = (haveMuzzle ? muzzle[1] : 0.0f) + trim;
             if (shift > 20.0f) shift = 20.0f; // a sane plane; never throw the rig away
@@ -2239,10 +2183,7 @@ void on_calcview(const FrameContext& ctx) {
                 _snprintf_s(note, sizeof note, _TRUNCATE,
                             "Tuning: %s | muzzle offset (%s) %.2f UU + trim %.2f%s",
                             g_trimKey.c_str(),
-                            havePalm    ? "palm"
-                            : haveFlash ? "measured flash"
-                            : haveMuzzle ? "bone 44 guess"
-                                         : "none",
+                            haveFlash ? "measured flash" : haveMuzzle ? "bone 44 guess" : "none",
                             haveMuzzle ? muzzle[1] : 0.0f, trim,
                             gunPlane ? "" : " | gun plane unavailable - head plane used");
                 bvr::vm_mirror::set_ui_note(note);
@@ -2279,11 +2220,6 @@ void on_calcview(const FrameContext& ctx) {
             publish_barrel(ctx, gpPreKick, mirrorPose, headW);
         else
             aim::set_barrel(false, nullptr, nullptr, nullptr, nullptr);
-        if (hand == 0 && g_gripPlace.load(std::memory_order_relaxed) &&
-            g_palmCast.load(std::memory_order_relaxed))
-            publish_palm(ctx, gpPreKick, mirrorPose, headW);
-        else
-            aim::set_palm(false, nullptr, nullptr);
         // Route B: the inputs the pose-writer hook re-applies next engine write.
         g_postCtx = ctx;
         g_postTarget = target;
@@ -2582,16 +2518,6 @@ void draw_debug_ui() {
                 }
                 if (done) save_barrel_angles();
             }
-        }
-        bool pc = g_palmCast.load();
-        if (ImGui::Checkbox("Plasmid casts leave Jack's palm (off: the controller tip)", &pc)) {
-            g_palmCast.store(pc);
-            save_config();
-        }
-        bool pp = g_palmPlane.load();
-        if (ImGui::Checkbox("Plasmid effects mirrored about the palm (off: the wrist)", &pp)) {
-            g_palmPlane.store(pp);
-            save_config();
         }
         ImGui::TextDisabled("The offset/trim sliders below now fine-tune from your palm.");
     }
