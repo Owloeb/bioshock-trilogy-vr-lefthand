@@ -5,6 +5,7 @@
 #include "core/util/xr_math.h"
 #include "core/vr/openxr_runtime.h"
 #include "game/bioshock1r/aim.h"
+#include "game/bioshock1r/bones.h"
 #include "game/bioshock1r/hands.h"
 
 #include <windows.h>
@@ -44,6 +45,10 @@ struct GrabPoint {
 // Keyed "<WeaponClass>@<setup>". Game thread writes; the UI reads under the lock.
 std::mutex g_mx;
 std::map<std::string, GrabPoint> g_points;
+// What the held hand rides, per grab point (same key): "" / absent = the weapon
+// part nearest the grab point, "*body" = gun body only, "*hand" = the engine's
+// own off hand (classic), else a weapon bone name.
+std::map<std::string, std::string> g_parts;
 bool g_loaded = false;
 
 // Live state (game thread), mirrored to atomics for the UI.
@@ -90,6 +95,9 @@ void save() {
     for (const auto& [k, p] : g_points)
         fprintf(f, "%s = %.4f %.4f %.4f %.5f %.5f %.5f %.5f\n", k.c_str(), p.g[0], p.g[1],
                 p.g[2], p.rel[0], p.rel[1], p.rel[2], p.rel[3]);
+    fprintf(f, "# what the held hand rides: <Weapon>@<setup>.part = <bone> | *body | *hand\n");
+    for (const auto& [k, v] : g_parts)
+        if (!v.empty()) fprintf(f, "%s.part = %s\n", k.c_str(), v.c_str());
     fclose(f);
 }
 
@@ -104,6 +112,17 @@ void load() {
     while (fgets(line, sizeof line, f)) {
         if (line[0] == '#') continue;
         char key[96] = {};
+        char val[40] = {};
+        if (sscanf_s(line, "%95[^= ] = %39s", key, static_cast<unsigned>(sizeof key), val,
+                     static_cast<unsigned>(sizeof val)) == 2) {
+            const size_t kl = strlen(key);
+            if (kl > 5 && strcmp(key + kl - 5, ".part") == 0) {
+                key[kl - 5] = 0;
+                std::lock_guard<std::mutex> lk(g_mx);
+                g_parts[key] = val;
+                continue;
+            }
+        }
         GrabPoint p{};
         if (sscanf_s(line, "%95[^= ] = %f %f %f %f %f %f %f", key,
                      static_cast<unsigned>(sizeof key), &p.g[0], &p.g[1], &p.g[2], &p.rel[0],
@@ -167,6 +186,15 @@ void tick(bool weaponRaised, bool gameplay) {
     key += "@";
     key += setup_tag();
     strncpy_s(g_keyUi, key.c_str(), _TRUNCATE);
+    {
+        std::string part;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            auto it = g_parts.find(key);
+            if (it != g_parts.end()) part = it->second;
+        }
+        bones::set_ride_part(part.c_str());
+    }
 
     if (g_clearRequest.exchange(0) == 1) {
         {
@@ -348,6 +376,49 @@ void draw_debug_ui() {
         }
     }
     ImGui::TextDisabled("One press per weapon: the next off-hand squeeze records the spot.");
+
+    // What the held hand rides when the gun animates.
+    if (key[0]) {
+        static char names[128][40];
+        const int n = bones::weapon_part_names(names, 128);
+        const int autoIdx = bones::ride_part_auto();
+        std::string cur;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            auto it = g_parts.find(key);
+            if (it != g_parts.end()) cur = it->second;
+        }
+        char autoLabel[96];
+        _snprintf_s(autoLabel, sizeof autoLabel, _TRUNCATE, "Nearest part (%s)",
+                    autoIdx >= 0 && autoIdx < n ? names[autoIdx] : "reach for the grip to see");
+        const char* preview = cur.empty()         ? autoLabel
+                              : cur == "*body"    ? "Gun body only"
+                              : cur == "*hand"    ? "Jack's own hand (classic)"
+                                                  : cur.c_str();
+        std::string choice = cur;
+        bool picked = false;
+        if (ImGui::BeginCombo("held hand rides", preview)) {
+            if (ImGui::Selectable(autoLabel, cur.empty())) choice = "", picked = true;
+            if (ImGui::Selectable("Gun body only", cur == "*body")) choice = "*body", picked = true;
+            if (ImGui::Selectable("Jack's own hand (classic)", cur == "*hand"))
+                choice = "*hand", picked = true;
+            for (int i = 0; i < n; ++i) {
+                ImGui::PushID(i);
+                if (ImGui::Selectable(names[i], cur == names[i])) choice = names[i], picked = true;
+                ImGui::PopID();
+            }
+            ImGui::EndCombo();
+        }
+        if (picked && choice != cur) {
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                if (choice.empty()) g_parts.erase(key);
+                else g_parts[key] = choice;
+            }
+            g_saveRequest.store(true);
+        }
+        ImGui::TextDisabled("The part your hand follows when the gun animates (pump, lever, drum).");
+    }
     const float d = g_distCm.load();
     if (d >= 0.0f)
         ImGui::Text("off hand %.1f cm from the grab point  %s%s", d,

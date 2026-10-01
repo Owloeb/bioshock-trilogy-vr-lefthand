@@ -70,6 +70,17 @@ void set_active_weapon(const char* key);
 // Developer tools: log one summary per weapon animation (engine off hand, gun
 // tilt, the weapon's own moving bones) to bioshockvr.log.
 void set_anim_log(bool on);
+// Two-handed grip, follow v5: what the held hand rides for the weapon in hand.
+// "" = the weapon part nearest the grab point (default), "*body" = the gun body
+// only, "*hand" = the engine's own off hand (v4), or a weapon bone name. Game
+// thread, every frame.
+void set_ride_part(const char* want);
+// The current weapon's part (bone) names; returns how many (render-safe copy).
+int weapon_part_names(char (*out)[40], int cap);
+// Nearest part to the grab point while the hand is near/holding (-1 none), and
+// what the held hand rides right now (index, -1 body, -2 engine hand, -3 idle).
+int ride_part_auto();
+int ride_part_active();
 // World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
 bool written_world(int idx, float out[3]);
 // The gun's barrel direction in the drive target's frame: its idle forward,
