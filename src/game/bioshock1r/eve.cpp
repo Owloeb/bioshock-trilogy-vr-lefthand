@@ -533,7 +533,11 @@ std::atomic<int> g_spot{kStomach};
 std::atomic<float> g_dropM[2] = {0.55f, 0.62f}; // below the eyes
 std::atomic<float> g_sideM[2] = {0.00f, 0.20f}; // toward the weapon hand's side
 std::atomic<float> g_fwdM[2] = {0.10f, 0.02f};  // forward of the eyes
-std::atomic<float> g_zoneM[2] = {0.15f, 0.20f}; // grab radius (the stomach is busier: tighter)
+std::atomic<float> g_zoneM[2] = {0.19f, 0.20f}; // grab radius (the stomach's busy-gun gates allow near the hip's)
+// eve.ini layout: 2 = the stomach reach default went 15 -> 19 cm (an older
+// file's 15 is that old default, not a choice, so it is not loaded).
+constexpr int kCfgVersion = 2;
+int g_cfgFileVersion = 0;
 const char* spot_name() { return g_spot.load() == kHip ? "hip" : "stomach"; }
 std::atomic<float> g_needleUu{14.0f};  // needle tip below the grip (syringe axis)
 std::atomic<float> g_surgeAmt{1.0f};   // injection tremor strength (0 = off)
@@ -614,6 +618,7 @@ void cfg_save() {
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "# BioShock VR - EVE holster\n");
+    fprintf(f, "version=%d\n", kCfgVersion);
     fprintf(f, "holster=%d\nblockAutoInject=%d\nspot=%d\nbellyDropM=%.3f\nbellySideM=%.3f\nbellyFwdM=%.3f\nbellyZoneM=%.3f\nhipDropM=%.3f\nhipSideM=%.3f\nhipFwdM=%.3f\nzoneM=%.3f\nneedleUu=%.1f\nsurge=%.2f\nhiddenOff=%d\nhiddenMask=%d\n",
             g_holsterOn.load() ? 1 : 0, g_blockAuto.load() ? 1 : 0, g_spot.load(), g_dropM[kStomach].load(),
             g_sideM[kStomach].load(), g_fwdM[kStomach].load(), g_zoneM[kStomach].load(), g_dropM[kHip].load(),
@@ -631,13 +636,14 @@ void cfg_load() {
         char key[48] = {};
         float v = 0.0f;
         if (line[0] == '#' || sscanf_s(line, "%47[^=]=%f", key, static_cast<unsigned>(sizeof key), &v) != 2) continue;
-        if (!strcmp(key, "holster")) g_holsterOn.store(v != 0.0f);
+        if (!strcmp(key, "version")) g_cfgFileVersion = static_cast<int>(v);
+        else if (!strcmp(key, "holster")) g_holsterOn.store(v != 0.0f);
         else if (!strcmp(key, "blockAutoInject")) g_blockAuto.store(v != 0.0f);
         else if (!strcmp(key, "spot")) g_spot.store(v == 1.0f ? kHip : kStomach);
         else if (!strcmp(key, "bellyDropM")) g_dropM[kStomach].store(v);
         else if (!strcmp(key, "bellySideM")) g_sideM[kStomach].store(v);
         else if (!strcmp(key, "bellyFwdM")) g_fwdM[kStomach].store(v);
-        else if (!strcmp(key, "bellyZoneM")) g_zoneM[kStomach].store(v);
+        else if (!strcmp(key, "bellyZoneM") && g_cfgFileVersion >= 2) g_zoneM[kStomach].store(v);
         else if (!strcmp(key, "hipDropM")) g_dropM[kHip].store(v);
         else if (!strcmp(key, "hipSideM")) g_sideM[kHip].store(v);
         else if (!strcmp(key, "hipFwdM")) g_fwdM[kHip].store(v);
@@ -1042,7 +1048,31 @@ bool holster_offset(float out[3]) {
     const float neckLocal[3] = {0.0f, -0.10f, 0.08f}; // XR head space: below, behind
     float nk[3];
     bvr::xrmath::quat_rotate(head.qx, head.qy, head.qz, head.qw, neckLocal, nk);
-    const float neck[3] = {head.px + nk[0], head.py + nk[1], head.pz + nk[2]};
+    float neck[3] = {head.px + nk[0], head.py + nk[1], head.pz + nk[2]};
+    // Height from a SETTLED neck, not the instantaneous one. Ducking, leaning
+    // in, hunching over a fight or bobbing while moving all drop the head far
+    // more than the stomach (the body bends at the waist), and a holster hung
+    // straight from the neck sank with every one of them - toward the groin
+    // after a busy stretch. The settled height rises at once (standing up)
+    // and follows a drop only once it is held (tau 1.5 s), so a real crouch
+    // still brings the holster down with you.
+    {
+        static float s_neckY = 0.0f;
+        static bool s_have = false;
+        static uint64_t s_ms = 0;
+        const uint64_t nowH = GetTickCount64();
+        const float dt = s_ms ? fminf(0.25f, (nowH - s_ms) / 1000.0f) : 0.0f;
+        s_ms = nowH;
+        if (!s_have || dt <= 0.0f) {
+            s_neckY = neck[1];
+            s_have = true;
+        } else if (neck[1] > s_neckY) {
+            s_neckY += (neck[1] - s_neckY) * fminf(1.0f, dt / 0.08f); // up: at once
+        } else {
+            s_neckY += (neck[1] - s_neckY) * (1.0f - expf(-dt / 1.5f)); // down: only if held
+        }
+        neck[1] = s_neckY;
+    }
     const float side = bvr::input::left_handed() ? -1.0f : 1.0f; // weapon hand's side
     const float rx = -g_bodyFwd[1], rz = g_bodyFwd[0];               // body right (XR)
     const int sp = g_spot.load();

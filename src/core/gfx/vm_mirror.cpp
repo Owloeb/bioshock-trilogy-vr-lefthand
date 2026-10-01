@@ -193,8 +193,21 @@ bool within_reach(const Entry& e, int row) {
     const float maxUu = g_maxReachM.load(std::memory_order_relaxed) * ws;
     if (d <= maxUu) return true;
     const float exc = g_reachExcM.load(std::memory_order_relaxed);
-    return exc > 0.0f && GetTickCount64() < g_reachExcUntilMs.load(std::memory_order_relaxed) &&
-           fabsf(d - exc * ws) <= g_reachExcTolM.load(std::memory_order_relaxed) * ws;
+    const uint64_t now = GetTickCount64();
+    if (exc <= 0.0f || now >= g_reachExcUntilMs.load(std::memory_order_relaxed)) return false;
+    const bool take = fabsf(d - exc * ws) <= g_reachExcTolM.load(std::memory_order_relaxed) * ws;
+    // While an exception is live, say what the reach test decided past the
+    // limit - accepted or not, and how far from the expected distance - so a
+    // first-person object still filed as world shows up as data.
+    static uint64_t s_logMs = 0;
+    static int s_logs = 0;
+    if (now - s_logMs >= 1000 && s_logs < 40) {
+        s_logMs = now;
+        ++s_logs;
+        BVR_LOG("[mirror] reach exception: draw at %.2f m (limit %.2f, expected %.2f +- %.2f) %s", d / ws,
+                maxUu / ws, exc, g_reachExcTolM.load(std::memory_order_relaxed), take ? "TAKEN" : "left as world");
+    }
+    return take;
 }
 
 // Reflect a draw's component->clip rows (x, y, z, w; 4 floats each) about the

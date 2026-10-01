@@ -202,7 +202,7 @@ never reaches the game, so it can't open the weapon wheel.
 **Staying out of the way at the stomach:** your weapon hand passes in front of your stomach all
 the time, so there the holster ignores the hand while it's busy with the gun: two-handing it,
 on the trigger, or aimed ahead (hip-fire). In those cases there's no buzz, and the squeeze goes
-to the game. The stomach reach is also tighter than the hip's (15 cm against 20 cm). The log
+to the game. The stomach reach is 19 cm (the hip's is 20 cm). The log
 says why when a squeeze at the stomach was left to the game (`[eve] holster: squeeze at the
 stomach left to the game - ...`).
 
@@ -216,7 +216,9 @@ every frame. That's the same spot the game hangs it from during its own injectio
 pull the trigger the mod presses X (the game's EVE button, with the plasmid raised) and the
 game takes over without a jump. The needle test is a capsule around the forearm, from wrist to
 elbow, using the arm solver. The holster hangs from your neck rather than your eyes, so looking
-down at it or leaning into a fight doesn't move it away from your hand.
+down at it or leaning into a fight doesn't move it away from your hand. Its height follows your
+settled posture: ducking, hunching or bobbing while you move doesn't drag it down, but a crouch
+you hold brings it down with you.
 
 **Settings:** in F10 → **EVE holster**: stomach or hip, then that spot's position (down,
 sideways, forward) and reach. Each spot keeps its own position, so switching back and forth
