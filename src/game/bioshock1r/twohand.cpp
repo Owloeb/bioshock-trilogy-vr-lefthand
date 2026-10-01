@@ -90,6 +90,7 @@ void save() {
     fprintf(f, "offHand=%d\ntwoHand=%d\nbuzz=%d\ngrabCm=%.1f\nslideOffCm=%.1f\nbuzzAmp=%.2f\n",
             g_offHand.load() ? 1 : 0, g_twoHand.load() ? 1 : 0, g_buzz.load() ? 1 : 0,
             g_grabCm.load(), g_releaseCm.load(), g_buzzAmp.load());
+    fprintf(f, "jackReloads=%d\n", bones::jack_reloads() ? 1 : 0);
     fprintf(f, "# grab points: <Weapon>@<R|L|LM> = x y z (m, weapon grip frame) qx qy qz qw\n");
     std::lock_guard<std::mutex> lk(g_mx);
     for (const auto& [k, p] : g_points)
@@ -143,6 +144,7 @@ void load() {
         else if (strcmp(key, "slideOffCm") == 0) g_releaseCm.store(v); // v2 key: the old
         // 20 cm "releaseCm" is deliberately ignored - the grip got stickier
         else if (strcmp(key, "buzzAmp") == 0) g_buzzAmp.store(v);
+        else if (strcmp(key, "jackReloads") == 0) bones::set_jack_reloads(v != 0.0f);
     }
     fclose(f);
     BVR_LOG("[twohand] loaded %d grab point(s)", points);
@@ -349,6 +351,12 @@ void draw_debug_ui() {
         g_releaseCm.store(f);
         g_saveRequest.store(true);
     }
+    b = bones::jack_reloads();
+    if (ImGui::Checkbox("Watch Jack reload while you hold the grip", &b)) {
+        bones::set_jack_reloads(b);
+        g_saveRequest.store(true);
+    }
+    ImGui::TextDisabled("Let go of the grip during a reload to do it yourself.");
 
     ImGui::Separator();
     char key[96];

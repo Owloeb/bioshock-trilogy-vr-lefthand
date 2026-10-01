@@ -81,6 +81,9 @@ int weapon_part_names(char (*out)[40], int cap);
 // what the held hand rides right now (index, -1 body, -2 engine hand, -3 idle).
 int ride_part_auto();
 int ride_part_active();
+// While held through a RELOAD, show Jack's own hand doing it (default on).
+void set_jack_reloads(bool on);
+bool jack_reloads();
 // World position of a bone the last drive wrote (e.g. 43/44: the gun barrel).
 bool written_world(int idx, float out[3]);
 // The gun's barrel direction in the drive target's frame: its idle forward,

@@ -1703,8 +1703,16 @@ const Qts* draw_source(int hand, bool driven) {
 // One cluster, moved rigidly: rotate its reference pose by qtc about its
 // reference anchor point, then put the anchor point at ptc. Appends every write
 // to the reapply cache (the caller resets it once per drive).
+// A second pose for rigid_cluster to blend toward, bone by bone (wB = 0..1).
+struct ClusterBlend {
+    const float* ptc;
+    const float* qtc;
+    const Qts* src;
+    float w;
+};
+
 bool rigid_cluster(int hand, int first, int last, int anchor, const float ptc[3],
-                   const float qtc[4], const Qts* src = g_ref) {
+                   const float qtc[4], const Qts* src = g_ref, const ClusterBlend* blend = nullptr) {
     // Rigid move: rotate the reference cluster by qtc about the reference
     // anchor point, then put the anchor point at the target. Every write is
     // also cached for reapply() - the stereo second pass must be able to
@@ -1730,6 +1738,26 @@ bool rigid_cluster(int hand, int first, int last, int anchor, const float ptc[3]
         float p[3] = {ptc[0] + rot[0], ptc[1] + rot[1], ptc[2] + rot[2]};
         float q[4];
         quat_mul(qtc, src[i].q, q);
+        if (blend && blend->w > 0.0f) {
+            const Qts* sb = blend->src;
+            const float* pab = sb[anchor].p;
+            const float relB[3] = {(sb[i].p[0] - pab[0]) * s, (sb[i].p[1] - pab[1]) * s,
+                                   (sb[i].p[2] - pab[2]) * s};
+            float rotB[3], qB[4];
+            qts_rotate(blend->qtc, relB, rotB);
+            quat_mul(blend->qtc, sb[i].q, qB);
+            const float w = blend->w;
+            for (int k = 0; k < 3; ++k) p[k] += (blend->ptc[k] + rotB[k] - p[k]) * w;
+            const float d = q[0] * qB[0] + q[1] * qB[1] + q[2] * qB[2] + q[3] * qB[3];
+            const float sg = d < 0.0f ? -1.0f : 1.0f;
+            float n2 = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                q[k] += (sg * qB[k] - q[k]) * w;
+                n2 += q[k] * q[k];
+            }
+            const float inv = n2 > 1e-12f ? 1.0f / sqrtf(n2) : 1.0f;
+            for (float& c : q) c *= inv;
+        }
         if (!write_n(g_bones[i].p, p, 12) || !write_n(g_bones[i].q, q, 16)) {
             g_skelInst = nullptr; // faulted mid-write: revalidate next frame
             g_cacheMs = 0;
@@ -1804,6 +1832,20 @@ std::atomic<int> g_ridePartUi{-3}; // what the held hand rides (-1 body, -2 clas
 int g_ridePart = -1;
 bool g_rideLocked = false;
 bool g_wasFollow = false;
+// Watching Jack reload: while you hold the grip through a RELOAD, the held
+// hand blends over to the engine's own left hand - its fingers included - on
+// the drawn gun, so you see Jack load it; let go and the hand is yours again
+// (at your controller) to mime it. Fire-cycle animations (the pump after a
+// shot, the chemical thrower's wrench, the crossbow prime) keep riding the
+// part. A reload = an animation that starts with the reload button down, or
+// with no trigger pull in the second before it.
+bool g_jackWant = false;
+float g_jackW = 0.0f;
+uint64_t g_jackMs = 0;
+bool g_animWasOn = false;
+bool g_animIsReload = false;
+uint64_t g_lastReloadBtnMs = 0;
+std::atomic<bool> g_jackReloads{true}; // F10 toggle
 
 // The weapon's parts are still: nothing moved more than a hair for 300 ms (or
 // a part has been moving for 4 s - an idle loop, not an animation).
@@ -2062,15 +2104,48 @@ bool drive_off_hand(int ih, const float qaInv[4], const float actorLoc[3], bool 
     const bool wantGrip = g_offFollow || g_offPreview;
     const bool relaxed = ih == 0 && !wantGrip && g_neutralValid;
     const bool gripShape = ih == 0 && wantGrip && g_gripShapeValid;
-    if (!rigid_cluster(ih, first, last, anchor, ptc, qtc,
-                       relaxed ? g_neutral : gripShape ? g_gripShape : g_ref))
+    // Jack's own hand on the drawn gun (see g_jackWant): the engine's live left
+    // hand relative to its live attach bone, carried by the drawn gun's frame
+    // G = qtcMain ref43 live43^-1 and set on the gun at the gun's drawn size.
+    ClusterBlend jack{nullptr, nullptr, g_liveL, 0.0f};
+    float ptcJ[3], qtcJ[4];
+    if (ih == 0) {
+        const uint64_t nowJ = GetTickCount64();
+        const float dt = g_jackMs ? static_cast<float>(nowJ - g_jackMs) : 0.0f;
+        g_jackMs = nowJ;
+        if (g_jackWant) g_jackW = fminf(1.0f, g_jackW + dt / 150.0f); // in over 150 ms
+        else g_jackW = fmaxf(0.0f, g_jackW - dt / 200.0f);          // home over 200 ms
+        if (g_jackW > 0.0f && g_liveValid && anchor < g_boneCount) {
+            const Qts& L43 = g_live[1];
+            const Qts& r43 = g_ref[patterns::kBoneWeaponAttach];
+            float t[4], l43i[4];
+            quat_conj(L43.q, l43i);
+            quat_mul(qtcMain, r43.q, t);
+            quat_mul(t, l43i, qtcJ);
+            const float ws = g_wScale.load(std::memory_order_relaxed);
+            const float d[3] = {(g_liveL[anchor].p[0] - L43.p[0]) * ws,
+                                (g_liveL[anchor].p[1] - L43.p[1]) * ws,
+                                (g_liveL[anchor].p[2] - L43.p[2]) * ws};
+            float dr[3];
+            qts_rotate(qtcJ, d, dr);
+            for (int k = 0; k < 3; ++k) ptcJ[k] = ptcMain[k] + dr[k];
+            const float x = g_jackW;
+            jack = {ptcJ, qtcJ, g_liveL, x * x * (3.0f - 2.0f * x)}; // smoothstep
+        }
+    }
+    const Qts* srcUsed = relaxed ? g_neutral : gripShape ? g_gripShape : g_ref;
+    if (!rigid_cluster(ih, first, last, anchor, ptc, qtc, srcUsed, jack.w > 0.0f ? &jack : nullptr))
         return false;
     static const float kZero[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     bool armed = false;
     if (g_armsOn.load(std::memory_order_relaxed)) {
-        const Qts* srcUsed = relaxed ? g_neutral : gripShape ? g_gripShape : g_ref;
         float Wt[3];
         written_wrist(ih, anchor, ptc, qtc, srcUsed, Wt);
+        if (jack.w > 0.0f) {
+            float WtJ[3];
+            written_wrist(ih, anchor, ptcJ, qtcJ, g_liveL, WtJ);
+            for (int k = 0; k < 3; ++k) Wt[k] += (WtJ[k] - Wt[k]) * jack.w;
+        }
         armed = arm_ik(ih, Wt, qaInv, actorLoc);
     }
     if (collapse && !armed) {
@@ -2307,6 +2382,8 @@ int weapon_part_names(char (*out)[40], int cap) {
 }
 
 int ride_part_auto() { return g_autoPart.load(std::memory_order_relaxed); }
+void set_jack_reloads(bool on) { g_jackReloads.store(on, std::memory_order_relaxed); }
+bool jack_reloads() { return g_jackReloads.load(std::memory_order_relaxed); }
 int ride_part_active() { return g_ridePartUi.load(std::memory_order_relaxed); }
 
 void set_active_weapon(const char* key) {
@@ -2513,6 +2590,21 @@ bool drive(const FrameContext& ctx, void* handsActor, const GamePose& gp, int ha
         }
     }
 
+    if (hand == 1) {
+        const uint64_t nowJ = GetTickCount64();
+        uint16_t btn = 0;
+        bvr::input::last_composed_buttons(&btn);
+        if (btn & 0x4000) g_lastReloadBtnMs = nowJ; // XINPUT_GAMEPAD_X: reload
+        if (animating && !g_animWasOn)
+            g_animIsReload = !firingWindow || nowJ - g_lastReloadBtnMs < 800;
+        if (!animating) g_animIsReload = false;
+        g_animWasOn = animating;
+        g_jackWant = g_jackReloads.load(std::memory_order_relaxed) && g_offFollow &&
+                     g_animIsReload && g_liveValid;
+    } else {
+        g_jackWant = false;
+        g_animWasOn = g_animIsReload = false;
+    }
     if (hand == 1) {
         weapon_still_tick();
         anim_log_tick(anchor, g_liveValid && (firingWindow || animating));
