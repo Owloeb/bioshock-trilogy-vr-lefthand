@@ -1063,8 +1063,27 @@ void place_hypo() {
     if (!g_tg.socketOk || !g_hypo || hypo_attached()) return;
     int32_t rot[3];
     basis_to_rot(g_tg.sockF, g_tg.sockU, rot);
-    write_block(static_cast<uint8_t*>(g_hypo) + patterns::kActorLocOffset, g_tg.socket, 12);
-    write_block(static_cast<uint8_t*>(g_hypo) + patterns::kActorRotOffset, rot, 12);
+    uint8_t* a = static_cast<uint8_t*>(g_hypo);
+    write_block(a + patterns::kActorLocOffset, g_tg.socket, 12);
+    write_block(a + patterns::kActorRotOffset, rot, 12);
+    // The engine renders an actor from a CACHED transform: a raw Location /
+    // Rotation write is not drawn until the actor is marked changed - the
+    // dirty protocol AActor::SetDrawScale uses (ENGINE_NOTES "DrawScale,
+    // finally"). Without it the syringe stayed wherever the last engine-side
+    // refresh left it: on the hand only when a draw happened to coincide with
+    // one (standing still, gun up, the plasmid raise refreshing it), back in
+    // the world when moving or drawn with a plasmid already up.
+    uint32_t flags = 0, rev = 0;
+    if (read_block(a + patterns::kActorDirtyFlagsOffset, &flags, 4)) {
+        flags |= 0x10;
+        write_block(a + patterns::kActorDirtyFlagsOffset, &flags, 4);
+    }
+    if (read_block(a + patterns::kActorRenderRevOffset, &rev, 4)) {
+        ++rev;
+        write_block(a + patterns::kActorRenderRevOffset, &rev, 4);
+    }
+    const uint8_t zero = 0;
+    write_block(a + patterns::kActorDirtyByteOffset, &zero, 1);
 }
 
 // The needle tip: down the syringe's axis from the grip (its mesh runs along
@@ -1289,8 +1308,8 @@ void holster_tick() {
                 break;
             }
             if (hands::active_hand() != 0) bvr::input::pulse_buttons(0x0100, 150); // LB: raise the plasmid
+            place_hypo(); // placed first, so the show draws it on the hand
             hypo_show(true);
-            place_hypo();
             buzz(1, 0.6f, 60);
             g_heldSinceMs = now;
             g_gameHides = 0;

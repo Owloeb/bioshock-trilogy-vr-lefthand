@@ -3552,6 +3552,11 @@ attached to the hands, and pointer/TArray censuses. Four headset runs.
 - The game ignores X while the hands are busy (action state != 5): an injection pressed while the
   plasmid is still coming up never attaches the syringe. The holster presses X only at rest and
   re-presses (up to 3) if no attach follows within 700 ms.
+- Placing the syringe needs the render dirty protocol after the Location/Rotation write (the
+  DrawScale one: `+0xD0 |= 0x10`, `+0x3F4++`, `+0x3E4 = 0`). Without it the actor drew at its
+  last engine-refreshed transform: on the hand only when a draw coincided with a refresh (the
+  plasmid raise from a gun), left behind in the world when moving or with a plasmid already up.
+  The learned bHidden bit (+0xCC/0x40 on this build) never read hidden during those failures.
   Writing `AActor::Location`/`Rotation` places it (proven: parked in front of the eyes).
 - **AHands action state** `hands+0x494`: 5 at rest, 1 while an action (cast, injection) runs.
   `hands+0x454` holds the raised plasmid's ability object (0 with a gun up) - its class names
