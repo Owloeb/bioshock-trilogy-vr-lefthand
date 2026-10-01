@@ -185,8 +185,9 @@ left-handed mode).
 
 1. **Draw.** Reach your weapon hand to that hip; the controller buzzes steadily while you're in
    reach. Squeeze the grip and Jack's real EVE syringe is in your hand. You can squeeze on the
-   way in: a squeeze that starts just short of the hip still draws if your hand gets there
-   within about half a second. If a gun was out, the plasmid comes up so your other arm is
+   way in: a squeeze that starts just short of the hip while your hand is moving toward it
+   still draws if the hand gets there within about half a second. A squeeze with your hand
+   held still near your side goes to the game as usual (the weapon wheel). If a gun was out, the plasmid comes up so your other arm is
    ready.
 2. **Needle in.** Push the needle into your plasmid forearm. Both controllers buzz when it goes
    in.

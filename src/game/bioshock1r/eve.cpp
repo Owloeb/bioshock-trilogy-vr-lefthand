@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cctype>
 #include <cstring>
+#include <functional>
 #include <string>
 
 namespace bvr::b1r::eve {
@@ -539,6 +540,12 @@ bool g_zoneSqueeze = false; // this squeeze began in the holster: never reaches 
 bool g_drawSpent = false;     // this squeeze already drew (or was refused)
 uint64_t g_squeezeRiseMs = 0; // when the current squeeze began (a grab may finish on arrival)
 uint64_t g_missLogMs = 0;
+float g_hipDistPrev = -1.0f;  // last tick's hand-to-holster distance (approach speed)
+uint64_t g_hipDistMs = 0;
+float g_approach = 0.0f;      // m/s toward the holster, smoothed
+uint64_t g_reshowMs = 0;
+uint64_t g_xSentMs = 0;       // when X went to the game for this injection
+bool g_sawAttach = false;     // the game took the syringe for this injection
 // The injection surge: a tremor that builds while the plunger runs, peaks as
 // the EVE lands and dies away in the hand.
 uint64_t g_surgeStartMs = 0, g_surgeLandMs = 0;
@@ -888,12 +895,13 @@ bool hip_offset(float out[3]) {
     return true;
 }
 
-// Inside the holster's reach, scaled. An upright capsule rather than a ball:
-// your hip does not sit at one exact height under a head that bobs, ducks and
-// strafes, so height gets half again the horizontal reach.
+// Inside the holster's reach, scaled: an ellipsoid a quarter taller than it
+// is wide (the hip does not sit at one exact height under a head that bobs).
+// Kept tight on purpose - every grip squeeze inside it belongs to the holster,
+// not to the weapon wheel.
 bool in_reach(const float o[3], float scale) {
-    const float r = g_zoneM.load() * scale;
-    return o[0] * o[0] + o[2] * o[2] < r * r && fabsf(o[1]) < r * 1.5f;
+    const float r = g_zoneM.load() * scale, h = r * 1.25f;
+    return (o[0] * o[0] + o[2] * o[2]) / (r * r) + o[1] * o[1] / (h * h) < 1.0f;
 }
 
 void buzz(int role, float a, int ms) { bvr::vr::haptic_pulse(role, a, ms); }
@@ -1037,14 +1045,26 @@ void holster_tick() {
     // rig (menus, cutscenes) puts the syringe away.
     const bool fresh = now - g_tgMs < 1500;
     if (!g_holsterOn.load() || !fresh) {
+        if (g_holsterOn.load() && g_hs != Hs::Idle)
+            BVR_LOG("[eve] holster: rig not drawn for %llu ms - putting the syringe away",
+                    static_cast<unsigned long long>(now - g_tgMs));
         put_away(!fresh ? "no rig" : "holster off");
+        static uint64_t s_noRigLogMs = 0;
+        if (g_holsterOn.load() && bvr::vr::hand_squeeze(1) >= 0.70f && now - s_noRigLogMs > 1500) {
+            s_noRigLogMs = now;
+            BVR_LOG("[eve] holster: grip squeezed but the hands rig has not been drawn for %llu ms - "
+                    "no draw possible", static_cast<unsigned long long>(now - g_tgMs));
+        }
         return;
     }
     const bool rigNow = now - g_tgMs < 150;
 
     const float sq = bvr::vr::hand_squeeze(1);
     const bool was = g_squeeze;
-    g_squeeze = g_squeeze ? sq >= 0.55f : sq >= 0.70f;
+    // Holding a syringe the release point is low: in a fight the grip relaxes
+    // without meaning to let go, and 0.55 dropped the hypo mid-reach.
+    const float release = g_hs == Hs::Idle ? 0.55f : 0.30f;
+    g_squeeze = g_squeeze ? sq >= release : sq >= 0.70f;
     const bool rising = g_squeeze && !was;
     const bool trig = rtRaw >= 150;
     const bool trigRise = trig && !g_trigPrev;
@@ -1054,30 +1074,40 @@ void holster_tick() {
     case Hs::Idle: {
         // Reach for the hip and squeeze in one movement, as you would in a
         // fight: the squeeze often lands a moment BEFORE the hand is inside
-        // the reach, and the old edge-only test then needed a release and a
-        // second squeeze. Now a squeeze that begins in the approach ring
-        // (1.6x the reach) is held for the holster and completes the draw if
-        // the hand arrives within 450 ms; one that begins inside draws at once.
+        // the reach. A squeeze that begins in the approach ring (1.5x the
+        // reach) WHILE THE HAND IS MOVING TOWARD THE HOLSTER is held for it and
+        // draws if the hand arrives within 450 ms. The motion is what makes it
+        // a reach: a still hand squeezing near your side is the weapon wheel,
+        // and the ring alone (v1, no motion test) swallowed it everywhere
+        // below the shoulder.
         float o[3] = {};
         const bool posed = hip_offset(o);
-        const bool zone = posed && in_reach(o, 1.0f);
-        const bool ring = posed && in_reach(o, 1.6f);
-        if (rising) g_squeezeRiseMs = now;
-        if (ring && rising) g_zoneSqueeze = true;
-        if (!g_squeeze) g_zoneSqueeze = g_drawSpent = false;
-        if (rising && !ring && posed && now - g_missLogMs > 2000) {
-            const float dist = sqrtf(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);
-            if (dist < 0.45f) { // near the hip but outside: tuning data
-                g_missLogMs = now;
-                BVR_LOG("[eve] holster: squeeze %.0f cm from the holster (side %+.0f, up %+.0f, fwd %+.0f cm) - "
-                        "outside the reach",
-                        dist * 100.0f, o[0] * 100.0f, o[1] * 100.0f, o[2] * 100.0f);
+        const float dist = posed ? sqrtf(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]) : -1.0f;
+        if (posed && g_hipDistPrev >= 0.0f && now > g_hipDistMs) {
+            const float dt = (now - g_hipDistMs) / 1000.0f;
+            if (dt < 0.1f) {
+                const float v = (g_hipDistPrev - dist) / dt;
+                g_approach += (v - g_approach) * fminf(1.0f, dt / 0.04f);
             }
         }
-        // The hip squeeze never reaches the game - in the ring, and for the
-        // rest of a squeeze that started there (leaving it with the grip
-        // still held used to open the weapon wheel).
-        if (ring || g_zoneSqueeze) bvr::vr::reserve_grip_bumper(1, true);
+        g_hipDistPrev = dist;
+        g_hipDistMs = now;
+        const bool zone = posed && in_reach(o, 1.0f);
+        const bool ring = posed && in_reach(o, 1.5f);
+        if (rising) {
+            g_squeezeRiseMs = now;
+            if (zone || (ring && g_approach > 0.35f)) g_zoneSqueeze = true;
+        }
+        if (!g_squeeze) g_zoneSqueeze = g_drawSpent = false;
+        if (rising && !g_zoneSqueeze && posed && dist < 0.45f && now - g_missLogMs > 1500) {
+            g_missLogMs = now; // near the hip but not taken: tuning data
+            BVR_LOG("[eve] holster: squeeze %.0f cm from the holster (side %+.0f, up %+.0f, fwd %+.0f cm, "
+                    "approach %.2f m/s) - not a draw",
+                    dist * 100.0f, o[0] * 100.0f, o[1] * 100.0f, o[2] * 100.0f, g_approach);
+        }
+        // A holster squeeze never reaches the game, for its whole length
+        // (leaving the zone with the grip still held used to open the wheel).
+        if (zone || g_zoneSqueeze) bvr::vr::reserve_grip_bumper(1, true);
         if (zone && !g_squeeze && now - g_lastBuzzMs >= 90) { // in reach: a steady light buzz
             g_lastBuzzMs = now;
             buzz(1, 0.22f, 60);
@@ -1085,6 +1115,10 @@ void holster_tick() {
         g_inZone = zone;
         const bool grab = zone && g_squeeze && g_zoneSqueeze && !g_drawSpent && now - g_squeezeRiseMs <= 450;
         if (grab) g_drawSpent = true; // one draw per squeeze (a refusal must not repeat)
+        if (g_zoneSqueeze && g_squeeze && !g_drawSpent && now - g_squeezeRiseMs > 450 && !zone) {
+            g_drawSpent = true;
+            BVR_LOG("[eve] holster: reach squeeze never arrived (%.0f cm away after 450 ms)", dist * 100.0f);
+        }
         if (grab) {
             BVR_LOG("[eve] holster: grip at the hip (syringe %p, socket bone %d, socket %s)", g_hypo, g_socket,
                     g_tg.socketOk ? "ok" : "missing");
@@ -1105,6 +1139,8 @@ void holster_tick() {
                 g_eveAtInject = eve;
                 g_xQueued = true;
                 g_xQueuedMs = now;
+                g_xSentMs = 0;
+                g_sawAttach = false;
                 buzz(1, 0.6f, 60);
                 set_state(Hs::Injecting, "first draw (finding the syringe)");
                 break;
@@ -1122,8 +1158,35 @@ void holster_tick() {
         bvr::vr::reserve_grip_bumper(1, true);
         supRt = true; // the trigger is the plunger now
         if (!g_squeeze) {
-            put_away("let go");
+            char why[48];
+            _snprintf_s(why, sizeof why, _TRUNCATE, "let go (grip %.2f)", sq);
+            put_away(why);
             break;
+        }
+        // The game hides the BioAmmoHypoTool on its own hand events (the
+        // raised hand switching, a plasmid or weapon change) and the console
+        // show is one-shot, so a held syringe could vanish from the hand.
+        // Re-show it right after any such change (a beat later too, in case
+        // the game's hide lands after ours). Event-driven: the console `set`
+        // walks every object, too heavy to run on a timer in VR.
+        {
+            void* hold = nullptr;
+            hands::current_holdable(&hold);
+            const uintptr_t key = reinterpret_cast<uintptr_t>(hold) ^ (hands::active_hand() << 1) ^
+                                  std::hash<std::string>{}(g_curPlasmid);
+            static uintptr_t s_key = 0;
+            static int s_stage = 0; // re-shows still due: at +60 ms, then +350 ms
+            if (key != s_key) {
+                s_key = key;
+                g_reshowMs = now;
+                s_stage = 2;
+            }
+            const uint64_t due = s_stage == 2 ? 60 : 350;
+            if (s_stage > 0 && now - g_reshowMs >= due) {
+                --s_stage;
+                g_shown = false;
+                hypo_show(true);
+            }
         }
         place_hypo();
         const bool in = rigNow && needle_in_arm(g_hs == Hs::In ? 1.5f : 1.0f);
@@ -1138,6 +1201,8 @@ void holster_tick() {
             g_eveAtInject = eve;
             g_xQueued = true;
             g_xQueuedMs = now;
+            g_xSentMs = 0;
+            g_sawAttach = false;
             set_state(Hs::Injecting, "trigger");
         }
         break;
@@ -1166,6 +1231,8 @@ void holster_tick() {
         if (g_xQueued && hands::active_hand() == 0) {
             bvr::input::pulse_buttons(0x4000, 150); // X with the plasmid raised: the game injects
             g_xQueued = false;
+            g_xSentMs = now;
+            g_sawAttach = false;
             g_surgeStartMs = now; // the plunger starts: the surge builds
             g_surgeLandMs = 0;
         }
@@ -1173,7 +1240,8 @@ void holster_tick() {
             g_xQueued = false;
             BVR_LOG("[eve] injection: the plasmid never came up");
         }
-        if (!hypo_attached()) place_hypo(); // until the game takes it over
+        if (hypo_attached()) g_sawAttach = true;
+        else place_hypo(); // until the game takes it over
         if (now - g_lastBuzzMs > 120) { // a pulse that swells with the plunge
             g_lastBuzzMs = now;
             const float ramp = g_surgeStartMs ? fminf(1.0f, (now - g_surgeStartMs) / 1500.0f) : 0.0f;
@@ -1191,10 +1259,20 @@ void holster_tick() {
             place_hypo();
             g_surgeLandMs = now; // the rush: peak tremor, then it fades in the hand
             set_state(Hs::Linger, "EVE in");
-        } else if (now - g_stateMs > 3500 || (now - g_stateMs > 1600 && g_hypo && !hypo_attached())) {
-            buzz(1, 0.4f, 20);
-            BVR_LOG("[eve] injection refused (EVE full or no hypos?)");
-            put_away("refused");
+        } else {
+            // Refused = the game never took the syringe within 1.2 s of X, or
+            // took it and let go with no EVE. Timed from X, not from the
+            // trigger: raising the plasmid first can take most of a second,
+            // and the old 1.6 s-from-trigger test put a good injection away.
+            const bool neverTook = g_xSentMs && !g_sawAttach && g_hypo && now - g_xSentMs > 1200;
+            const bool letGoEmpty = g_sawAttach && !hypo_attached() && now - g_xSentMs > 2600;
+            if (neverTook || letGoEmpty || now - g_stateMs > 4500) {
+                buzz(1, 0.4f, 20);
+                BVR_LOG("[eve] injection refused (%s)", neverTook    ? "the game never took the syringe - EVE full?"
+                                                        : letGoEmpty ? "the game let go with no EVE"
+                                                                     : "timed out");
+                put_away("refused");
+            }
         }
         break;
     }
