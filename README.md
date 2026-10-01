@@ -330,7 +330,7 @@ that feature.
   hooks) are theirs.
 - **BioVRDev's BioVR**, whose design the always-visible off hand and two-handed grip are
   modelled on: the grab and release distances, the grab-zone buzz, and aiming along both hands.
-- Built by Owen with Claude (Anthropic).
+- Built with help from Claude (Anthropic).
 
 ---
 ---
