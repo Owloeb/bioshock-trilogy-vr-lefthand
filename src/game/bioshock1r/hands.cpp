@@ -1061,55 +1061,24 @@ void reflect_point(float p[3], const float P[3], const float n[3]) {
 }
 
 // EVE holster targets: the weapon hand's gun socket and the plasmid forearm,
-// in world space AS SEEN - the engine rig is the mirror image of what is shown
-// whenever the viewmodel mirror is on, so reflect back through the same plane
-// the render uses (the gun/eye plane, or the head plane in head-plane mode).
-void publish_eve_targets(const FrameContext& ctx, bool mirrorPose, bool gunPlane,
-                         const GamePose& headW) {
+// in ENGINE world space. The syringe is drawn in the viewmodel pass, so the
+// viewmodel mirror reflects it with the hands: placed on the engine socket it
+// shows on the hand you see (placing it where the hand is SEEN reflected it a
+// second time - it orbited the plasmid hand). The needle test runs in the
+// same space; the reflection keeps every distance.
+void publish_eve_targets(const FrameContext& ctx) {
     eve::Targets t;
     t.worldScale = ctx.worldScale;
-    float planeP[3] = {}, planeN[3] = {};
-    bool reflect = false;
-    if (mirrorPose && gunPlane) {
-        memcpy(planeP, g_eyePlaneQ, 12);
-        memcpy(planeN, g_eyePlaneN, 12);
-        reflect = true;
-    } else if (mirrorPose) {
-        float hf[3], hu[3];
-        ue_rot_basis(headW.rot, hf, planeN, hu);
-        planeP[0] = headW.loc.x;
-        planeP[1] = headW.loc.y;
-        planeP[2] = headW.loc.z;
-        reflect = true;
-    }
-    auto seen_point = [&](float p[3]) {
-        if (reflect) reflect_point(p, planeP, planeN);
-    };
-    auto seen_vec = [&](float v[3]) {
-        if (!reflect) return;
-        float o[3];
-        reflect_vec(v, planeN, o);
-        memcpy(v, o, 12);
-    };
     const int sock = eve::socket_bone();
     float q[4];
     if (sock >= 0 && bones::weapon_socket_world(sock, t.socket, q)) {
         static const float kX[3] = {1, 0, 0}, kZ[3] = {0, 0, 1};
         quat_rotate(q[0], q[1], q[2], q[3], kX, t.sockF);
         quat_rotate(q[0], q[1], q[2], q[3], kZ, t.sockU);
-        seen_point(t.socket);
-        seen_vec(t.sockF);
-        seen_vec(t.sockU);
         t.socketOk = true;
     }
-    if (bones::written_world_pose(patterns::kBoneLWrist, t.wrist, q)) {
-        seen_point(t.wrist);
-        t.wristOk = true;
-    }
-    if (bones::written_world_pose(patterns::kBoneLSleeve[2], t.elbow, q)) {
-        seen_point(t.elbow);
-        t.elbowOk = true;
-    }
+    if (bones::written_world_pose(patterns::kBoneLWrist, t.wrist, q)) t.wristOk = true;
+    if (bones::written_world_pose(patterns::kBoneLSleeve[2], t.elbow, q)) t.elbowOk = true;
     eve::set_targets(t);
 }
 
@@ -2267,7 +2236,7 @@ void on_calcview(const FrameContext& ctx) {
         bonewatch::mark_drive_begin();
         const bool drove = bones::drive(ctx, target, gp, hand);
         bonewatch::mark_drive_end();
-        if (drove) publish_eve_targets(ctx, mirrorPose, gunPlaneLive, headW);
+        if (drove) publish_eve_targets(ctx);
         if (!drove) {
             mirrorArm.arm = false; // rig not driven: never reflect an unplaced rig
             g_postTarget = nullptr;

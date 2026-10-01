@@ -23,8 +23,9 @@ void on_attach(void* parent, void* child);
 // The probe is running (the attach hook installs itself while it is).
 bool probe_on();
 
-// What the holster needs from the drawn rig, in WORLD space as you SEE it
-// (already reflected back through the viewmodel mirror when it is on).
+// What the holster needs from the drawn rig, in ENGINE world space - where
+// the syringe must be placed for the viewmodel mirror to show it on the hand
+// you see.
 struct Targets {
     bool socketOk = false;      // the weapon hand's gun socket ("Pistol")
     float socket[3];

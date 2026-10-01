@@ -998,11 +998,15 @@ void holster_tick() {
         }
     }
 
-    const bool fresh = now - g_tgMs < 200;
+    // The hand drive skips frames while the raised hand switches (the draw
+    // itself raises the plasmid) - ride through that; only a real loss of the
+    // rig (menus, cutscenes) puts the syringe away.
+    const bool fresh = now - g_tgMs < 1500;
     if (!g_holsterOn.load() || !fresh) {
         put_away(!fresh ? "no rig" : "holster off");
         return;
     }
+    const bool rigNow = now - g_tgMs < 150;
 
     const float sq = bvr::vr::hand_squeeze(1);
     const bool was = g_squeeze;
@@ -1067,7 +1071,7 @@ void holster_tick() {
             break;
         }
         place_hypo();
-        const bool in = needle_in_arm(g_hs == Hs::In ? 1.5f : 1.0f);
+        const bool in = rigNow && needle_in_arm(g_hs == Hs::In ? 1.5f : 1.0f);
         if (in && g_hs == Hs::Held) {
             buzz(0, 0.5f, 50);
             buzz(1, 0.5f, 50);
